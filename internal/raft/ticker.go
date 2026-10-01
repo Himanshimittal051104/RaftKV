@@ -6,7 +6,7 @@ import (
 )
 
 // Start begins the election and heartbeat background goroutine.
-func (rn *RaftNode) Start() {
+func (rn *RaftNode) StartBackground() {
 	go rn.runLoop()
 }
 
@@ -106,6 +106,7 @@ func (rn *RaftNode) startElection() {
 	}
 }
 
+
 func (rn *RaftNode) broadcastHeartbeat() {
 	rn.mu.Lock()
 	if rn.role != Leader {
@@ -124,26 +125,83 @@ func (rn *RaftNode) broadcastHeartbeat() {
 		}
 
 		go func(peerID int) {
+			rn.mu.Lock()
+			if rn.role != Leader || rn.currentTerm != term {
+				rn.mu.Unlock()
+				return
+			}
+
+			prevLogIndex := rn.nextIndex[peerID] - 1
+			if prevLogIndex < 0 {
+				prevLogIndex = 0
+			}
+			prevLogTerm := rn.log[prevLogIndex].Term
+
+			// Slice entries to send to this peer starting from nextIndex[peerID]
+			var entries []LogEntry
+			if rn.nextIndex[peerID] < len(rn.log) {
+				entries = make([]LogEntry, len(rn.log)-rn.nextIndex[peerID])
+				copy(entries, rn.log[rn.nextIndex[peerID]:])
+			}
+
 			args := AppendEntriesArgs{
 				Term:         term,
 				LeaderID:     me,
-				PrevLogIndex: len(peers[peerID].log) - 1,
-				PrevLogTerm:  0,
-				Entries:      nil,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
 				LeaderCommit: commitIndex,
 			}
-			var reply AppendEntriesReply
+			rn.mu.Unlock()
 
+			var reply AppendEntriesReply
 			peers[peerID].AppendEntries(&args, &reply)
 
 			rn.mu.Lock()
 			defer rn.mu.Unlock()
+
+			if rn.role != Leader || rn.currentTerm != term {
+				return
+			}
 
 			if reply.Term > rn.currentTerm {
 				rn.currentTerm = reply.Term
 				rn.role = Follower
 				rn.votedFor = -1
 				rn.resetElectionTimeout()
+				return
+			}
+
+			if reply.Success {
+				// Update nextIndex and matchIndex for peer
+				newMatch := prevLogIndex + len(entries)
+				if newMatch > rn.matchIndex[peerID] {
+					rn.matchIndex[peerID] = newMatch
+				}
+				rn.nextIndex[peerID] = rn.matchIndex[peerID] + 1
+
+				// Check if we can advance commitIndex
+				// A log entry is committed if stored on a majority of servers
+				for N := len(rn.log) - 1; N > rn.commitIndex; N-- {
+					if rn.log[N].Term == rn.currentTerm {
+						count := 1 // Leader counts itself
+						for j := range peers {
+							if j != me && rn.matchIndex[j] >= N {
+								count++
+							}
+						}
+						if count > len(peers)/2 {
+							rn.commitIndex = N
+							rn.applyCommittedEntries()
+							break
+						}
+					}
+				}
+			} else {
+				// If append failed because of log inconsistency, decrement nextIndex and retry
+				if rn.nextIndex[peerID] > 1 {
+					rn.nextIndex[peerID]--
+				}
 			}
 		}(i)
 	}

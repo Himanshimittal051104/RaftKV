@@ -69,3 +69,44 @@ func (rn *RaftNode) resetElectionTimeout() {
 	rn.electionTimeout = 150*time.Millisecond + jitter
 	rn.lastResetTime = time.Now()
 }
+
+
+// Start is called by the client to submit a new command.
+func (rn *RaftNode) Start(command Command) (int, int, bool) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	if rn.role != Leader {
+		return -1, -1, false
+	}
+
+	index := len(rn.log)
+	term := rn.currentTerm
+	rn.log = append(rn.log, LogEntry{
+		Term:    term,
+		Command: command,
+	})
+
+	rn.matchIndex[rn.me] = index
+	rn.nextIndex[rn.me] = index + 1
+
+	return index, term, true
+}
+
+
+// applyCommittedEntries sends committed log entries to the application layer.
+func (rn *RaftNode) applyCommittedEntries() {
+	for rn.lastApplied < rn.commitIndex {
+		rn.lastApplied++
+		msg := ApplyMsg{
+			CommandValid: true,
+			Command:      rn.log[rn.lastApplied].Command,
+			CommandIndex: rn.lastApplied,
+		}
+		// Send non-blocking or push to channel
+		select {
+		case rn.applyCh <- msg:
+		default:
+		}
+	}
+}
