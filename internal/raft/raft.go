@@ -4,6 +4,7 @@ import (
 	"math/rand"
 	"sync"
 	"time"
+	"RaftKV/internal/storage"
 )
 
 type RaftNode struct {
@@ -31,23 +32,26 @@ type RaftNode struct {
 	electionTimeout time.Duration
 	heartbeatPeriod time.Duration
 
+	Engine storage.Engine
+
 	applyCh chan ApplyMsg
 	stopCh  chan struct{}
 }
 
 // NewRaftNode creates and initializes a node in the Follower state.
-func NewRaftNode(me int, peersCount int, applyCh chan ApplyMsg) *RaftNode {
+func NewRaftNode(me int, peersCount int, applyCh chan ApplyMsg, engine storage.Engine) *RaftNode {
 	rn := &RaftNode{
 		me:              me,
 		currentTerm:     0,
 		votedFor:        -1,
 		role:            Follower,
-		log:             make([]LogEntry, 1), // Dummy entry at index 0 so indices are 1-based
+		log:             make([]LogEntry, 1),
 		commitIndex:     0,
 		lastApplied:     0,
 		heartbeatPeriod: 50 * time.Millisecond,
 		applyCh:         applyCh,
 		stopCh:          make(chan struct{}),
+		Engine:          engine, // Assign engine here
 	}
 
 	rn.resetElectionTimeout()
@@ -95,15 +99,28 @@ func (rn *RaftNode) Start(command Command) (int, int, bool) {
 
 
 // applyCommittedEntries sends committed log entries to the application layer.
+// applyCommittedEntries sends committed log entries to the application layer and executes them in storage.
 func (rn *RaftNode) applyCommittedEntries() {
 	for rn.lastApplied < rn.commitIndex {
 		rn.lastApplied++
+		entry := rn.log[rn.lastApplied]
+
+		// Execute the command against the storage engine if an engine is provided
+		if rn.Engine != nil {
+			switch entry.Command.Op {
+			case "SET":
+				_ = rn.Engine.Put([]byte(entry.Command.Key), []byte(entry.Command.Value))
+			case "DELETE":
+				_ = rn.Engine.Delete([]byte(entry.Command.Key))
+			}
+		}
+
 		msg := ApplyMsg{
 			CommandValid: true,
-			Command:      rn.log[rn.lastApplied].Command,
+			Command:      entry.Command,
 			CommandIndex: rn.lastApplied,
 		}
-		// Send non-blocking or push to channel
+		
 		select {
 		case rn.applyCh <- msg:
 		default:

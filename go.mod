@@ -1,3 +1,3 @@
-module distributed-kv
+module RaftKV
 
 go 1.27.1
