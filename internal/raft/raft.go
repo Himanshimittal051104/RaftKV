@@ -1,58 +1,65 @@
 package raft
 
 import (
-	"errors"
-	"math/rand"
-	"sync"
-	"time"
+	"errors"     // Used to create predefined errors:
+	"math/rand" //Used to randomize the election timeout. Without randomization, multiple nodes could time out simultaneously and repeatedly start elections.
+	"sync"     //multiple goroutines can access the Raft node simultaneously.
+	"time"     //This handles election and heartbeat timing.
 
-	"RaftKV/internal/storage"
+	"RaftKV/internal/storage"  //This connects the Raft layer to your KV storage engine.
 )
 
+
+//Instead of repeatedly creating new error instances, we define them as package-level variables. 
 var (
-	ErrWrongLeader = errors.New("raft: node is not the leader")
-	ErrTimeout     = errors.New("raft: client request timed out")
+	ErrWrongLeader = errors.New("raft: node is not the leader")  //"The client contacted a node that isn't currently the leader."
+	ErrTimeout     = errors.New("raft: client request timed out") //represents a client request that did not complete within the expected time.
 )
 
 type RaftNode struct {
-	mu sync.Mutex
+	mu sync.Mutex //This protects the node's shared state.
 
 	peers []*RaftNode // Direct in-memory pointers to peers for Phase 1 testing
 	me    int         // Index of this node in peers[]
 
 	// Persistent state on all servers (will persist to disk in Phase 4)
+	//According to Raft, these are the pieces of state that eventually need to survive a crash.
 	currentTerm int
 	votedFor    int        // -1 means no vote cast yet in currentTerm
 	log         []LogEntry // Log entries; index 0 is a dummy entry
 
 	// Volatile state on all servers
-	commitIndex int
-	lastApplied int
+	commitIndex int 
+	lastApplied int   //lastApplied <= commitIndex
+	//After a crash, you can reconstruct the state machine from persistent storage/snapshot + log replay.
 	role        Role
 
 	// Volatile state on leaders
-	nextIndex  []int
-	matchIndex []int
+	nextIndex  []int  //The next log index the leader believes it should send to that follower.If a follower rejects AppendEntries, the leader moves its nextIndex backward and retries.This is the mechanism for repairing divergent logs.
+	matchIndex []int //The highest log index that the leader knows has been successfully replicated on that follower.The leader can use these values to determine whether a majority has replicated an entry and therefore whether it can advance commitIndex.
 
 	// Election and heartbeat tracking
-	lastResetTime   time.Time
-	electionTimeout time.Duration
-	heartbeatPeriod time.Duration
+	lastResetTime   time.Time    //Records when the election timer was last reset.
+	electionTimeout time.Duration   //How long this node waits before starting an election.
+	heartbeatPeriod time.Duration   //How frequently the leader sends heartbeats. (heartbeatPeriod < electionTimeout) Otherwise followers could start elections even though the leader is healthy.
 
-	Engine storage.Engine
 
-	applyCh chan ApplyMsg
-	stopCh  chan struct{}
+
+	//these three are not leader-specific.Every node has its own state machine/storage.Every node needs a way to send committed entries to its state machine/application layer
+	Engine storage.Engine //This connects Raft to your KV engine.
+
+	applyCh chan ApplyMsg   //This is a Go channel. It's used to send committed Raft commands toward the application/state-machine layer.
+	stopCh  chan struct{} //This is typically used to tell background goroutines
 }
 
 // NewRaftNode creates and initializes a node in the Follower state.
 func NewRaftNode(me int, peersCount int, applyCh chan ApplyMsg, engine storage.Engine) *RaftNode {
-	rn := &RaftNode{
+	rn := &RaftNode{ //You're allocating a RaftNode and getting a pointer to it.
 		me:              me,
 		currentTerm:     0,
 		votedFor:        -1,
 		role:            Follower,
-		log:             make([]LogEntry, 1),
+		log:             make([]LogEntry, 1), //log[0] = dummy
 		commitIndex:     0,
 		lastApplied:     0,
 		heartbeatPeriod: 50 * time.Millisecond,
@@ -60,15 +67,15 @@ func NewRaftNode(me int, peersCount int, applyCh chan ApplyMsg, engine storage.E
 		stopCh:          make(chan struct{}),
 		Engine:          engine, // Assign engine here
 	}
-
-	rn.resetElectionTimeout()
-	return rn
+ 
+	rn.resetElectionTimeout() //This chooses a randomized election timeout and records the current time.
+	return rn  //Returns the initialized node.
 }
 
 // SetPeers connects this node to its cluster peers.
 func (rn *RaftNode) SetPeers(peers []*RaftNode) {
-	rn.mu.Lock()
-	defer rn.mu.Unlock()
+	rn.mu.Lock() //You lock because you're modifying shared state.
+	defer rn.mu.Unlock()  //defer means: Run Unlock() when this function returns.
 	rn.peers = peers
 	rn.nextIndex = make([]int, len(peers))
 	rn.matchIndex = make([]int, len(peers))
@@ -91,16 +98,18 @@ func (rn *RaftNode) Start(command Command) (int, int, bool) {
 	}
 
 	index := len(rn.log)
-	term := rn.currentTerm
+	term := rn.currentTerm  //The new log entry belongs to the leader's current term.
 	rn.log = append(rn.log, LogEntry{
 		Term:    term,
 		Command: command,
 	})
+	//Notice you don't explicitly set Index here.That's because you're using the slice position as the effective log index.
 
+	//Update leader's own replication state. Since the leader has obviously appended the entry to its own log:
 	rn.matchIndex[rn.me] = index
 	rn.nextIndex[rn.me] = index + 1
 
-	return index, term, true
+	return index, term, true //"Yes, I'm the leader.The command is at this log index and term." At this point:The command is NOT committed yet.It has only been appended to the leader's local log.
 }
 
 // Put submits a SET command to the cluster via Raft consensus.
@@ -115,7 +124,7 @@ func (rn *RaftNode) Put(key, value string) (bool, error) {
 	if !isLeader {
 		return false, ErrWrongLeader
 	}
-	return true, nil
+	return true, nil //Your Put() currently returns success when the command is accepted by the leader, not necessarily when it has been committed by a majority.
 }
 
 // Get reads directly from the engine if the node is a verified leader.
@@ -127,7 +136,7 @@ func (rn *RaftNode) Get(key string) (string, bool, error) {
 	}
 	rn.mu.Unlock()
 
-	// Query local engine storage state
+	// You're checking that the node is currently leader.Then directly Query local engine storage state
 	val, found, err := rn.Engine.Get([]byte(key))
 	if err != nil {
 		return "", false, err
@@ -152,7 +161,7 @@ func (rn *RaftNode) Delete(key string) (bool, error) {
 // applyCommittedEntries sends committed log entries to the application layer and executes them in storage.
 func (rn *RaftNode) applyCommittedEntries() {
 	for rn.lastApplied < rn.commitIndex {
-		rn.lastApplied++
+		rn.lastApplied++  //advance lastApplied to the next log entry that needs to be applied.
 		entry := rn.log[rn.lastApplied]
 
 		// Execute the command against the storage engine if an engine is provided
@@ -177,5 +186,8 @@ func (rn *RaftNode) applyCommittedEntries() {
 		case rn.applyCh <- msg:
 		default:
 		}
+		//This is a non-blocking send.If receiver is ready:send message; Otherwise:immediately continue. Ifchannel is not ready, ApplyMsg is silently dropped.
+
+		// In your current code, ApplyMsg is functioning partly like a notifier, while the actual state update is happening directly through Engine. In the cleaner design, ApplyMsg is the mechanism by which the state machine learns what committed operation it must apply.
 	}
 }

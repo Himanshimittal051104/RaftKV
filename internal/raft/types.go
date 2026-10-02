@@ -1,9 +1,10 @@
-package raft
+package raft 
+//This tells Go that this file belongs to the raft package.
 
-type Role int
+type Role int //Role -> integer representing the node's current state
 
 const (
-	Follower Role = iota
+	Follower Role = iota //iota is a Go keyword used inside a const block. It starts at 0 and increments automatically.
 	Candidate
 	Leader
 )
@@ -35,6 +36,8 @@ type LogEntry struct {
 	Command Command
 }
 
+//An ApplyMsg represents a message from the Raft layer to the state machine.
+//Raft -> "This entry is now committed.Please apply it."-> State Machine
 type ApplyMsg struct {
 	CommandValid bool
 	Command      Command
@@ -53,3 +56,32 @@ type StateMachine interface {
 	Snapshot() ([]byte, error)
 	Restore(snapshot []byte) error
 }
+
+    //              CLIENT
+    //                 │
+    //                 │ SET A=10
+    //                 ▼
+    //              Command
+    //                 │
+    //                 ▼
+    //            LogEntry
+    //       ┌─────────┼─────────┐
+    //       │         │         │
+    //    Index      Term     Command
+    //                           │
+    //                           ▼
+    //                    Raft replication
+    //                           │
+    //                      majority ACK
+    //                           │
+    //                           ▼
+    //                        COMMIT
+    //                           │
+    //                           ▼
+    //                       ApplyMsg
+    //                           │
+    //                           ▼
+    //                    StateMachine
+    //                           │
+    //                           ▼
+    //                      KV State
