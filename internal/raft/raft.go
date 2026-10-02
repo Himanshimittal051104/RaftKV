@@ -1,10 +1,17 @@
 package raft
 
 import (
+	"errors"
 	"math/rand"
 	"sync"
 	"time"
+
 	"RaftKV/internal/storage"
+)
+
+var (
+	ErrWrongLeader = errors.New("raft: node is not the leader")
+	ErrTimeout     = errors.New("raft: client request timed out")
 )
 
 type RaftNode struct {
@@ -13,7 +20,7 @@ type RaftNode struct {
 	peers []*RaftNode // Direct in-memory pointers to peers for Phase 1 testing
 	me    int         // Index of this node in peers[]
 
-	// Persistent state on all servers (will persist to disk in Phase 3)
+	// Persistent state on all servers (will persist to disk in Phase 4)
 	currentTerm int
 	votedFor    int        // -1 means no vote cast yet in currentTerm
 	log         []LogEntry // Log entries; index 0 is a dummy entry
@@ -74,7 +81,6 @@ func (rn *RaftNode) resetElectionTimeout() {
 	rn.lastResetTime = time.Now()
 }
 
-
 // Start is called by the client to submit a new command.
 func (rn *RaftNode) Start(command Command) (int, int, bool) {
 	rn.mu.Lock()
@@ -97,8 +103,52 @@ func (rn *RaftNode) Start(command Command) (int, int, bool) {
 	return index, term, true
 }
 
+// Put submits a SET command to the cluster via Raft consensus.
+func (rn *RaftNode) Put(key, value string) (bool, error) {
+	cmd := Command{
+		Op:    "SET",
+		Key:   key,
+		Value: value,
+	}
 
-// applyCommittedEntries sends committed log entries to the application layer.
+	_, _, isLeader := rn.Start(cmd)
+	if !isLeader {
+		return false, ErrWrongLeader
+	}
+	return true, nil
+}
+
+// Get reads directly from the engine if the node is a verified leader.
+func (rn *RaftNode) Get(key string) (string, bool, error) {
+	rn.mu.Lock()
+	if rn.role != Leader {
+		rn.mu.Unlock()
+		return "", false, ErrWrongLeader
+	}
+	rn.mu.Unlock()
+
+	// Query local engine storage state
+	val, found, err := rn.Engine.Get([]byte(key))
+	if err != nil {
+		return "", false, err
+	}
+	return string(val), found, nil
+}
+
+// Delete submits a DELETE command to the cluster via Raft consensus.
+func (rn *RaftNode) Delete(key string) (bool, error) {
+	cmd := Command{
+		Op:  "DELETE",
+		Key: key,
+	}
+
+	_, _, isLeader := rn.Start(cmd)
+	if !isLeader {
+		return false, ErrWrongLeader
+	}
+	return true, nil
+}
+
 // applyCommittedEntries sends committed log entries to the application layer and executes them in storage.
 func (rn *RaftNode) applyCommittedEntries() {
 	for rn.lastApplied < rn.commitIndex {
@@ -112,6 +162,8 @@ func (rn *RaftNode) applyCommittedEntries() {
 				_ = rn.Engine.Put([]byte(entry.Command.Key), []byte(entry.Command.Value))
 			case "DELETE":
 				_ = rn.Engine.Delete([]byte(entry.Command.Key))
+			case "GET":
+				// Read operations do not mutate state machine logs
 			}
 		}
 
@@ -120,7 +172,7 @@ func (rn *RaftNode) applyCommittedEntries() {
 			Command:      entry.Command,
 			CommandIndex: rn.lastApplied,
 		}
-		
+
 		select {
 		case rn.applyCh <- msg:
 		default:

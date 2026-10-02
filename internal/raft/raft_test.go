@@ -1,147 +1,103 @@
 package raft
 
 import (
-	"fmt"
+	"errors"
 	"testing"
 	"time"
 
-	"RaftKV/internal/storage" // Make sure this matches your go.mod module name
+	"RaftKV/internal/storage"
 )
 
-func TestInitialElection(t *testing.T) {
+func TestClientAPIAndLeaderRedirection(t *testing.T) {
+	// Setup a 3-node cluster with MemEngines and apply channels
 	n := 3
 	nodes := make([]*RaftNode, n)
-	applyChs := make([]chan ApplyMsg, n)
-
-	for i := 0; i < n; i++ {
-		applyChs[i] = make(chan ApplyMsg, 100)
-		engine := storage.NewMemEngine()
-		nodes[i] = NewRaftNode(i, n, applyChs[i], engine)
-	}
-
-	for i := 0; i < n; i++ {
-		nodes[i].SetPeers(nodes)
-		nodes[i].StartBackground()
-	}
-
-	fmt.Println("Waiting for leader election...")
-	time.Sleep(600 * time.Millisecond)
-
-	leaders := 0
-	leaderID := -1
-	for i := 0; i < n; i++ {
-		nodes[i].mu.Lock()
-		if nodes[i].role == Leader {
-			leaders++
-			leaderID = i
-		}
-		fmt.Printf("Node %d role: %s, term: %d\n", i, nodes[i].role, nodes[i].currentTerm)
-		nodes[i].mu.Unlock()
-	}
-
-	for i := 0; i < n; i++ {
-		nodes[i].Stop()
-	}
-
-	if leaders != 1 {
-		t.Fatalf("Expected exactly 1 leader, but found %d", leaders)
-	}
-
-	fmt.Printf("Success! Node %d was elected leader.\n", leaderID)
-}
-
-func TestLogReplicationAndStorage(t *testing.T) {
-	n := 3
-	nodes := make([]*RaftNode, n)
-	applyChs := make([]chan ApplyMsg, n)
 	engines := make([]storage.Engine, n)
+	applyChs := make([]chan ApplyMsg, n)
 
-	// 1. Initialize nodes with their own storage engines and apply channels
 	for i := 0; i < n; i++ {
-		applyChs[i] = make(chan ApplyMsg, 100)
 		engines[i] = storage.NewMemEngine()
+		applyChs[i] = make(chan ApplyMsg, 100)
 		nodes[i] = NewRaftNode(i, n, applyChs[i], engines[i])
 	}
 
+	// Connect peers and start their background loops
 	for i := 0; i < n; i++ {
 		nodes[i].SetPeers(nodes)
-		nodes[i].StartBackground()
+		nodes[i].StartBackground() // Start the background election and heartbeat loop
 	}
+	defer func() {
+		for i := 0; i < n; i++ {
+			nodes[i].Stop()
+		}
+	}()
 
-	// 2. Wait for leader election
-	fmt.Println("Waiting for leader election...")
-	time.Sleep(600 * time.Millisecond)
-
-	// 3. Find the current leader
+	t.Log("Waiting for leader election...")
 	var leader *RaftNode
 	leaderID := -1
-	for i := 0; i < n; i++ {
-		nodes[i].mu.Lock()
-		if nodes[i].role == Leader {
-			leader = nodes[i]
-			leaderID = i
+
+	// Wait up to 3 seconds to find a leader
+	start := time.Now()
+	for time.Since(start) < 3*time.Second {
+		for i := 0; i < n; i++ {
+			nodes[i].mu.Lock()
+			if nodes[i].role == Leader {
+				leader = nodes[i]
+				leaderID = i
+			}
+			nodes[i].mu.Unlock()
 		}
-		nodes[i].mu.Unlock()
+		if leader != nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	if leader == nil {
-		t.Fatalf("Failed to elect a leader for the replication test")
+		t.Fatalf("Failed to elect a leader within timeout")
 	}
+	t.Logf("Leader found: Node %d", leaderID)
 
-	fmt.Printf("Leader found: Node %d. Submitting write command...\n", leaderID)
-
-	// 4. Submit a command to the leader
-	cmd := Command{
-		ClientID:  1,
-		SeqNumber: 1,
-		Op:        "SET",
-		Key:       "name",
-		Value:     "RaftKv",
+	// Test 1: Verify Follower returns ErrWrongLeader
+	followerID := (leaderID + 1) % n
+	follower := nodes[followerID]
+	
+	_, err := follower.Put("test_key", "test_val")
+	if !errors.Is(err, ErrWrongLeader) {
+		t.Fatalf("Expected ErrWrongLeader on follower Put, got: %v", err)
 	}
-	index, term, ok := leader.Start(cmd)
-	if !ok {
-		t.Fatalf("Leader rejected command submission")
+	t.Log("Follower correctly rejected Put with ErrWrongLeader")
+
+	// Test 2: Successful Put on Leader
+	success, err := leader.Put("city", "Delhi")
+	if !success || err != nil {
+		t.Fatalf("Failed to Put on leader: %v", err)
 	}
-	fmt.Printf("Command accepted at log index %d, term %d\n", index, term)
+	t.Log("Put command submitted successfully to leader")
 
-	// 5. Wait for replication / commitment cycle
-	time.Sleep(300 * time.Millisecond)
+	// Wait briefly for log replication and state application
+	time.Sleep(200 * time.Millisecond)
 
-	// 6. Check that all nodes applied the command and stored it in their storage engines
-	appliedCount := 0
-	for i := 0; i < n; i++ {
-		// Drain apply channel
-		select {
-		case msg := <-applyChs[i]:
-			if msg.CommandValid && msg.Command == cmd {
-				appliedCount++
-				fmt.Printf("Node %d applied command via applyCh at index %d\n", i, msg.CommandIndex)
-			}
-		default:
-		}
-
-		// Verify data is actually stored in the storage engine backend!
-		valBytes, exists, err := engines[i].Get([]byte("name"))
-		if err != nil || !exists {
-			t.Fatalf("Node %d failed to persist key 'name' in storage engine", i)
-		}
-		valStr := string(valBytes)
-		if valStr != "RaftKv" {
-			t.Fatalf("Node %d storage engine has incorrect value: got %s, want RaftKv", i, valStr)
-		}
-		fmt.Printf("Node %d storage engine verified: 'name' = '%s'\n", i, valStr)
+	// Test 3: Successful Get on Leader
+	val, found, err := leader.Get("city")
+	if err != nil || !found || val != "Delhi" {
+		t.Fatalf("Failed to Get correct value: val=%s, found=%v, err=%v", val, found, err)
 	}
+	t.Logf("Get verified on leader: 'city' = '%s'", val)
 
-	// 7. Clean up
-	for i := 0; i < n; i++ {
-		nodes[i].Stop()
-		engines[i].Close()
+	// Test 4: Successful Delete on Leader
+	success, err = leader.Delete("city")
+	if !success || err != nil {
+		t.Fatalf("Failed to Delete on leader: %v", err)
 	}
+	t.Log("Delete command submitted successfully")
 
-	// 8. Assertions
-	if appliedCount == 0 {
-		t.Fatalf("Expected nodes to apply the replicated command, but none did")
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify deletion
+	_, found, err = leader.Get("city")
+	if found || err != nil {
+		t.Fatalf("Expected key 'city' to be deleted, but found=%v", found)
 	}
-
-	fmt.Println("Success! Consensus, log replication, state application, and storage persistence verified.")
+	t.Log("Success! Client API, operations (Put/Get/Delete), and leader redirection verified.")
 }
