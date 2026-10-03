@@ -428,6 +428,42 @@ Additional invariants will be added as persistence, snapshots, linearizable read
 
 ---
 
+## Development Roadmap
+
+1. **Raft Consensus**
+   - Leader election
+   - Heartbeats
+   - Log replication
+   - Commitment and state-machine application
+
+2. **Durability**
+   - Persistent Raft state
+   - Crash recovery
+   - Custom storage engine
+
+3. **Scalability & Compaction**
+   - Snapshots
+   - Log compaction
+
+4. **Correctness & Reliability**
+   - Fault injection
+   - Linearizability testing
+   - Failure recovery testing
+
+5. **Observability & Performance**
+   - Metrics
+   - Benchmarking
+   - Profiling
+   - Performance optimization
+
+6. **Production Hardening**
+   - Concurrency hardening
+   - Graceful shutdown
+   - Robust error handling
+   - Final integration testing
+
+---
+
 ## Goals
 The primary goal of RaftKV is to understand and implement the engineering principles behind distributed systems rather than simply using an existing distributed database implementation.
 
