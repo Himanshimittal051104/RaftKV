@@ -9,8 +9,9 @@ import (
 )
 
 type KVServer struct {
-	node *raft.RaftNode
-	mux  *http.ServeMux
+	node *raft.RaftNode //This is the Raft node that actually handles consensus.
+	mux  *http.ServeMux //This is Go's HTTP router. It decides which handler receives an incoming HTTP request.
+	//HTTP Client -> KVServer -> RaftNode
 }
 
 type PutRequest struct {
@@ -25,7 +26,7 @@ type Response struct {
 	Error    string `json:"error,omitempty"`
 }
 
-func NewKVServer(node *raft.RaftNode) *KVServer {
+func NewKVServer(node *raft.RaftNode) *KVServer { //This creates the HTTP server around an existing Raft node.
 	s := &KVServer{
 		node: node,
 		mux:  http.NewServeMux(),
@@ -35,7 +36,7 @@ func NewKVServer(node *raft.RaftNode) *KVServer {
 }
 
 func (s *KVServer) registerRoutes() {
-	s.mux.HandleFunc("/kv", s.handleKVRequest)
+	s.mux.HandleFunc("/kv", s.handleKVRequest) //Whenever an HTTP request comes to /kv, call handleKVRequest.
 }
 
 func (s *KVServer) handleKVRequest(w http.ResponseWriter, r *http.Request) {
@@ -110,6 +111,6 @@ func (s *KVServer) handleKVRequest(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *KVServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (s *KVServer) ServeHTTP(w http.ResponseWriter, r *http.Request) { //It means KVServer itself implements the http.Handler interface.
 	s.mux.ServeHTTP(w, r)
 }
