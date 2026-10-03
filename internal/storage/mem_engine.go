@@ -5,6 +5,7 @@ import (
 )
 
 // MemEngine is a thread-safe, in-memory implementation of the storage.Engine interface.
+//It is your actual storage implementation for the storage.Engine interface
 type MemEngine struct {
 	mu   sync.Mutex
 	data map[string][]byte
