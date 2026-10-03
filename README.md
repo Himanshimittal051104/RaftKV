@@ -66,6 +66,8 @@ GET    /kv?key=<key>
 DELETE /kv?key=<key>
 ```
 
+---
+
 ## Architecture
 At a high level, RaftKV follows:
 
@@ -120,6 +122,8 @@ Apply to state machine
 Storage Engine
 ```
 
+---
+
 ## Raft Node
 Each Raft node maintains the following state.
 
@@ -144,6 +148,8 @@ nextIndex[]
 matchIndex[]
 ```
 
+---
+
 ## Raft Log
 Each log entry contains:
 ```go
@@ -164,6 +170,8 @@ type Command struct {
 }
 ```
 The log stores client commands together with the Raft term and log index.
+
+---
 
 ## Leader Election
 Each node starts as a follower.
@@ -210,6 +218,8 @@ If the previous entry does not match, replication fails and the leader moves nex
 
 If a conflicting entry is found, the follower removes the conflicting suffix and appends the leader's entries.
 
+---
+
 ## Commitment
 A log entry becomes eligible for commitment when it has been replicated on a majority of the cluster.
 
@@ -240,6 +250,8 @@ The distinction between these stages is important:
 Append ≠ Commit ≠ Apply
 ```
 Appending an entry to the leader's local log does not mean that the operation has been committed.
+
+---
 
 ## State Machine
 RaftKV separates consensus from application logic.
