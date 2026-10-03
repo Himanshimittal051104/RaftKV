@@ -58,7 +58,7 @@ Current endpoint:
 /kv
 ```
 
-### Supported operations:
+Supported operations:
 
 ```text
 POST   /kv
