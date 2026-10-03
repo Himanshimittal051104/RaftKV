@@ -94,5 +94,53 @@ At a high level, RaftKV follows:
           Follower         Follower
 ```
 
+A write follows the general path:
+```text
+Client
+  │
+  ▼
+Leader
+  │
+  ▼
+Append command to Raft log
+  │
+  ▼
+Replicate to followers
+  │
+  ▼
+Majority replicated
+  │
+  ▼
+Commit
+  │
+  ▼
+Apply to state machine
+  │
+  ▼
+Storage Engine
+```
 
+## Raft Node
+Each Raft node maintains the following state.
+
+### Persistent State
+The current implementation keeps the following state in memory:
+```text
+currentTerm
+votedFor
+log
+```
+Durable persistence and crash recovery are planned for a later phase.
+
+### Volatile State
+```text
+commitIndex
+lastApplied
+```
+
+### Leader-Specific Volatile State
+```text
+nextIndex[]
+matchIndex[]
+```
 
