@@ -56,3 +56,15 @@ Current endpoint:
 
 ```text
 /kv
+```
+
+Supported operations:
+
+```text
+POST   /kv
+GET    /kv?key=<key>
+DELETE /kv?key=<key>
+```
+
+
+
