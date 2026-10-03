@@ -76,7 +76,7 @@ func (rn *RaftNode) startElection() {
 			defer rn.mu.Unlock()
 
 			if rn.role != Candidate || rn.currentTerm != term {
-				return
+				return   // Suppose A starts an election:Then while waiting for votes, A receives an AppendEntries from another valid leader: then A becomes a follower and ignores the vote replies from other nodes.
 			}
 
 			if reply.Term > rn.currentTerm {
