@@ -76,7 +76,7 @@ func (rn *RaftNode) startElection() {
 			defer rn.mu.Unlock()
 
 			if rn.role != Candidate || rn.currentTerm != term {
-				return   // Suppose A starts an election:Then while waiting for votes, A receives an AppendEntries from another valid leader: then A becomes a follower and ignores the vote replies from other nodes.
+				return // Suppose A starts an election:Then while waiting for votes, A receives an AppendEntries from another valid leader: then A becomes a follower and ignores the vote replies from other nodes.
 			}
 
 			if reply.Term > rn.currentTerm {
@@ -105,7 +105,6 @@ func (rn *RaftNode) startElection() {
 		}(i)
 	}
 }
-
 
 func (rn *RaftNode) broadcastAppendEntries() {
 	rn.mu.Lock()
@@ -158,9 +157,9 @@ func (rn *RaftNode) broadcastAppendEntries() {
 			peers[peerID].AppendEntries(&args, &reply)
 
 			rn.mu.Lock()
-			defer rn.mu.Unlock()
 
 			if rn.role != Leader || rn.currentTerm != term {
+				rn.mu.Unlock()
 				return
 			}
 
@@ -169,8 +168,11 @@ func (rn *RaftNode) broadcastAppendEntries() {
 				rn.role = Follower
 				rn.votedFor = -1
 				rn.resetElectionTimeout()
+				rn.mu.Unlock()
 				return
 			}
+
+			var msgs []ApplyMsg
 
 			if reply.Success {
 				// Update nextIndex and matchIndex for peer
@@ -192,7 +194,7 @@ func (rn *RaftNode) broadcastAppendEntries() {
 						}
 						if count > len(peers)/2 {
 							rn.commitIndex = N
-							rn.applyCommittedEntries()
+							msgs = rn.collectCommittedEntries()
 							break
 						}
 					}
@@ -201,6 +203,12 @@ func (rn *RaftNode) broadcastAppendEntries() {
 				// If append failed because of log inconsistency, decrement nextIndex and retry
 				if rn.nextIndex[peerID] > 1 {
 					rn.nextIndex[peerID]--
+				}
+			}
+			rn.mu.Unlock()
+			for _, msg := range msgs {
+				if rn.applyCh != nil {
+					rn.applyCh <- msg
 				}
 			}
 		}(i)

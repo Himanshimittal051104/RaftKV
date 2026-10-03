@@ -128,6 +128,7 @@ func TestBroadcastAppendEntriesCommitsMajority(t *testing.T) {
 		}
 	}
 }
+
 func TestApplyCommittedEntry(t *testing.T) {
 	applyCh := make(chan ApplyMsg, 10)
 
@@ -151,53 +152,55 @@ func TestApplyCommittedEntry(t *testing.T) {
 
 	node.commitIndex = 1
 
+	msgs := node.collectCommittedEntries()
+
 	node.mu.Unlock()
 
-	node.applyCommittedEntries()
+	// collectCommittedEntries should return the
+	// messages that need to be delivered.
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 ApplyMsg, got %d", len(msgs))
+	}
 
-	select {
-	case msg := <-applyCh:
-		if !msg.CommandValid {
-			t.Fatal("expected valid command")
-		}
+	msg := msgs[0]
 
-		if msg.CommandIndex != 1 {
-			t.Fatalf(
-				"expected command index 1, got %d",
-				msg.CommandIndex,
-			)
-		}
+	if !msg.CommandValid {
+		t.Fatal("expected valid command")
+	}
 
-		if msg.CommandTerm != 1 {
-			t.Fatalf(
-				"expected command term 1, got %d",
-				msg.CommandTerm,
-			)
-		}
+	if msg.CommandIndex != 1 {
+		t.Fatalf(
+			"expected command index 1, got %d",
+			msg.CommandIndex,
+		)
+	}
 
-		if msg.Command.Op != "SET" {
-			t.Fatalf(
-				"expected SET command, got %s",
-				msg.Command.Op,
-			)
-		}
+	if msg.CommandTerm != 1 {
+		t.Fatalf(
+			"expected command term 1, got %d",
+			msg.CommandTerm,
+		)
+	}
 
-		if msg.Command.Key != "name" {
-			t.Fatalf(
-				"expected key name, got %s",
-				msg.Command.Key,
-			)
-		}
+	if msg.Command.Op != "SET" {
+		t.Fatalf(
+			"expected SET command, got %s",
+			msg.Command.Op,
+		)
+	}
 
-		if msg.Command.Value != "Himanshi" {
-			t.Fatalf(
-				"expected value Himanshi, got %s",
-				msg.Command.Value,
-			)
-		}
+	if msg.Command.Key != "name" {
+		t.Fatalf(
+			"expected key name, got %s",
+			msg.Command.Key,
+		)
+	}
 
-	default:
-		t.Fatal("expected ApplyMsg but received none")
+	if msg.Command.Value != "Himanshi" {
+		t.Fatalf(
+			"expected value Himanshi, got %s",
+			msg.Command.Value,
+		)
 	}
 
 	node.mu.Lock()

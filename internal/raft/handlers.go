@@ -46,13 +46,13 @@ func (rn *RaftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) 
 // AppendEntries handles log replication and heartbeats from the leader.
 func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rn.mu.Lock()
-	defer rn.mu.Unlock()
 
 	reply.Success = false
 	reply.Term = rn.currentTerm
 
 	// 1. Reply false if term < currentTerm
 	if args.Term < rn.currentTerm {
+		rn.mu.Unlock()
 		return
 	}
 
@@ -70,12 +70,14 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 	if args.PrevLogIndex >= len(rn.log) {
 		reply.Term = rn.currentTerm
 		reply.Success = false
+		rn.mu.Unlock()
 		return
 	}
 
 	if rn.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Term = rn.currentTerm
 		reply.Success = false
+		rn.mu.Unlock()
 		return
 	}
 
@@ -100,14 +102,24 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 		argsIndex++
 	}
 
+	var msgs []ApplyMsg
+
 	// 4. Update commitIndex based on leaderCommit
 	if args.LeaderCommit > rn.commitIndex {
 		rn.commitIndex = min(args.LeaderCommit, len(rn.log)-1)
-		rn.applyCommittedEntries()
+		msgs = rn.collectCommittedEntries()
 	}
 
 	reply.Success = true
 	reply.Term = rn.currentTerm
+
+	rn.mu.Unlock()
+
+	for _, msg := range msgs {
+		if rn.applyCh != nil {
+			rn.applyCh <- msg
+		}
+	}
 }
 
 // Helper utility for min

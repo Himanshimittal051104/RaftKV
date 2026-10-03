@@ -207,24 +207,24 @@ func (rn *RaftNode) notifyApplied(index int, err error) {
 }
 
 
-// applyCommittedEntries sends committed log entries to the application layer and executes them in storage.
-func (rn *RaftNode) applyCommittedEntries() {
-	for rn.lastApplied < rn.commitIndex {
-		rn.lastApplied++
+// applyCommittedEntries collects committed log entries.
+func (rn *RaftNode) collectCommittedEntries() []ApplyMsg {
+    var msgs []ApplyMsg
 
-		entry := rn.log[rn.lastApplied]
+    for rn.lastApplied < rn.commitIndex {
+        rn.lastApplied++
 
-		msg := ApplyMsg{
-			CommandValid: true,
-			Command:      entry.Command,
-			CommandIndex: rn.lastApplied,
-			CommandTerm:  entry.Term,
-		}
+        entry := rn.log[rn.lastApplied]
 
-		// Do not silently drop committed commands.
-		if rn.applyCh != nil {
-    		rn.applyCh <- msg
-		}
+        msg := ApplyMsg{
+            CommandValid: true,
+            Command:      entry.Command,
+            CommandIndex: rn.lastApplied,
+            CommandTerm:  entry.Term,
+        }
 
-	}
+        msgs = append(msgs, msg)
+    }
+
+    return msgs
 }
