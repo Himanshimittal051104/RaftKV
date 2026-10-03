@@ -198,3 +198,45 @@ matchIndex
 
 
 `matchIndex` represents the highest log index known to be replicated on that follower.
+
+
+Before accepting entries, a follower verifies:
+```text
+PrevLogIndex
+PrevLogTerm
+```
+
+If the previous entry does not match, replication fails and the leader moves nextIndex backwards and retries.
+
+If a conflicting entry is found, the follower removes the conflicting suffix and appends the leader's entries.
+
+## Commitment
+A log entry becomes eligible for commitment when it has been replicated on a majority of the cluster.
+
+
+The leader advances:
+```text
+commitIndex
+```
+and committed entries are applied in order.
+
+
+The application path is:
+```text
+Raft
+  │
+  │ committed command
+  ▼
+ApplyMsg
+  │
+  ▼
+State Machine
+  │
+  ▼
+Storage Engine
+```
+The distinction between these stages is important:
+```text
+Append ≠ Commit ≠ Apply
+```
+Appending an entry to the leader's local log does not mean that the operation has been committed.
