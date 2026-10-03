@@ -346,3 +346,77 @@ Example response:
 
 ---
 
+## Project Structure
+```text
+RaftKV/
+├── cmd/
+│   └── server/
+│
+├── docs/
+│   └── invariants.md
+│
+├── internal/
+│   ├── raft/
+│   │   ├── handlers.go
+│   │   ├── raft.go
+│   │   ├── raft_test.go
+│   │   ├── rpc_types.go
+│   │   ├── ticker.go
+│   │   └── types.go
+│   │
+│   ├── server/
+│   │   ├── server.go
+│   │   └── server_test.go
+│   │
+│   └── storage/
+│       ├── engine.go
+│       └── mem_engine.go
+│
+├── proto/
+│
+├── go.mod
+└── README.md
+```
+
+---
+
+## Correctness Invariants
+RaftKV is being developed around explicit correctness invariants.
+
+
+Some of the current invariants include:
+- A server grants at most one vote per term.
+- A node rejects RPCs from stale terms.
+- A node steps down when it discovers a higher term.
+- A candidate's log must be sufficiently up-to-date to receive a vote.
+- A follower accepts log entries only when PrevLogIndex and PrevLogTerm match.
+- Committed entries are applied in log order.
+- lastApplied never exceeds commitIndex.
+- A log entry is committed only after replication on a majority.
+Additional invariants will be added as persistence, snapshots, linearizable reads, and failure testing are implemented.
+
+---
+
+## Goals
+The primary goal of RaftKV is to understand and implement the engineering principles behind distributed systems rather than simply using an existing distributed database implementation.
+
+
+The project focuses on:
+- Distributed consensus
+- Leader election
+- Replicated state machines
+- Log replication
+- Fault tolerance
+- Durable storage
+- Crash recovery
+- Linearizability
+- Distributed-system testing
+- Performance analysis
+RaftKV is being built from the consensus and storage primitives upward, with correctness and failure handling treated as first-class design requirements.
+
+---
+
+## Status
+RaftKV is an active distributed-systems project under development.
+The current implementation focuses on the Raft consensus core and replicated key-value state machine. Persistence, crash recovery, snapshots, fault injection, linearizability testing, observability, and performance engineering are part of the planned development roadmap.
+```
