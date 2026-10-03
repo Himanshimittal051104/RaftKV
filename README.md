@@ -58,12 +58,40 @@ Current endpoint:
 /kv
 ```
 
-Supported operations:
+### Supported operations:
 
 ```text
 POST   /kv
 GET    /kv?key=<key>
 DELETE /kv?key=<key>
+```
+
+## Architecture
+At a high level, RaftKV follows:
+
+```text
+                    Client
+                      │
+                      ▼
+                HTTP KV Server
+                      │
+                      ▼
+                  Raft Node
+                      │
+          ┌───────────┴───────────┐
+          │                       │
+          ▼                       ▼
+       Raft Log             State Machine
+          │                       │
+          │                 Storage Engine
+          │                       │
+          └──────────┬────────────┘
+                     │
+                Replication
+                     │
+             ┌───────┴───────┐
+             ▼               ▼
+          Follower         Follower
 ```
 
 
