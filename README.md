@@ -398,13 +398,13 @@ RaftKV/
 ### In Progress
 - [ ] Correctness hardening and failure testing
 - [ ] Linearizable reads
-- [ ] Persistent storage
-- [ ] Crash recovery
-- [ ] Snapshots and log compaction
-- [ ] Fault injection and chaos testing
 
 ### Planned
+- [ ] Persistent storage
+- [ ] Crash recovery
 - [ ] Custom storage engine
+- [ ] Snapshots and log compaction
+- [ ] Fault injection and chaos testing
 - [ ] Observability and metrics
 - [ ] Benchmarking and profiling
 - [ ] Production hardening
