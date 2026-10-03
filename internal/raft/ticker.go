@@ -41,6 +41,12 @@ func (rn *RaftNode) runLoop() {
 
 func (rn *RaftNode) startElection() {
 	rn.mu.Lock()
+	if rn.role == Leader ||
+        time.Since(rn.lastResetTime) < rn.electionTimeout {
+        rn.mu.Unlock()
+        return
+    }
+
 	rn.role = Candidate
 	rn.currentTerm++
 	rn.votedFor = rn.me
