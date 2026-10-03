@@ -419,4 +419,5 @@ RaftKV is being built from the consensus and storage primitives upward, with cor
 ## Status
 RaftKV is an active distributed-systems project under development.
 The current implementation focuses on the Raft consensus core and replicated key-value state machine. Persistence, crash recovery, snapshots, fault injection, linearizability testing, observability, and performance engineering are part of the planned development roadmap.
-```
+
+---
