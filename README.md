@@ -240,3 +240,28 @@ The distinction between these stages is important:
 Append ≠ Commit ≠ Apply
 ```
 Appending an entry to the leader's local log does not mean that the operation has been committed.
+
+## State Machine
+RaftKV separates consensus from application logic.
+
+
+The Raft layer is responsible for:
+- Leader election
+- Log replication
+- Commitment
+- Ordering
+  
+The state machine is responsible for applying committed commands.
+
+
+The storage layer provides the underlying key-value operations.
+```text
+Raft
+  │
+  ▼
+State Machine
+  │
+  ▼
+storage.Engine
+```
+
