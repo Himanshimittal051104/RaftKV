@@ -33,7 +33,7 @@ func (rn *RaftNode) runLoop() {
 			if role != Leader && elapsed >= timeout {
 				rn.startElection()
 			} else if role == Leader {
-				rn.broadcastHeartbeat()
+				rn.broadcastAppendEntries()
 			}
 		}
 	}
@@ -99,7 +99,7 @@ func (rn *RaftNode) startElection() {
 						rn.nextIndex[j] = len(rn.log)
 						rn.matchIndex[j] = 0
 					}
-					go rn.broadcastHeartbeat()
+					go rn.broadcastAppendEntries()
 				}
 			}
 		}(i)
@@ -107,7 +107,7 @@ func (rn *RaftNode) startElection() {
 }
 
 
-func (rn *RaftNode) broadcastHeartbeat() {
+func (rn *RaftNode) broadcastAppendEntries() {
 	rn.mu.Lock()
 	if rn.role != Leader {
 		rn.mu.Unlock()
