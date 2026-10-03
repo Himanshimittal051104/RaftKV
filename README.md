@@ -146,7 +146,23 @@ matchIndex[]
 
 ## Raft Log
 Each log entry contains:
+```go
+type LogEntry struct {
+    Index   int
+    Term    int
+    Command Command
+}
+```
 Commands contain:
+```go
+type Command struct {
+    ClientID  int64
+    SeqNumber int64
+    Op        string
+    Key       string
+    Value     string
+}
+```
 The log stores client commands together with the Raft term and log index.
 
 ## Leader Election
@@ -175,4 +191,6 @@ nextIndex
 matchIndex
 ```
 nextIndex represents the next log position the leader will attempt to replicate to that follower.
+
+
 matchIndex represents the highest log index known to be replicated on that follower.
