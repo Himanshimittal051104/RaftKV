@@ -193,6 +193,8 @@ The candidate's log is compared with the voter's log using:
 1. Last log term.
 2. Last log index if the terms are equal.
 
+---
+
 ## Log Replication
 The leader replicates entries using AppendEntries.
 
@@ -276,4 +278,71 @@ State Machine
   ▼
 storage.Engine
 ```
+
+---
+
+## Storage Engine
+The storage abstraction is defined by:
+```go
+type Engine interface {
+    Put(key, value []byte) error
+    Get(key []byte) ([]byte, bool, error)
+    Delete(key []byte) error
+    Close() error
+}
+```
+The current implementation is:
+```text
+MemEngine
+```
+which stores data in memory using a Go map.
+
+
+A persistent storage engine is planned as a future phase.
+
+---
+
+## HTTP API
+### PUT
+Create or update a key:
+```http
+POST /kv
+Content-Type: application/json
+
+{
+  "key": "name",
+  "value": "RaftKV"
+}
+```
+Example response:
+```json
+{
+  "success": true
+}
+```
+### GET
+Retrieve a value:
+```http
+GET /kv?key=name
+```
+Example response:
+```json
+{
+  "value": "RaftKV",
+  "found": true
+}
+```
+### DELETE
+Delete a key:
+```http
+DELETE /kv?key=name
+```
+Example response:
+```json
+{
+  "success": true
+}
+```
+
+---
 
