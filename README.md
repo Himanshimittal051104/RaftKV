@@ -168,6 +168,8 @@ The log stores client commands together with the Raft term and log index.
 ## Leader Election
 Each node starts as a follower.
 If a follower does not receive valid communication from a leader before its randomized election timeout expires, it starts an election.
+
+
 The candidate:
 1. Changes its role to Candidate.
 2. Increments its current term.
@@ -185,12 +187,14 @@ The candidate's log is compared with the voter's log using:
 
 ## Log Replication
 The leader replicates entries using AppendEntries.
+
+
 For each follower, the leader maintains:
 ```text
 nextIndex
 matchIndex
 ```
-nextIndex represents the next log position the leader will attempt to replicate to that follower.
+`nextIndex` represents the next log position the leader will attempt to replicate to that follower.
 
 
-matchIndex represents the highest log index known to be replicated on that follower.
+`matchIndex` represents the highest log index known to be replicated on that follower.
