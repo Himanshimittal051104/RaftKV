@@ -380,6 +380,37 @@ RaftKV/
 
 ---
 
+## Current Implementation Status
+
+### Implemented
+- [x] Raft node structure and state management
+- [x] Leader election
+- [x] Heartbeats
+- [x] RequestVote RPC
+- [x] AppendEntries RPC
+- [x] Log replication
+- [x] Log conflict resolution
+- [x] Majority-based commitment
+- [x] Replicated key-value operations
+- [x] In-memory storage engine
+- [x] HTTP API
+
+### In Progress
+- [ ] Correctness hardening and failure testing
+- [ ] Linearizable reads
+- [ ] Persistent storage
+- [ ] Crash recovery
+- [ ] Snapshots and log compaction
+- [ ] Fault injection and chaos testing
+
+### Planned
+- [ ] Custom storage engine
+- [ ] Observability and metrics
+- [ ] Benchmarking and profiling
+- [ ] Production hardening
+
+---
+
 ## Correctness Invariants
 RaftKV is being developed around explicit correctness invariants.
 
