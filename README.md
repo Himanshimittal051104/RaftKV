@@ -6,9 +6,7 @@ RaftKV is a distributed key-value store designed to explore the internals of
 distributed systems, consensus, replicated state machines, and fault-tolerant
 storage.
 
-The system currently implements Raft-based leader election, heartbeats,
-log replication, conflict resolution, majority-based commitment, and a
-replicated key-value state machine exposed through an HTTP API.
+The system currently implements Raft-based leader election, heartbeats, log replication, conflict resolution, majority-based commitment, a replicated key-value state machine, and linearizable reads using a ReadIndex-based mechanism.
 
 ---
 
@@ -20,14 +18,67 @@ replicated key-value state machine exposed through an HTTP API.
 - Candidate self-voting
 - Majority-based leader election
 - Term-based leadership
-- RequestVote RPC
-- AppendEntries RPC
+- `RequestVote` RPC
+- `AppendEntries` RPC
 - Heartbeats
 - Log replication
 - Log conflict detection and resolution
 - `nextIndex` and `matchIndex` tracking
 - Majority-based log commitment
 - Ordered application of committed entries
+- Higher-term detection and leader step-down
+- Election timer handling and stale-term protection
+
+### Linearizable Reads
+
+RaftKV implements leader-based linearizable reads using a ReadIndex-style mechanism.
+
+
+A `GET` request does not create a new Raft log entry.
+
+
+Instead, the leader:
+
+1. Verifies that it is currently the leader.
+2. Sends lightweight `ReadProbe` RPCs to other nodes.
+3. Obtains confirmation from a majority of the cluster.
+4. Establishes a `readIndex` from the committed state.
+5. Waits until the local state machine has applied through that index.
+6. Performs the read directly from the local storage engine.
+7. Re-checks leadership before returning the result.
+
+
+The read path is therefore:
+
+```text
+Client
+  │
+  ▼
+GET
+  │
+  ▼
+Leader Check
+  │
+  ▼
+ReadIndex
+  │
+  ▼
+ReadProbe Quorum
+  │
+  ▼
+Committed Read Index
+  │
+  ▼
+Wait for Application
+  │
+  ▼
+Storage Engine
+  │
+  ▼
+Response
+```
+
+A dedicated `ReadProbe` RPC is used instead of AppendEntries so that read confirmation does not perform unnecessary log-prefix matching or log repair.
 
 ### Key-Value Store
 
@@ -95,8 +146,8 @@ At a high level, RaftKV follows:
              ▼               ▼
           Follower         Follower
 ```
-
-A write follows the general path:
+### Write Path
+A write follows :
 ```text
 Client
   │
@@ -121,6 +172,38 @@ Apply to state machine
   ▼
 Storage Engine
 ```
+
+The system distinguishes between:
+```text
+Append ≠ Commit ≠ Apply
+```
+
+### Read Path
+Reads use a different path from writes:
+```text
+Client
+  │
+  ▼
+Leader
+  │
+  ▼
+ReadProbe RPCs
+  │
+  ▼
+Majority confirms current-term leadership
+  │
+  ▼
+readIndex
+  │
+  ▼
+Wait for local application
+  │
+  ▼
+Storage Engine
+```
+
+
+GET requests are therefore not appended to the Raft log.
 
 ---
 
@@ -247,11 +330,21 @@ State Machine
   ▼
 Storage Engine
 ```
-The distinction between these stages is important:
+
+The system maintains the distinction:
 ```text
-Append ≠ Commit ≠ Apply
+Log Append
+    ↓
+Replication
+    ↓
+Commit
+    ↓
+Apply
+    ↓
+State Machine
 ```
-Appending an entry to the leader's local log does not mean that the operation has been committed.
+
+Client write operations wait for their corresponding committed command to be applied before returning successfully.
 
 ---
 
@@ -367,6 +460,7 @@ RaftKV/
 │   ├── server/
 │   │   ├── server.go
 │   │   └── server_test.go
+│   │   └── state_machine.go
 │   │
 │   └── storage/
 │       ├── engine.go
@@ -394,14 +488,19 @@ RaftKV/
 - [x] Replicated key-value operations
 - [x] In-memory storage engine
 - [x] HTTP API
+- [x] Raft correctness hardening
+- [x] Election and term-transition handling
+- [x] Replication failure-path testing
+- [x] Dedicated ReadProbe RPC
+- [x] Majority-based ReadIndex
+- [x] Linearizable-read path
+- [x] ReadIndex application fence
+- [x] Leadership-loss handling during reads
 
 ### In Progress
-- [ ] Correctness hardening and failure testing
-- [ ] Linearizable reads
+- [ ] Persistence & Crash Recovery
 
 ### Planned
-- [ ] Persistent storage
-- [ ] Crash recovery
 - [ ] Custom storage engine
 - [ ] Snapshots and log compaction
 - [ ] Fault injection and chaos testing
@@ -422,41 +521,93 @@ Some of the current invariants include:
 - A candidate's log must be sufficiently up-to-date to receive a vote.
 - A follower accepts log entries only when PrevLogIndex and PrevLogTerm match.
 - Committed entries are applied in log order.
-- lastApplied never exceeds commitIndex.
+- `lastApplied` never exceeds commitIndex.
 - A log entry is committed only after replication on a majority.
+- Commit index never moves backwards.
+- A committed entry must not be overwritten by an outdated leader.
+- Leader commit advancement considers entries from the current term.
+- A ReadIndex requires confirmation from a majority in the leader's current term.
+- A higher-term response invalidates the current leader's ReadIndex operation.
+- A read waits until the local state machine has reached the ReadIndex.
+- A node that loses leadership does not complete the read through the old leader path.
+
+
 Additional invariants will be added as persistence, snapshots, linearizable reads, and failure testing are implemented.
+
+---
+
+## Testing
+RaftKV includes tests covering both normal operation and Raft safety properties.
+
+
+The test suite currently covers:
+- Leader election
+- Voting rules
+- Election timeout behavior
+- Higher-term transitions
+- Heartbeats
+- Log replication
+- Log conflict resolution
+- nextIndex and matchIndex updates
+- Majority commitment
+- Commit-index safety
+- State-machine application ordering
+- Client request completion
+- Replication failure paths
+- ReadProbe behavior
+- ReadIndex quorum confirmation
+- Linearizable-read fencing
+- Leadership loss during reads
+
+
+Run the Raft test suite with:
+```bash
+go test ./internal/raft
+```
+
+Run all project tests with:
+```bash
+go test ./...
+```
 
 ---
 
 ## Development Roadmap
 
-1. **Raft Consensus**
+1. **Raft Consensus — Completed**
    - Leader election
    - Heartbeats
    - Log replication
+   - Conflict resolution
    - Commitment and state-machine application
+   - Linearizable reads using ReadIndex
 
-2. **Durability**
+2. **Durability — Next**
    - Persistent Raft state
    - Crash recovery
-   - Custom storage engine
+   - Durable log
+   - Recovery-time state reconstruction
 
-3. **Scalability & Compaction**
+4. **Storage**
+   - Custom storage engine
+   - Storage/consensus durability integration
+
+4. **Scalability & Compaction**
    - Snapshots
    - Log compaction
 
-4. **Correctness & Reliability**
+5. **Correctness & Reliability**
    - Fault injection
    - Linearizability testing
    - Failure recovery testing
 
-5. **Observability & Performance**
+6. **Observability & Performance**
    - Metrics
    - Benchmarking
    - Profiling
    - Performance optimization
 
-6. **Production Hardening**
+7. **Production Hardening**
    - Concurrency hardening
    - Graceful shutdown
    - Robust error handling
@@ -479,12 +630,19 @@ The project focuses on:
 - Linearizability
 - Distributed-system testing
 - Performance analysis
+
+
 RaftKV is being built from the consensus and storage primitives upward, with correctness and failure handling treated as first-class design requirements.
 
 ---
 
 ## Status
 RaftKV is an active distributed-systems project under development.
-The current implementation focuses on the Raft consensus core and replicated key-value state machine. Persistence, crash recovery, snapshots, fault injection, linearizability testing, observability, and performance engineering are part of the planned development roadmap.
+
+
+The current implementation contains a functional Raft consensus core, replicated key-value state machine, HTTP API, correctness-focused testing, and a ReadIndex-based linearizable-read path.
+
+
+The next major development phase is persistent storage and crash recovery, followed by snapshots, fault injection, systematic correctness testing, observability, and performance engineering.
 
 ---
