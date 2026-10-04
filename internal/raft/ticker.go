@@ -8,6 +8,7 @@ import (
 // Start begins the election and heartbeat background goroutine.
 func (rn *RaftNode) StartBackground() {
 	go rn.runLoop()
+	go rn.applyLoop()
 }
 
 // Stop cleanly terminates the node's loop.
@@ -58,7 +59,7 @@ func (rn *RaftNode) startElection() {
 	lastLogTerm := rn.log[lastLogIndex].Term
 	peers := rn.peers
 	rn.mu.Unlock()
-
+	println("Node", me, "started election for term", term)
 	var votesMu sync.Mutex
 	votesReceived := 1 // Vote for self
 
@@ -94,13 +95,16 @@ func (rn *RaftNode) startElection() {
 			}
 
 			if reply.VoteGranted {
+				println("Node", me, "received vote from", peerID, "for term", term)
 				votesMu.Lock()
 				votesReceived++
 				hasQuorum := votesReceived > len(peers)/2
 				votesMu.Unlock()
 
 				if hasQuorum && rn.role == Candidate {
+					println("Node", me, "BECAME LEADER for term", term)
 					rn.role = Leader
+
 					for j := range rn.peers {
 						rn.nextIndex[j] = len(rn.log)
 						rn.matchIndex[j] = 0

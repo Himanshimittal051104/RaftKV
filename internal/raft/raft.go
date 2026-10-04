@@ -22,7 +22,6 @@ type RaftNode struct {
 	peers []*RaftNode // Direct in-memory pointers to peers for Phase 1 testing
 	me    int         // Index of this node in peers[]
 
-	// Persistent state on all servers (will persist to disk in Phase 4)
 	//According to Raft, these are the pieces of state that eventually need to survive a crash.
 	currentTerm int
 	votedFor    int        // -1 means no vote cast yet in currentTerm
@@ -50,10 +49,22 @@ type RaftNode struct {
 
 	applyCh chan ApplyMsg //This is a Go channel. It's used to send committed Raft commands toward the application/state-machine layer.
 	stopCh  chan struct{} //This is typically used to tell background goroutines
+
+	persister Persister
 }
 
 // NewRaftNode creates and initializes a node in the Follower state.
-func NewRaftNode(me int, peersCount int, applyCh chan ApplyMsg, engine storage.Engine) *RaftNode {
+func NewRaftNode(me int,peersCount int,applyCh chan ApplyMsg,engine storage.Engine) *RaftNode {
+
+    return NewRaftNodeWithPersister(
+        me,
+        peersCount,
+        applyCh,
+        engine,
+        NewMemPersister(),
+    )
+}
+func NewRaftNodeWithPersister(me int, peersCount int, applyCh chan ApplyMsg, engine storage.Engine, persister Persister) *RaftNode {
 	rn := &RaftNode{ //You're allocating a RaftNode and getting a pointer to it.
 		me:              me,
 		currentTerm:     0,
@@ -67,6 +78,7 @@ func NewRaftNode(me int, peersCount int, applyCh chan ApplyMsg, engine storage.E
 		stopCh:          make(chan struct{}),
 		Engine:          engine, // Assign engine here
 		applyWaiters:    make(map[int]chan error),
+		persister:       persister,
 	}
 
 	rn.resetElectionTimeout() //This chooses a randomized election timeout and records the current time.
@@ -149,7 +161,7 @@ func (rn *RaftNode) Get(key string) (string, bool, error) {
 		return "", false, err
 	}
 
-	// TODO: wait until the state machine has applied
+	// wait until the state machine has applied
 	// everything through readIndex.
 
 	if err := rn.waitForApply(readIndex); err != nil {
@@ -342,4 +354,35 @@ func (rn *RaftNode) readIndex() (int, error) {
 	}
 
 	return 0, ErrReadIndexFailed
+}
+
+func (rn *RaftNode) applyLoop() {
+	for {
+		select {
+		case <-rn.stopCh:
+			return
+
+		case msg := <-rn.applyCh:
+			if !msg.CommandValid {
+				continue
+			}
+
+			var err error
+
+			switch msg.Command.Op {
+			case "SET":
+				err = rn.Engine.Put(
+					[]byte(msg.Command.Key),
+					[]byte(msg.Command.Value),
+				)
+
+			case "DELETE":
+				err = rn.Engine.Delete(
+					[]byte(msg.Command.Key),
+				)
+			}
+
+			rn.notifyApplied(msg.CommandIndex, err)
+		}
+	}
 }
