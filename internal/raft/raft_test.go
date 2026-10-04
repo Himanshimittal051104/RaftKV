@@ -401,9 +401,9 @@ func TestClientAPIAndLeaderRedirection(t *testing.T) {
 	applyChs := make([]chan ApplyMsg, n)
 
 	for i := 0; i < n; i++ {
-    	engines[i] = storage.NewMemEngine()
-    	applyChs[i] = make(chan ApplyMsg, 100)
-    	nodes[i] = NewRaftNode(i, n, applyChs[i], engines[i])
+		engines[i] = storage.NewMemEngine()
+		applyChs[i] = make(chan ApplyMsg, 100)
+		nodes[i] = NewRaftNode(i, n, applyChs[i], engines[i])
 	}
 
 	// Test-side state-machine consumer.
@@ -434,7 +434,6 @@ func TestClientAPIAndLeaderRedirection(t *testing.T) {
 			}
 		}(i)
 	}
-
 
 	// Connect peers and start their background loops
 	for i := 0; i < n; i++ {
@@ -476,7 +475,7 @@ func TestClientAPIAndLeaderRedirection(t *testing.T) {
 	// Test 1: Verify Follower returns ErrWrongLeader
 	followerID := (leaderID + 1) % n
 	follower := nodes[followerID]
-	
+
 	_, err := follower.Put("test_key", "test_val")
 	if !errors.Is(err, ErrWrongLeader) {
 		t.Fatalf("Expected ErrWrongLeader on follower Put, got: %v", err)
@@ -489,8 +488,6 @@ func TestClientAPIAndLeaderRedirection(t *testing.T) {
 		t.Fatalf("Failed to Put on leader: %v", err)
 	}
 	t.Log("Put command submitted successfully to leader")
-
-	
 
 	// Test 3: Successful Get on Leader
 	val, found, err := leader.Get("city")
@@ -2074,8 +2071,8 @@ func TestLeaderDecrementsNextIndexAndRepairsFollower(t *testing.T) {
 
 		repaired :=
 			len(follower.log) == 3 &&
-			follower.log[2].Term == 2 &&
-			follower.log[2].Command.Value == "B"
+				follower.log[2].Term == 2 &&
+				follower.log[2].Command.Value == "B"
 
 		follower.mu.Unlock()
 
@@ -2324,5 +2321,422 @@ func TestFollowerDoesNotCommitBeyondItsLog(t *testing.T) {
 			follower.commitIndex,
 			len(follower.log)-1,
 		)
+	}
+}
+
+func TestReadProbeCurrentTerm(t *testing.T) {
+	node := NewRaftNode(
+		0,
+		1,
+		make(chan ApplyMsg, 10),
+		storage.NewMemEngine(),
+	)
+
+	node.mu.Lock()
+	node.currentTerm = 5
+	node.role = Follower
+	node.lastResetTime = time.Now().Add(-1 * time.Second)
+	oldReset := node.lastResetTime
+	node.mu.Unlock()
+
+	args := ReadProbeArgs{
+		Term:     5,
+		LeaderID: 0,
+	}
+
+	var reply ReadProbeReply
+	node.ReadProbe(&args, &reply)
+
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	if reply.Term != 5 {
+		t.Fatalf("expected reply term 5, got %d", reply.Term)
+	}
+
+	if node.role != Follower {
+		t.Fatalf("expected follower, got %v", node.role)
+	}
+
+	if !node.lastResetTime.After(oldReset) {
+		t.Fatalf("expected election timer to reset")
+	}
+}
+
+func TestReadProbeHigherTerm(t *testing.T) {
+	node := NewRaftNode(
+		0,
+		1,
+		make(chan ApplyMsg, 10),
+		storage.NewMemEngine(),
+	)
+
+	node.mu.Lock()
+	node.currentTerm = 3
+	node.role = Candidate
+	node.votedFor = 1
+	node.mu.Unlock()
+
+	args := ReadProbeArgs{
+		Term:     5,
+		LeaderID: 0,
+	}
+
+	var reply ReadProbeReply
+	node.ReadProbe(&args, &reply)
+
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	if node.currentTerm != 5 {
+		t.Fatalf("expected term 5, got %d", node.currentTerm)
+	}
+
+	if node.role != Follower {
+		t.Fatalf("expected follower, got %v", node.role)
+	}
+
+	if node.votedFor != -1 {
+		t.Fatalf("expected votedFor to be reset, got %d", node.votedFor)
+	}
+
+	if reply.Term != 5 {
+		t.Fatalf("expected reply term 5, got %d", reply.Term)
+	}
+}
+
+func TestReadProbeStaleTerm(t *testing.T) {
+	node := NewRaftNode(
+		0,
+		1,
+		make(chan ApplyMsg, 10),
+		storage.NewMemEngine(),
+	)
+
+	node.mu.Lock()
+	node.currentTerm = 5
+	node.role = Follower
+	node.electionTimeout = 200 * time.Millisecond
+	node.lastResetTime = time.Now().Add(-190 * time.Millisecond)
+	before := node.lastResetTime
+	node.mu.Unlock()
+
+	args := ReadProbeArgs{
+		Term:     4,
+		LeaderID: 0,
+	}
+
+	var reply ReadProbeReply
+	node.ReadProbe(&args, &reply)
+
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	if reply.Term != 5 {
+		t.Fatalf("expected reply term 5, got %d", reply.Term)
+	}
+
+	if node.currentTerm != 5 {
+		t.Fatalf("expected term to remain 5, got %d", node.currentTerm)
+	}
+
+	if !node.lastResetTime.Equal(before) {
+		t.Fatal("stale probe should not reset election timer")
+	}
+}
+
+func TestReadIndexMajority(t *testing.T) {
+	nodes := make([]*RaftNode, 3)
+	for i := 0; i < 3; i++ {
+		nodes[i] = NewRaftNode(
+			i,
+			3,
+			make(chan ApplyMsg, 10),
+			storage.NewMemEngine(),
+		)
+	}
+
+	for i := range nodes {
+		nodes[i].SetPeers(nodes)
+	}
+
+	nodes[0].mu.Lock()
+	nodes[0].role = Leader
+	nodes[0].currentTerm = 5
+	nodes[0].commitIndex = 7
+	nodes[0].mu.Unlock()
+
+	readIndex, err := nodes[0].readIndex()
+	if err != nil {
+		t.Fatalf("readIndex failed: %v", err)
+	}
+
+	if readIndex != 7 {
+		t.Fatalf("expected readIndex 7, got %d", readIndex)
+	}
+}
+
+func TestReadIndexSingleNode(t *testing.T) {
+	node := NewRaftNode(
+		0,
+		1,
+		make(chan ApplyMsg, 10),
+		storage.NewMemEngine(),
+	)
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 3
+	node.commitIndex = 5
+	node.mu.Unlock()
+
+	readIndex, err := node.readIndex()
+	if err != nil {
+		t.Fatalf("readIndex failed: %v", err)
+	}
+
+	if readIndex != 5 {
+		t.Fatalf("expected readIndex 5, got %d", readIndex)
+	}
+}
+
+func TestReadIndexHigherTermStepsDown(t *testing.T) {
+	nodes := make([]*RaftNode, 2)
+
+	for i := 0; i < 2; i++ {
+		nodes[i] = NewRaftNode(
+			i,
+			2,
+			make(chan ApplyMsg, 10),
+			storage.NewMemEngine(),
+		)
+	}
+
+	for i := range nodes {
+		nodes[i].SetPeers(nodes)
+	}
+
+	nodes[0].mu.Lock()
+	nodes[0].role = Leader
+	nodes[0].currentTerm = 5
+	nodes[0].commitIndex = 3
+	nodes[0].mu.Unlock()
+
+	nodes[1].mu.Lock()
+	nodes[1].currentTerm = 6
+	nodes[1].mu.Unlock()
+
+	_, err := nodes[0].readIndex()
+
+	if err != ErrWrongLeader {
+		t.Fatalf("expected ErrWrongLeader, got %v", err)
+	}
+
+	nodes[0].mu.Lock()
+	defer nodes[0].mu.Unlock()
+
+	if nodes[0].currentTerm != 6 {
+		t.Fatalf("expected term 6, got %d", nodes[0].currentTerm)
+	}
+
+	if nodes[0].role != Follower {
+		t.Fatalf("expected follower, got %v", nodes[0].role)
+	}
+}
+
+func TestGetWaitsForReadIndexToApply(t *testing.T) {
+	node := NewRaftNode(
+		0,
+		1,
+		make(chan ApplyMsg, 10),
+		storage.NewMemEngine(),
+	)
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 1
+	node.commitIndex = 1
+	node.lastApplied = 0
+	node.mu.Unlock()
+
+	// Put the value directly into the engine only after the
+	// read-index application point is reached.
+	done := make(chan struct{})
+
+	go func() {
+		_, _, _ = node.Get("key")
+		close(done)
+	}()
+
+	// Give Get() enough time to reach waitForApply().
+	time.Sleep(50 * time.Millisecond)
+
+	select {
+	case <-done:
+		t.Fatal("Get returned before read index was applied")
+	default:
+	}
+
+	// Simulate application of index 1.
+	node.mu.Lock()
+	node.lastApplied = 1
+	node.mu.Unlock()
+
+	node.notifyApplied(1, nil)
+
+	select {
+	case <-done:
+		// Expected.
+	case <-time.After(1 * time.Second):
+		t.Fatal("Get did not return after read index was applied")
+	}
+}
+
+func TestGetWaitsForReadIndexApplication(t *testing.T) {
+	nodes := make([]*RaftNode, 3)
+	engines := make([]storage.Engine, 3)
+
+	for i := 0; i < 3; i++ {
+		engines[i] = storage.NewMemEngine()
+
+		nodes[i] = NewRaftNode(
+			i,
+			3,
+			make(chan ApplyMsg, 10),
+			engines[i],
+		)
+	}
+
+	for i := range nodes {
+		nodes[i].SetPeers(nodes)
+	}
+
+	leader := nodes[0]
+
+	leader.mu.Lock()
+	leader.role = Leader
+	leader.currentTerm = 1
+	leader.commitIndex = 1
+	leader.lastApplied = 0
+
+	// Create the committed log entry that Get() will fence on.
+	leader.log = append(leader.log, LogEntry{
+		Index: 1,
+		Term:  1,
+		Command: Command{
+			Op:    "SET",
+			Key:   "x",
+			Value: "value",
+		},
+	})
+	leader.mu.Unlock()
+
+	done := make(chan struct{})
+	var (
+		value string
+		found bool
+		err   error
+	)
+
+	go func() {
+		value, found, err = leader.Get("x")
+		close(done)
+	}()
+
+	// Give Get() time to perform ReadIndex and reach waitForApply().
+	time.Sleep(50 * time.Millisecond)
+
+	select {
+	case <-done:
+		t.Fatal("Get returned before the read index was applied")
+	default:
+	}
+
+	// Simulate the state machine applying index 1.
+	if err := engines[0].Put([]byte("x"), []byte("value")); err != nil {
+		t.Fatalf("failed to apply value: %v", err)
+	}
+
+	leader.mu.Lock()
+	leader.lastApplied = 1
+	leader.mu.Unlock()
+
+	leader.notifyApplied(1, nil)
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("Get did not return after read index was applied")
+	}
+
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+
+	if !found {
+		t.Fatal("expected key to be found")
+	}
+
+	if value != "value" {
+		t.Fatalf("expected value 'value', got %q", value)
+	}
+}
+
+func TestGetFailsIfLeadershipLostBeforeRead(t *testing.T) {
+	node := NewRaftNode(
+		0,
+		1,
+		make(chan ApplyMsg, 10),
+		storage.NewMemEngine(),
+	)
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 1
+	node.commitIndex = 1
+	node.lastApplied = 0
+
+	node.log = append(node.log, LogEntry{
+		Index: 1,
+		Term:  1,
+		Command: Command{
+			Op:    "SET",
+			Key:   "x",
+			Value: "value",
+		},
+	})
+	node.mu.Unlock()
+
+	done := make(chan struct{})
+	var err error
+
+	go func() {
+		_, _, err = node.Get("x")
+		close(done)
+	}()
+
+	// Give Get enough time to reach waitForApply.
+	time.Sleep(50 * time.Millisecond)
+
+	// Simulate losing leadership while waiting.
+	node.mu.Lock()
+	node.role = Follower
+	node.mu.Unlock()
+
+	// Simulate the read index becoming applied.
+	node.mu.Lock()
+	node.lastApplied = 1
+	node.mu.Unlock()
+
+	node.notifyApplied(1, nil)
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("Get did not return")
+	}
+
+	if err != ErrWrongLeader {
+		t.Fatalf("expected ErrWrongLeader, got %v", err)
 	}
 }

@@ -28,6 +28,16 @@ type AppendEntriesReply struct {
 	Success bool // True if follower contained entry matching PrevLogIndex and PrevLogTerm
 }
 
+type ReadProbeArgs struct {
+    Term     int
+    LeaderID int
+}
+
+type ReadProbeReply struct {
+    Term int
+}
+
+
 // LastLogIndex + LastLogTerm
 //         ↓
 // "Is this candidate's log up-to-date?"

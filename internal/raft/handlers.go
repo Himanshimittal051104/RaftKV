@@ -129,3 +129,26 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+
+func (rn *RaftNode) ReadProbe(args *ReadProbeArgs, reply *ReadProbeReply) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	if args.Term < rn.currentTerm {
+		reply.Term = rn.currentTerm
+		return
+	}
+
+	if args.Term > rn.currentTerm {
+		rn.currentTerm = args.Term
+		rn.role = Follower
+		rn.votedFor = -1
+	}
+
+	// We received a valid current-term probe from the leader.
+	rn.role = Follower
+	rn.lastResetTime = time.Now()
+
+	reply.Term = rn.currentTerm
+}
