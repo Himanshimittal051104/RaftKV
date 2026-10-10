@@ -81,25 +81,28 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 		return
 	}
 
-	// If term is higher, update state and become follower
-	newTerm := rn.currentTerm
-	newVotedFor := rn.votedFor
-
 	if args.Term > rn.currentTerm {
-		newTerm = args.Term
-		newVotedFor = -1
+		if err := rn.persistState(args.Term, -1, rn.log); err != nil {
+			reply.Term = rn.currentTerm
+			rn.mu.Unlock()
+			return
+		}
+
+		rn.currentTerm = args.Term
+		rn.votedFor = -1
 	}
 
+	rn.role = Follower
+	rn.lastResetTime = time.Now()
+	reply.Term = rn.currentTerm
 
 	// 2. Reply false if log doesn't contain an entry at PrevLogIndex matching PrevLogTerm
 	if args.PrevLogIndex >= len(rn.log) {
-		reply.Term =newTerm
 		rn.mu.Unlock()
 		return
 	}
 
 	if rn.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.Term = rn.currentTerm
 		rn.mu.Unlock()
 		return
 	}
@@ -128,18 +131,14 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 		argsIndex++
 	}
 
-	if err := rn.persistState(newTerm, newVotedFor, newLog); err != nil {
+	if err := rn.persistState(rn.currentTerm, rn.votedFor, newLog); err != nil {
 		reply.Term = rn.currentTerm
 		rn.mu.Unlock()
 		return
 	}
-
-	rn.currentTerm = newTerm
-	rn.votedFor = newVotedFor
-	rn.log = newLog
-	rn.role = Follower
-	rn.lastResetTime = time.Now()
 	
+	rn.log = newLog
+
 	var msgs []ApplyMsg
 
 	// 4. Update commitIndex based on leaderCommit
@@ -179,8 +178,12 @@ func (rn *RaftNode) ReadProbe(args *ReadProbeArgs, reply *ReadProbeReply) {
 	}
 
 	if args.Term > rn.currentTerm {
+		if err := rn.persistState(args.Term, -1, rn.log); err != nil {
+			reply.Term = rn.currentTerm
+			return
+		}
+
 		rn.currentTerm = args.Term
-		rn.role = Follower
 		rn.votedFor = -1
 	}
 

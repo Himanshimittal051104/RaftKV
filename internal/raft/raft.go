@@ -7,6 +7,7 @@ import (
 	"time"      //This handles election and heartbeat timing.
 
 	"RaftKV/internal/storage" //This connects the Raft layer to your KV storage engine.
+	"fmt"
 )
 
 // Instead of repeatedly creating new error instances, we define them as package-level variables.
@@ -80,6 +81,22 @@ func NewRaftNodeWithPersister(me int, peersCount int, applyCh chan ApplyMsg, eng
 		applyWaiters:    make(map[int]chan error),
 		persister:       persister,
 	}
+
+	savedState, err := persister.ReadRaftState()
+    if err != nil {
+        panic(fmt.Sprintf("raft: failed to read persisted state: %v", err))
+    }
+
+	if len(savedState) > 0 {
+        term, vote, restoredLog, err := decodeRaftState(savedState)
+        if err != nil {
+            panic(fmt.Sprintf("raft: failed to decode persisted state: %v", err))
+        }
+
+        rn.currentTerm = term
+        rn.votedFor = vote
+        rn.log = restoredLog
+    }
 
 	rn.resetElectionTimeout() //This chooses a randomized election timeout and records the current time.
 	return rn                 //Returns the initialized node.

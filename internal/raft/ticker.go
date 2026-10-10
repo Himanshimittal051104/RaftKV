@@ -186,6 +186,11 @@ func (rn *RaftNode) broadcastAppendEntries() {
 			}
 
 			if reply.Term > rn.currentTerm {
+				if err := rn.persistState(reply.Term, -1, rn.log); err != nil {
+        			// Persistence failed; don't publish the state change.
+        			rn.mu.Unlock()
+        			return
+    			}
 				rn.currentTerm = reply.Term
 				rn.role = Follower
 				rn.votedFor = -1
