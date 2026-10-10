@@ -32,7 +32,7 @@ type RaftNode struct {
 	commitIndex int
 	lastApplied int //lastApplied <= commitIndex
 	//After a crash, you can reconstruct the state machine from persistent storage/snapshot + log replay.
-	
+
 	role Role
 
 	// Volatile state on leaders
@@ -79,6 +79,13 @@ func NewPersistentRaftNode(me int, peersCount int, applyCh chan ApplyMsg, engine
 		engine,
 		persister,
 	)
+
+	// Recover application state for our single-node configuration.
+	if peersCount == 1 {
+		if err := node.recoverSingleNodeState(); err != nil {
+			return nil, err
+		}
+	}
 
 	return node, nil
 }
@@ -471,4 +478,56 @@ func (rn *RaftNode) persistState(currentTerm int, votedFor int, log []LogEntry) 
 	}
 
 	return rn.persister.SaveRaftState(state)
+}
+
+// recoverSingleNodeState rebuilds the in-memory state machine
+// from the persisted log during single-node startup.
+//
+// Call this before starting background goroutines or serving requests.
+func (rn *RaftNode) recoverSingleNodeState() error {
+	lastIndex := len(rn.log) - 1
+
+	// Replay log entries in order, skipping the dummy entry at index 0.
+	for i := 1; i <= lastIndex; i++ {
+		entry := rn.log[i]
+
+		switch entry.Command.Op {
+		case "SET":
+			if err := rn.Engine.Put(
+				[]byte(entry.Command.Key),
+				[]byte(entry.Command.Value),
+			); err != nil {
+				return fmt.Errorf(
+					"recover SET at index %d: %w",
+					i,
+					err,
+				)
+			}
+
+		case "DELETE":
+			if err := rn.Engine.Delete(
+				[]byte(entry.Command.Key),
+			); err != nil {
+				return fmt.Errorf(
+					"recover DELETE at index %d: %w",
+					i,
+					err,
+				)
+			}
+
+		default:
+			return fmt.Errorf(
+				"recover log index %d: unsupported operation %q",
+				i,
+				entry.Command.Op,
+			)
+		}
+	}
+
+	// In this single-node configuration, the recovered durable log
+	// represents the committed state reconstructed above.
+	rn.commitIndex = lastIndex
+	rn.lastApplied = lastIndex
+
+	return nil
 }

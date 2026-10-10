@@ -1,56 +1,58 @@
 package raft
 
 import (
-    "bytes"
-    "path/filepath"
-    "testing"
-    "reflect"
+	"RaftKV/internal/storage"
+	"bytes"
+	"path/filepath"
+	"reflect"
+	"testing"
+	"time"
 )
 
 func TestMemPersisterSaveAndRead(t *testing.T) {
-    p := NewMemPersister()
+	p := NewMemPersister()
 
-    original := []byte("raft-state")
+	original := []byte("raft-state")
 
-    if err := p.SaveRaftState(original); err != nil {
-        t.Fatalf("SaveRaftState failed: %v", err)
-    }
+	if err := p.SaveRaftState(original); err != nil {
+		t.Fatalf("SaveRaftState failed: %v", err)
+	}
 
-    restored, err := p.ReadRaftState()
-    if err != nil {
-        t.Fatalf("ReadRaftState failed: %v", err)
-    }
+	restored, err := p.ReadRaftState()
+	if err != nil {
+		t.Fatalf("ReadRaftState failed: %v", err)
+	}
 
-    if !bytes.Equal(restored, original) {
-        t.Fatalf("restored state = %q, want %q", restored, original)
-    }
+	if !bytes.Equal(restored, original) {
+		t.Fatalf("restored state = %q, want %q", restored, original)
+	}
 }
 
 func TestMemPersisterCopiesState(t *testing.T) {
-    p := NewMemPersister()
+	p := NewMemPersister()
 
-    original := []byte("raft-state")
+	original := []byte("raft-state")
 
-    if err := p.SaveRaftState(original); err != nil {
-        t.Fatalf("SaveRaftState failed: %v", err)
-    }
+	if err := p.SaveRaftState(original); err != nil {
+		t.Fatalf("SaveRaftState failed: %v", err)
+	}
 
-    original[0] = 'X'
+	original[0] = 'X'
 
-    restored, err := p.ReadRaftState()
-    if err != nil {
-        t.Fatalf("ReadRaftState failed: %v", err)
-    }
+	restored, err := p.ReadRaftState()
+	if err != nil {
+		t.Fatalf("ReadRaftState failed: %v", err)
+	}
 
-    if bytes.Equal(restored, original) {
-        t.Fatalf("persister state changed when caller modified original")
-    }
+	if bytes.Equal(restored, original) {
+		t.Fatalf("persister state changed when caller modified original")
+	}
 
-    expected := []byte("raft-state")
+	expected := []byte("raft-state")
 
-    if !bytes.Equal(restored, expected) {
-        t.Fatalf("restored state = %q, want %q", restored, expected)
-    }
+	if !bytes.Equal(restored, expected) {
+		t.Fatalf("restored state = %q, want %q", restored, expected)
+	}
 }
 
 func TestPersisterRoundTrip(t *testing.T) {
@@ -58,17 +60,17 @@ func TestPersisterRoundTrip(t *testing.T) {
 
 	originalLog := []LogEntry{
 		{Index: 1, Term: 1, Command: Command{
-			ClientID: 101,
+			ClientID:  101,
 			SeqNumber: 1,
-			Op: "SET",
-			Key: "name",
-			Value: "Himanshi",
+			Op:        "SET",
+			Key:       "name",
+			Value:     "Himanshi",
 		}},
 		{Index: 2, Term: 2, Command: Command{
-			ClientID: 101,
+			ClientID:  101,
 			SeqNumber: 2,
-			Op: "DELETE",
-			Key: "old-key",
+			Op:        "DELETE",
+			Key:       "old-key",
 		}},
 	}
 
@@ -113,64 +115,62 @@ func TestPersisterRoundTrip(t *testing.T) {
 	}
 }
 
-
 func TestRaftNodeRestoresPersistedState(t *testing.T) {
-    persister := NewMemPersister()
+	persister := NewMemPersister()
 
-    originalLog := []LogEntry{
-        {Index: 0, Term: 0},
-        {
-            Index: 1,
-            Term: 2,
-            Command: Command{
-                Op:    "SET",
-                Key:   "language",
-                Value: "Go",
-            },
-        },
-    }
+	originalLog := []LogEntry{
+		{Index: 0, Term: 0},
+		{
+			Index: 1,
+			Term:  2,
+			Command: Command{
+				Op:    "SET",
+				Key:   "language",
+				Value: "Go",
+			},
+		},
+	}
 
-    // Simulate state saved by the first node.
-    encoded, err := encodeRaftState(2, 1, originalLog)
-    if err != nil {
-        t.Fatalf("encode state: %v", err)
-    }
+	// Simulate state saved by the first node.
+	encoded, err := encodeRaftState(2, 1, originalLog)
+	if err != nil {
+		t.Fatalf("encode state: %v", err)
+	}
 
-    if err := persister.SaveRaftState(encoded); err != nil {
-        t.Fatalf("save state: %v", err)
-    }
+	if err := persister.SaveRaftState(encoded); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
 
-    // Construct a new node using the same persister.
-    node := NewRaftNodeWithPersister(
-        0,
-        1,
-        make(chan ApplyMsg),
-        nil,
-        persister,
-    )
+	// Construct a new node using the same persister.
+	node := NewRaftNodeWithPersister(
+		0,
+		1,
+		make(chan ApplyMsg),
+		nil,
+		persister,
+	)
 
-    defer close(node.stopCh)
+	defer close(node.stopCh)
 
-    node.mu.Lock()
-    defer node.mu.Unlock()
+	node.mu.Lock()
+	defer node.mu.Unlock()
 
-    if node.currentTerm != 2 {
-        t.Errorf("currentTerm = %d, want 2", node.currentTerm)
-    }
+	if node.currentTerm != 2 {
+		t.Errorf("currentTerm = %d, want 2", node.currentTerm)
+	}
 
-    if node.votedFor != 1 {
-        t.Errorf("votedFor = %d, want 1", node.votedFor)
-    }
+	if node.votedFor != 1 {
+		t.Errorf("votedFor = %d, want 1", node.votedFor)
+	}
 
-    if len(node.log) != len(originalLog) {
-        t.Fatalf("log length = %d, want %d", len(node.log), len(originalLog))
-    }
+	if len(node.log) != len(originalLog) {
+		t.Fatalf("log length = %d, want %d", len(node.log), len(originalLog))
+	}
 
-    if !reflect.DeepEqual(node.log, originalLog) {
-        t.Errorf("restored log does not match original log")
-    }
+	if !reflect.DeepEqual(node.log, originalLog) {
+		t.Errorf("restored log does not match original log")
+	}
 }
-
 
 func TestFilePersisterSaveAndRead(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "raft-state.bin")
@@ -202,7 +202,6 @@ func TestFilePersisterSaveAndRead(t *testing.T) {
 	}
 }
 
-
 func TestFilePersisterRestoresRaftState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "raft-state.bin")
 
@@ -215,7 +214,7 @@ func TestFilePersisterRestoresRaftState(t *testing.T) {
 		{Index: 0, Term: 0},
 		{
 			Index: 1,
-			Term: 3,
+			Term:  3,
 			Command: Command{
 				Op:    "SET",
 				Key:   "city",
@@ -261,7 +260,6 @@ func TestFilePersisterRestoresRaftState(t *testing.T) {
 	}
 }
 
-
 func TestRaftNodeRecoversFromFilePersister(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "raft-state.bin")
 
@@ -274,7 +272,7 @@ func TestRaftNodeRecoversFromFilePersister(t *testing.T) {
 		{Index: 0, Term: 0},
 		{
 			Index: 1,
-			Term: 4,
+			Term:  4,
 			Command: Command{
 				Op:    "SET",
 				Key:   "language",
@@ -321,5 +319,66 @@ func TestRaftNodeRecoversFromFilePersister(t *testing.T) {
 
 	if !reflect.DeepEqual(node.log, originalLog) {
 		t.Errorf("recovered log does not match original log")
+	}
+}
+
+func TestPersistentNodeRecoversStateMachine(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
+
+	// First node: write a key to the state machine.
+	engine1 := storage.NewMemEngine()
+	applyCh1 := make(chan ApplyMsg, 100)
+
+	node1, err := NewPersistentRaftNode(
+		0, 1, applyCh1, engine1, stateFile,
+	)
+	if err != nil {
+		t.Fatalf("create first node: %v", err)
+	}
+
+	node1.StartBackground()
+	defer node1.Stop()
+
+	// Wait for the single-node election to finish.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		node1.mu.Lock()
+		isLeader := node1.role == Leader
+		node1.mu.Unlock()
+
+		if isLeader {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first node did not become leader")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if _, err := node1.Put("language", "Go"); err != nil {
+		t.Fatalf("put language=Go: %v", err)
+	}
+
+	// Second node: same persisted file, but a fresh empty engine.
+	engine2 := storage.NewMemEngine()
+	applyCh2 := make(chan ApplyMsg, 100)
+
+	node2, err := NewPersistentRaftNode(
+		0, 1, applyCh2, engine2, stateFile,
+	)
+	if err != nil {
+		t.Fatalf("create recovered node: %v", err)
+	}
+	defer node2.Stop()
+
+	value, found, err := node2.Engine.Get([]byte("language"))
+	if err != nil {
+		t.Fatalf("get recovered value: %v", err)
+	}
+	if !found {
+		t.Fatal("expected language key to be recovered")
+	}
+	if string(value) != "Go" {
+		t.Fatalf("expected Go, got %q", string(value))
 	}
 }
