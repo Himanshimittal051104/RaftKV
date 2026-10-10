@@ -112,12 +112,26 @@ func (rn *RaftNode) Start(command Command) (int, int, bool) {
 
 	index := len(rn.log)
 	term := rn.currentTerm //The new log entry belongs to the leader's current term.
-	rn.log = append(rn.log, LogEntry{
+	entry := LogEntry{
+		Index:   index,
 		Term:    term,
 		Command: command,
-	})
-	//Notice you don't explicitly set Index here.That's because you're using the slice position as the effective log index.
+	}
 
+	newLog := make([]LogEntry, len(rn.log)+1)
+	copy(newLog, rn.log)
+	newLog[len(rn.log)] = entry
+
+	if err := rn.persistState(
+		rn.currentTerm,
+		rn.votedFor,
+		newLog,
+	); err != nil {
+		return -1, -1, false
+	}
+
+	rn.log = newLog
+	
 	//Update leader's own replication state. Since the leader has obviously appended the entry to its own log:
 	rn.matchIndex[rn.me] = index
 	rn.nextIndex[rn.me] = index + 1
@@ -385,4 +399,17 @@ func (rn *RaftNode) applyLoop() {
 			rn.notifyApplied(msg.CommandIndex, err)
 		}
 	}
+}
+
+func (rn *RaftNode) persistState(currentTerm int,votedFor int,log []LogEntry,) error {
+	state, err := encodeRaftState(
+		currentTerm,
+		votedFor,
+		log,
+	)
+	if err != nil {
+		return err
+	}
+
+	return rn.persister.SaveRaftState(state)
 }

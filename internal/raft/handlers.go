@@ -14,9 +14,23 @@ func (rn *RaftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) 
 	}
 
 	if args.Term > rn.currentTerm {
-		rn.currentTerm = args.Term
+		newTerm := args.Term
+		newVotedFor := -1
+
+		if err := rn.persistState(
+			newTerm,
+			newVotedFor,
+			rn.log,
+		); err != nil {
+			reply.Term = rn.currentTerm
+			reply.VoteGranted = false
+			return
+		}
+
+		rn.currentTerm = newTerm
 		rn.role = Follower
-		rn.votedFor = -1
+		rn.votedFor = newVotedFor
+		
 	}
 
 	canVote := rn.votedFor == -1 || rn.votedFor == args.CandidateID
@@ -32,7 +46,18 @@ func (rn *RaftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) 
 	}
 
 	if canVote && logUpToDate {
-		rn.votedFor = args.CandidateID
+		newVotedFor := args.CandidateID
+
+		if err := rn.persistState(
+			rn.currentTerm,
+			newVotedFor,
+			rn.log,
+		); err != nil {
+			reply.Term = rn.currentTerm
+			reply.VoteGranted = false
+			return
+		}
+		rn.votedFor = newVotedFor
 		rn.role = Follower
 		rn.lastResetTime = time.Now()
 		reply.VoteGranted = true
@@ -57,29 +82,30 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 	}
 
 	// If term is higher, update state and become follower
+	newTerm := rn.currentTerm
+	newVotedFor := rn.votedFor
+
 	if args.Term > rn.currentTerm {
-		rn.currentTerm = args.Term
-		rn.role = Follower
-		rn.votedFor = -1
+		newTerm = args.Term
+		newVotedFor = -1
 	}
 
-	rn.role = Follower
-	rn.lastResetTime = time.Now()
 
 	// 2. Reply false if log doesn't contain an entry at PrevLogIndex matching PrevLogTerm
 	if args.PrevLogIndex >= len(rn.log) {
-		reply.Term = rn.currentTerm
-		reply.Success = false
+		reply.Term =newTerm
 		rn.mu.Unlock()
 		return
 	}
 
 	if rn.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Term = rn.currentTerm
-		reply.Success = false
 		rn.mu.Unlock()
 		return
 	}
+
+	newLog := make([]LogEntry, len(rn.log))
+	copy(newLog, rn.log)
 
 	// 3. Process incoming entries (Conflict resolution & appending)
 	argsIndex := 0
@@ -88,20 +114,32 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 	for argsIndex < len(args.Entries) {
 		if localIndex < len(rn.log) {
 			// Conflict check: if existing entry conflicts with new one, delete existing and all that follow it
-			if rn.log[localIndex].Term != args.Entries[argsIndex].Term {
-				rn.log = rn.log[:localIndex]
-				rn.log = append(rn.log, args.Entries[argsIndex:]...)
+			if newLog[localIndex].Term != args.Entries[argsIndex].Term {
+				newLog = newLog[:localIndex]
+				newLog = append(newLog, args.Entries[argsIndex:]...)
 				break
 			}
 		} else {
 			// No conflict, append remaining entries
-			rn.log = append(rn.log, args.Entries[argsIndex:]...)
+			newLog = append(newLog, args.Entries[argsIndex:]...)
 			break
 		}
 		localIndex++
 		argsIndex++
 	}
 
+	if err := rn.persistState(newTerm, newVotedFor, newLog); err != nil {
+		reply.Term = rn.currentTerm
+		rn.mu.Unlock()
+		return
+	}
+
+	rn.currentTerm = newTerm
+	rn.votedFor = newVotedFor
+	rn.log = newLog
+	rn.role = Follower
+	rn.lastResetTime = time.Now()
+	
 	var msgs []ApplyMsg
 
 	// 4. Update commitIndex based on leaderCommit

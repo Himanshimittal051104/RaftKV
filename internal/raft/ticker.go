@@ -48,11 +48,23 @@ func (rn *RaftNode) startElection() {
         return
     }
 
-	rn.role = Candidate
-	rn.currentTerm++
-	rn.votedFor = rn.me
-	rn.resetElectionTimeout()
+	newTerm := rn.currentTerm + 1
+	newVotedFor := rn.me
+	if err := rn.persistState(
+		newTerm,
+		newVotedFor,
+		rn.log,
+	); err != nil {
+		rn.mu.Unlock()
+		return
+	}
 
+
+	rn.role = Candidate
+	rn.currentTerm=newTerm
+	rn.votedFor = newVotedFor
+	rn.resetElectionTimeout()
+	
 	term := rn.currentTerm
 	me := rn.me
 	lastLogIndex := len(rn.log) - 1
