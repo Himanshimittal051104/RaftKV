@@ -2,6 +2,7 @@ package raft
 
 import (
     "bytes"
+    "path/filepath"
     "testing"
     "reflect"
 )
@@ -168,4 +169,157 @@ func TestRaftNodeRestoresPersistedState(t *testing.T) {
     if !reflect.DeepEqual(node.log, originalLog) {
         t.Errorf("restored log does not match original log")
     }
+}
+
+
+func TestFilePersisterSaveAndRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "raft-state.bin")
+
+	p1, err := NewFilePersister(path)
+	if err != nil {
+		t.Fatalf("create persister: %v", err)
+	}
+
+	want := []byte("persistent-raft-state")
+
+	if err := p1.SaveRaftState(want); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	// Simulate constructing a new persister after a restart.
+	p2, err := NewFilePersister(path)
+	if err != nil {
+		t.Fatalf("recreate persister: %v", err)
+	}
+
+	got, err := p2.ReadRaftState()
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read state = %q, want %q", got, want)
+	}
+}
+
+
+func TestFilePersisterRestoresRaftState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "raft-state.bin")
+
+	p1, err := NewFilePersister(path)
+	if err != nil {
+		t.Fatalf("create persister: %v", err)
+	}
+
+	originalLog := []LogEntry{
+		{Index: 0, Term: 0},
+		{
+			Index: 1,
+			Term: 3,
+			Command: Command{
+				Op:    "SET",
+				Key:   "city",
+				Value: "Delhi",
+			},
+		},
+	}
+
+	// Encode and persist actual Raft state.
+	encoded, err := encodeRaftState(3, 1, originalLog)
+	if err != nil {
+		t.Fatalf("encode state: %v", err)
+	}
+
+	if err := p1.SaveRaftState(encoded); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	// Recreate the persister and restore the saved state.
+	p2, err := NewFilePersister(path)
+	if err != nil {
+		t.Fatalf("recreate persister: %v", err)
+	}
+
+	saved, err := p2.ReadRaftState()
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+
+	term, vote, recoveredLog, err := decodeRaftState(saved)
+	if err != nil {
+		t.Fatalf("decode state: %v", err)
+	}
+
+	if term != 3 {
+		t.Errorf("term = %d, want 3", term)
+	}
+	if vote != 1 {
+		t.Errorf("votedFor = %d, want 1", vote)
+	}
+	if !reflect.DeepEqual(recoveredLog, originalLog) {
+		t.Errorf("recovered log does not match original log")
+	}
+}
+
+
+func TestRaftNodeRecoversFromFilePersister(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "raft-state.bin")
+
+	p1, err := NewFilePersister(path)
+	if err != nil {
+		t.Fatalf("create persister: %v", err)
+	}
+
+	originalLog := []LogEntry{
+		{Index: 0, Term: 0},
+		{
+			Index: 1,
+			Term: 4,
+			Command: Command{
+				Op:    "SET",
+				Key:   "language",
+				Value: "Go",
+			},
+		},
+	}
+
+	encoded, err := encodeRaftState(4, 2, originalLog)
+	if err != nil {
+		t.Fatalf("encode state: %v", err)
+	}
+
+	if err := p1.SaveRaftState(encoded); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	// Recreate the persister, simulating a process restart.
+	p2, err := NewFilePersister(path)
+	if err != nil {
+		t.Fatalf("recreate persister: %v", err)
+	}
+
+	node := NewRaftNodeWithPersister(
+		0,
+		3,
+		make(chan ApplyMsg, 10),
+		nil,
+		p2,
+	)
+
+	defer close(node.stopCh)
+
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	if node.currentTerm != 4 {
+		t.Errorf("currentTerm = %d, want 4", node.currentTerm)
+	}
+
+	if node.votedFor != 2 {
+		t.Errorf("votedFor = %d, want 2", node.votedFor)
+	}
+
+	if !reflect.DeepEqual(node.log, originalLog) {
+		t.Errorf("recovered log does not match original log")
+	}
 }

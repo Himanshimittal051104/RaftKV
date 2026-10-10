@@ -7,7 +7,7 @@ import (
 	"time"      //This handles election and heartbeat timing.
 
 	"RaftKV/internal/storage" //This connects the Raft layer to your KV storage engine.
-	"fmt"
+	"fmt"                     //fmt is a package, and Println, Printf, and Sprintf are functions provided by that package.
 )
 
 // Instead of repeatedly creating new error instances, we define them as package-level variables.
@@ -32,6 +32,7 @@ type RaftNode struct {
 	commitIndex int
 	lastApplied int //lastApplied <= commitIndex
 	//After a crash, you can reconstruct the state machine from persistent storage/snapshot + log replay.
+	
 	role Role
 
 	// Volatile state on leaders
@@ -55,16 +56,33 @@ type RaftNode struct {
 }
 
 // NewRaftNode creates and initializes a node in the Follower state.
-func NewRaftNode(me int,peersCount int,applyCh chan ApplyMsg,engine storage.Engine) *RaftNode {
+func NewRaftNode(me int, peersCount int, applyCh chan ApplyMsg, engine storage.Engine) *RaftNode {
 
-    return NewRaftNodeWithPersister(
-        me,
-        peersCount,
-        applyCh,
-        engine,
-        NewMemPersister(),
-    )
+	return NewRaftNodeWithPersister(
+		me,
+		peersCount,
+		applyCh,
+		engine,
+		NewMemPersister(),
+	)
 }
+func NewPersistentRaftNode(me int, peersCount int, applyCh chan ApplyMsg, engine storage.Engine, stateFile string) (*RaftNode, error) {
+	persister, err := NewFilePersister(stateFile)
+	if err != nil {
+		return nil, err
+	}
+
+	node := NewRaftNodeWithPersister(
+		me,
+		peersCount,
+		applyCh,
+		engine,
+		persister,
+	)
+
+	return node, nil
+}
+
 func NewRaftNodeWithPersister(me int, peersCount int, applyCh chan ApplyMsg, engine storage.Engine, persister Persister) *RaftNode {
 	rn := &RaftNode{ //You're allocating a RaftNode and getting a pointer to it.
 		me:              me,
@@ -72,6 +90,8 @@ func NewRaftNodeWithPersister(me int, peersCount int, applyCh chan ApplyMsg, eng
 		votedFor:        -1,
 		role:            Follower,
 		log:             make([]LogEntry, 1), //log[0] = dummy
+		nextIndex:       make([]int, peersCount),
+		matchIndex:      make([]int, peersCount),
 		commitIndex:     0,
 		lastApplied:     0,
 		heartbeatPeriod: 50 * time.Millisecond,
@@ -83,20 +103,20 @@ func NewRaftNodeWithPersister(me int, peersCount int, applyCh chan ApplyMsg, eng
 	}
 
 	savedState, err := persister.ReadRaftState()
-    if err != nil {
-        panic(fmt.Sprintf("raft: failed to read persisted state: %v", err))
-    }
+	if err != nil {
+		panic(fmt.Sprintf("raft: failed to read persisted state: %v", err))
+	}
 
 	if len(savedState) > 0 {
-        term, vote, restoredLog, err := decodeRaftState(savedState)
-        if err != nil {
-            panic(fmt.Sprintf("raft: failed to decode persisted state: %v", err))
-        }
+		term, vote, restoredLog, err := decodeRaftState(savedState)
+		if err != nil {
+			panic(fmt.Sprintf("raft: failed to decode persisted state: %v", err))
+		}
 
-        rn.currentTerm = term
-        rn.votedFor = vote
-        rn.log = restoredLog
-    }
+		rn.currentTerm = term
+		rn.votedFor = vote
+		rn.log = restoredLog
+	}
 
 	rn.resetElectionTimeout() //This chooses a randomized election timeout and records the current time.
 	return rn                 //Returns the initialized node.
@@ -148,10 +168,25 @@ func (rn *RaftNode) Start(command Command) (int, int, bool) {
 	}
 
 	rn.log = newLog
-	
+
 	//Update leader's own replication state. Since the leader has obviously appended the entry to its own log:
 	rn.matchIndex[rn.me] = index
 	rn.nextIndex[rn.me] = index + 1
+
+	// In a single-node cluster, the leader itself is a majority.
+	if len(rn.peers) == 0 {
+		rn.commitIndex = index
+		applyMsgs := rn.collectCommittedEntries()
+		go func() {
+			for _, msg := range applyMsgs {
+				select {
+				case rn.applyCh <- msg:
+				case <-rn.stopCh:
+					return
+				}
+			}
+		}()
+	}
 
 	return index, term, true //"Yes, I'm the leader.The command is at this log index and term." At this point:The command is NOT committed yet.It has only been appended to the leader's local log.
 }
@@ -406,6 +441,13 @@ func (rn *RaftNode) applyLoop() {
 					[]byte(msg.Command.Key),
 					[]byte(msg.Command.Value),
 				)
+				fmt.Printf(
+					"Applied SET: index=%d key=%q value=%q err=%v\n",
+					msg.CommandIndex,
+					msg.Command.Key,
+					msg.Command.Value,
+					err,
+				)
 
 			case "DELETE":
 				err = rn.Engine.Delete(
@@ -418,7 +460,7 @@ func (rn *RaftNode) applyLoop() {
 	}
 }
 
-func (rn *RaftNode) persistState(currentTerm int,votedFor int,log []LogEntry,) error {
+func (rn *RaftNode) persistState(currentTerm int, votedFor int, log []LogEntry) error {
 	state, err := encodeRaftState(
 		currentTerm,
 		votedFor,

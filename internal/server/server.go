@@ -21,8 +21,8 @@ type PutRequest struct {
 
 type Response struct {
 	Success  bool   `json:"success,omitempty"`
-	Value    string `json:"value,omitempty"`
-	Found    bool   `json:"found,omitempty"`
+	Value    string `json:"value"`
+	Found    bool   `json:"found"`
 	Error    string `json:"error,omitempty"`
 }
 

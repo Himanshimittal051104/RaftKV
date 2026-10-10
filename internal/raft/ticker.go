@@ -43,10 +43,10 @@ func (rn *RaftNode) runLoop() {
 func (rn *RaftNode) startElection() {
 	rn.mu.Lock()
 	if rn.role == Leader ||
-        time.Since(rn.lastResetTime) < rn.electionTimeout {
-        rn.mu.Unlock()
-        return
-    }
+		time.Since(rn.lastResetTime) < rn.electionTimeout {
+		rn.mu.Unlock()
+		return
+	}
 
 	newTerm := rn.currentTerm + 1
 	newVotedFor := rn.me
@@ -59,12 +59,11 @@ func (rn *RaftNode) startElection() {
 		return
 	}
 
-
 	rn.role = Candidate
-	rn.currentTerm=newTerm
+	rn.currentTerm = newTerm
 	rn.votedFor = newVotedFor
 	rn.resetElectionTimeout()
-	
+
 	term := rn.currentTerm
 	me := rn.me
 	lastLogIndex := len(rn.log) - 1
@@ -74,6 +73,28 @@ func (rn *RaftNode) startElection() {
 	println("Node", me, "started election for term", term)
 	var votesMu sync.Mutex
 	votesReceived := 1 // Vote for self
+
+	// A single-node cluster already has a majority.
+	if votesReceived > len(peers)/2 {
+		rn.mu.Lock()
+
+		if rn.role == Candidate && rn.currentTerm == term {
+			println("Node", me, "BECAME LEADER for term", term)
+			rn.role = Leader
+
+			for j := range rn.peers {
+				rn.nextIndex[j] = len(rn.log)
+				rn.matchIndex[j] = 0
+			}
+
+			rn.mu.Unlock()
+			go rn.broadcastAppendEntries()
+		} else {
+			rn.mu.Unlock()
+		}
+
+		return
+	}
 
 	for i := range peers {
 		if i == me {
@@ -187,10 +208,10 @@ func (rn *RaftNode) broadcastAppendEntries() {
 
 			if reply.Term > rn.currentTerm {
 				if err := rn.persistState(reply.Term, -1, rn.log); err != nil {
-        			// Persistence failed; don't publish the state change.
-        			rn.mu.Unlock()
-        			return
-    			}
+					// Persistence failed; don't publish the state change.
+					rn.mu.Unlock()
+					return
+				}
 				rn.currentTerm = reply.Term
 				rn.role = Follower
 				rn.votedFor = -1
