@@ -69,7 +69,9 @@ func (rn *RaftNode) startElection() {
 	lastLogIndex := len(rn.log) - 1
 	lastLogTerm := rn.log[lastLogIndex].Term
 	peers := rn.peers
+
 	rn.mu.Unlock()
+
 	println("Node", me, "started election for term", term)
 	var votesMu sync.Mutex
 	votesReceived := 1 // Vote for self
@@ -115,15 +117,25 @@ func (rn *RaftNode) startElection() {
 			rn.mu.Lock()
 			defer rn.mu.Unlock()
 
-			if rn.role != Candidate || rn.currentTerm != term {
-				return // Suppose A starts an election:Then while waiting for votes, A receives an AppendEntries from another valid leader: then A becomes a follower and ignores the vote replies from other nodes.
-			}
-
 			if reply.Term > rn.currentTerm {
+				if err := rn.persistState(
+					reply.Term,
+					-1,
+					rn.log,
+				); err != nil {
+					// Do not publish the higher term if persistence fails.
+					return
+				}
+
 				rn.currentTerm = reply.Term
 				rn.role = Follower
 				rn.votedFor = -1
 				rn.resetElectionTimeout()
+				return
+			}
+
+			// Ignore stale replies from an election we no longer belong to.
+			if rn.role != Candidate || rn.currentTerm != term {
 				return
 			}
 
@@ -243,6 +255,7 @@ func (rn *RaftNode) broadcastAppendEntries() {
 						if count > len(peers)/2 {
 							rn.commitIndex = N
 							msgs = rn.collectCommittedEntries()
+
 							break
 						}
 					}
@@ -255,6 +268,7 @@ func (rn *RaftNode) broadcastAppendEntries() {
 			}
 			rn.mu.Unlock()
 			for _, msg := range msgs {
+
 				if rn.applyCh != nil {
 					rn.applyCh <- msg
 				}

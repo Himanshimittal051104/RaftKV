@@ -31,6 +31,7 @@ type RaftNode struct {
 	// Volatile state on all servers
 	commitIndex int
 	lastApplied int //lastApplied <= commitIndex
+	lastQueued  int
 	//After a crash, you can reconstruct the state machine from persistent storage/snapshot + log replay.
 
 	role Role
@@ -295,6 +296,7 @@ func (rn *RaftNode) waitForApply(index int) error {
 
 	case <-time.After(2 * time.Second):
 		rn.mu.Lock()
+
 		delete(rn.applyWaiters, index)
 		rn.mu.Unlock()
 
@@ -316,15 +318,15 @@ func (rn *RaftNode) notifyApplied(index int, err error) {
 func (rn *RaftNode) collectCommittedEntries() []ApplyMsg {
 	var msgs []ApplyMsg
 
-	for rn.lastApplied < rn.commitIndex {
-		rn.lastApplied++
+	for rn.lastQueued < rn.commitIndex {
+		rn.lastQueued++
 
-		entry := rn.log[rn.lastApplied]
+		entry := rn.log[rn.lastQueued]
 
 		msg := ApplyMsg{
 			CommandValid: true,
 			Command:      entry.Command,
-			CommandIndex: rn.lastApplied,
+			CommandIndex: entry.Index,
 			CommandTerm:  entry.Term,
 		}
 
@@ -436,6 +438,7 @@ func (rn *RaftNode) applyLoop() {
 			return
 
 		case msg := <-rn.applyCh:
+
 			if !msg.CommandValid {
 				continue
 			}
@@ -448,18 +451,21 @@ func (rn *RaftNode) applyLoop() {
 					[]byte(msg.Command.Key),
 					[]byte(msg.Command.Value),
 				)
-				fmt.Printf(
-					"Applied SET: index=%d key=%q value=%q err=%v\n",
-					msg.CommandIndex,
-					msg.Command.Key,
-					msg.Command.Value,
-					err,
-				)
 
 			case "DELETE":
 				err = rn.Engine.Delete(
 					[]byte(msg.Command.Key),
 				)
+			}
+
+			if err == nil {
+				rn.mu.Lock()
+
+				if msg.CommandIndex == rn.lastApplied+1 {
+					rn.lastApplied++
+				}
+
+				rn.mu.Unlock()
 			}
 
 			rn.notifyApplied(msg.CommandIndex, err)

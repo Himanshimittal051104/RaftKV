@@ -7,9 +7,10 @@ func (rn *RaftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) 
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
+	reply.VoteGranted = false
+
 	if args.Term < rn.currentTerm {
 		reply.Term = rn.currentTerm
-		reply.VoteGranted = false
 		return
 	}
 
@@ -23,15 +24,16 @@ func (rn *RaftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) 
 			rn.log,
 		); err != nil {
 			reply.Term = rn.currentTerm
-			reply.VoteGranted = false
 			return
 		}
 
 		rn.currentTerm = newTerm
 		rn.role = Follower
 		rn.votedFor = newVotedFor
-		
+
 	}
+
+	reply.Term = rn.currentTerm
 
 	canVote := rn.votedFor == -1 || rn.votedFor == args.CandidateID
 
@@ -45,42 +47,47 @@ func (rn *RaftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) 
 		logUpToDate = true
 	}
 
-	if canVote && logUpToDate {
-		newVotedFor := args.CandidateID
-
-		if err := rn.persistState(
-			rn.currentTerm,
-			newVotedFor,
-			rn.log,
-		); err != nil {
-			reply.Term = rn.currentTerm
-			reply.VoteGranted = false
-			return
-		}
-		rn.votedFor = newVotedFor
-		rn.role = Follower
-		rn.lastResetTime = time.Now()
-		reply.VoteGranted = true
-	} else {
-		reply.VoteGranted = false
+	if !canVote || !logUpToDate {
+		return
 	}
 
+	if rn.votedFor != args.CandidateID {
+		if err := rn.persistState(
+			rn.currentTerm,
+			args.CandidateID,
+			rn.log,
+		); err != nil {
+			return
+		}
+
+		rn.votedFor = args.CandidateID
+	}
+
+	rn.role = Follower
+	rn.resetElectionTimeout()
+
+	reply.VoteGranted = true
 	reply.Term = rn.currentTerm
 }
 
 // AppendEntries handles log replication and heartbeats from the leader.
-func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+
+func (rn *RaftNode) AppendEntries(
+	args *AppendEntriesArgs,
+	reply *AppendEntriesReply,
+) {
 	rn.mu.Lock()
 
 	reply.Success = false
 	reply.Term = rn.currentTerm
 
-	// 1. Reply false if term < currentTerm
+	// 1. Reject stale leaders.
 	if args.Term < rn.currentTerm {
 		rn.mu.Unlock()
 		return
 	}
 
+	// 2. Persist a higher term before updating in-memory state.
 	if args.Term > rn.currentTerm {
 		if err := rn.persistState(args.Term, -1, rn.log); err != nil {
 			reply.Term = rn.currentTerm
@@ -93,11 +100,11 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 	}
 
 	rn.role = Follower
-	rn.lastResetTime = time.Now()
+	rn.resetElectionTimeout()
 	reply.Term = rn.currentTerm
 
-	// 2. Reply false if log doesn't contain an entry at PrevLogIndex matching PrevLogTerm
-	if args.PrevLogIndex >= len(rn.log) {
+	// 3. Validate the previous log entry.
+	if args.PrevLogIndex < 0 || args.PrevLogIndex >= len(rn.log) {
 		rn.mu.Unlock()
 		return
 	}
@@ -107,41 +114,53 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 		return
 	}
 
+	// 4. Reconcile the incoming entries with the local log.
 	newLog := make([]LogEntry, len(rn.log))
 	copy(newLog, rn.log)
 
-	// 3. Process incoming entries (Conflict resolution & appending)
 	argsIndex := 0
 	localIndex := args.PrevLogIndex + 1
+	logChanged := false
 
 	for argsIndex < len(args.Entries) {
-		if localIndex < len(rn.log) {
-			// Conflict check: if existing entry conflicts with new one, delete existing and all that follow it
-			if newLog[localIndex].Term != args.Entries[argsIndex].Term {
-				newLog = newLog[:localIndex]
-				newLog = append(newLog, args.Entries[argsIndex:]...)
-				break
-			}
-		} else {
-			// No conflict, append remaining entries
+		if localIndex >= len(newLog) {
 			newLog = append(newLog, args.Entries[argsIndex:]...)
+			logChanged = true
 			break
 		}
-		localIndex++
-		argsIndex++
+
+		// Matching index and term means this entry already matches.
+		if newLog[localIndex].Term == args.Entries[argsIndex].Term {
+			localIndex++
+			argsIndex++
+			continue
+		}
+
+		// Conflict: remove this entry and all entries after it.
+		newLog = newLog[:localIndex]
+		newLog = append(newLog, args.Entries[argsIndex:]...)
+		logChanged = true
+		break
 	}
 
-	if err := rn.persistState(rn.currentTerm, rn.votedFor, newLog); err != nil {
-		reply.Term = rn.currentTerm
-		rn.mu.Unlock()
-		return
-	}
-	
-	rn.log = newLog
+	// 5. Persist only when the log actually changes.
+	if logChanged {
+		if err := rn.persistState(
+			rn.currentTerm,
+			rn.votedFor,
+			newLog,
+		); err != nil {
+			reply.Term = rn.currentTerm
+			rn.mu.Unlock()
+			return
+		}
 
+		rn.log = newLog
+	}
+
+	// 6. Advance the commit index using the leader's commit index.
 	var msgs []ApplyMsg
 
-	// 4. Update commitIndex based on leaderCommit
 	if args.LeaderCommit > rn.commitIndex {
 		rn.commitIndex = min(args.LeaderCommit, len(rn.log)-1)
 		msgs = rn.collectCommittedEntries()
@@ -152,9 +171,16 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 
 	rn.mu.Unlock()
 
+	// 7. Deliver committed entries to the state machine.
 	for _, msg := range msgs {
-		if rn.applyCh != nil {
-			rn.applyCh <- msg
+		if rn.applyCh == nil {
+			continue
+		}
+
+		select {
+		case rn.applyCh <- msg:
+		case <-rn.stopCh:
+			return
 		}
 	}
 }
@@ -166,7 +192,6 @@ func min(a, b int) int {
 	}
 	return b
 }
-
 
 func (rn *RaftNode) ReadProbe(args *ReadProbeArgs, reply *ReadProbeReply) {
 	rn.mu.Lock()
