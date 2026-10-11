@@ -75,7 +75,7 @@ func TestPersisterRoundTrip(t *testing.T) {
 	}
 
 	// Step 1: Encode the state.
-	encoded, err := encodeRaftState(2, 1, originalLog)
+	encoded, err := encodeRaftState(2, 1, originalLog, 0)
 	if err != nil {
 		t.Fatalf("encoding failed: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestPersisterRoundTrip(t *testing.T) {
 	}
 
 	// Step 4: Decode the saved bytes.
-	term, vote, recoveredLog, err := decodeRaftState(saved)
+	term, vote, recoveredLog, commitIndex, err := decodeRaftState(saved)
 	if err != nil {
 		t.Fatalf("decoding saved state failed: %v", err)
 	}
@@ -110,6 +110,11 @@ func TestPersisterRoundTrip(t *testing.T) {
 	if vote != 1 {
 		t.Errorf("votedFor: got %d, want 1", vote)
 	}
+
+	if commitIndex != 0 {
+		t.Errorf("commitIndex = %d, want 0", commitIndex)
+	}
+
 	if !reflect.DeepEqual(originalLog, recoveredLog) {
 		t.Errorf("recovered log does not match original log")
 	}
@@ -132,7 +137,7 @@ func TestRaftNodeRestoresPersistedState(t *testing.T) {
 	}
 
 	// Simulate state saved by the first node.
-	encoded, err := encodeRaftState(2, 1, originalLog)
+	encoded, err := encodeRaftState(2, 1, originalLog, 0)
 	if err != nil {
 		t.Fatalf("encode state: %v", err)
 	}
@@ -186,6 +191,12 @@ func TestFilePersisterSaveAndRead(t *testing.T) {
 		t.Fatalf("save state: %v", err)
 	}
 
+	updated := []byte("updated-raft-state")
+
+	if err := p1.SaveRaftState(updated); err != nil {
+		t.Fatalf("save updated state: %v", err)
+	}
+
 	// Simulate constructing a new persister after a restart.
 	p2, err := NewFilePersister(path)
 	if err != nil {
@@ -197,8 +208,8 @@ func TestFilePersisterSaveAndRead(t *testing.T) {
 		t.Fatalf("read state: %v", err)
 	}
 
-	if !bytes.Equal(got, want) {
-		t.Fatalf("read state = %q, want %q", got, want)
+	if !bytes.Equal(got, updated) {
+		t.Fatalf("read state = %q, want %q", got, updated)
 	}
 }
 
@@ -224,7 +235,7 @@ func TestFilePersisterRestoresRaftState(t *testing.T) {
 	}
 
 	// Encode and persist actual Raft state.
-	encoded, err := encodeRaftState(3, 1, originalLog)
+	encoded, err := encodeRaftState(3, 1, originalLog, 0)
 	if err != nil {
 		t.Fatalf("encode state: %v", err)
 	}
@@ -244,7 +255,7 @@ func TestFilePersisterRestoresRaftState(t *testing.T) {
 		t.Fatalf("read state: %v", err)
 	}
 
-	term, vote, recoveredLog, err := decodeRaftState(saved)
+	term, vote, recoveredLog, commitIndex, err := decodeRaftState(saved)
 	if err != nil {
 		t.Fatalf("decode state: %v", err)
 	}
@@ -254,6 +265,10 @@ func TestFilePersisterRestoresRaftState(t *testing.T) {
 	}
 	if vote != 1 {
 		t.Errorf("votedFor = %d, want 1", vote)
+	}
+
+	if commitIndex != 0 {
+		t.Errorf("commitIndex = %d, want 0", commitIndex)
 	}
 	if !reflect.DeepEqual(recoveredLog, originalLog) {
 		t.Errorf("recovered log does not match original log")
@@ -281,7 +296,7 @@ func TestRaftNodeRecoversFromFilePersister(t *testing.T) {
 		},
 	}
 
-	encoded, err := encodeRaftState(4, 2, originalLog)
+	encoded, err := encodeRaftState(4, 2, originalLog, 0)
 	if err != nil {
 		t.Fatalf("encode state: %v", err)
 	}
@@ -380,5 +395,95 @@ func TestPersistentNodeRecoversStateMachine(t *testing.T) {
 	}
 	if string(value) != "Go" {
 		t.Fatalf("expected Go, got %q", string(value))
+	}
+}
+
+func TestPersistentNodeDoesNotRecoverUncommittedEntries(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
+
+	log := []LogEntry{
+		{Index: 0}, // Dummy entry
+		{
+			Index: 1,
+			Term:  1,
+			Command: Command{
+				Op:    "SET",
+				Key:   "committed",
+				Value: "yes",
+			},
+		},
+		{
+			Index: 2,
+			Term:  1,
+			Command: Command{
+				Op:    "SET",
+				Key:   "uncommitted",
+				Value: "no",
+			},
+		},
+	}
+
+	// Persist both entries, but mark only index 1 as committed.
+	state, err := encodeRaftState(1, -1, log, 1)
+	if err != nil {
+		t.Fatalf("encode state: %v", err)
+	}
+
+	persister, err := NewFilePersister(stateFile)
+	if err != nil {
+		t.Fatalf("create persister: %v", err)
+	}
+	if err := persister.SaveRaftState(state); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	engine := storage.NewMemEngine()
+	node, err := NewPersistentRaftNode(
+		0, 1, make(chan ApplyMsg, 10), engine, stateFile,
+	)
+	if err != nil {
+		t.Fatalf("recover node: %v", err)
+	}
+	defer node.Stop()
+
+	// The committed entry must be restored.
+	value, found, err := engine.Get([]byte("committed"))
+	if err != nil {
+		t.Fatalf("get committed key: %v", err)
+	}
+	if !found || string(value) != "yes" {
+		t.Fatalf("committed key = (%q, %v), want (%q, true)",
+			string(value), found, "yes")
+	}
+
+	// The uncommitted entry must not be applied.
+	_, found, err = engine.Get([]byte("uncommitted"))
+	if err != nil {
+		t.Fatalf("get uncommitted key: %v", err)
+	}
+	if found {
+		t.Fatal("uncommitted entry was incorrectly recovered")
+	}
+
+	if node.commitIndex != 1 {
+		t.Fatalf("commitIndex = %d, want 1", node.commitIndex)
+	}
+}
+
+func TestFilePersisterMissingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing-state.bin")
+
+	p, err := NewFilePersister(path)
+	if err != nil {
+		t.Fatalf("create persister: %v", err)
+	}
+
+	state, err := p.ReadRaftState()
+	if err != nil {
+		t.Fatalf("read missing state file: %v", err)
+	}
+
+	if state != nil {
+		t.Fatalf("state = %v, want nil for a missing file", state)
 	}
 }

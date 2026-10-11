@@ -1,67 +1,71 @@
 package raft
 
 import (
-    "reflect"
-    "testing"
+	"reflect"
+	"testing"
 )
 
 func TestEncodeDecodeRaftState(t *testing.T) {
-    originalTerm := 5
-    originalVotedFor := 2
+	originalTerm := 5
+	originalVotedFor := 2
+	originalCommitIndex := 2
 
-    originalLog := []LogEntry{
-        {
-            Index: 0,
-            Term: 0,
-        },
-        {
-            Index: 1,
-            Term: 1,
-            Command: Command{
-                ClientID: 10,
-                SeqNumber: 1,
-                Op: "SET",
-                Key: "name",
-                Value: "Himanshi",
-            },
-        },
-        {
-            Index: 2,
-            Term: 5,
-            Command: Command{
-                ClientID: 10,
-                SeqNumber: 2,
-                Op: "DELETE",
-                Key: "name",
-            },
-        },
-    }
+	originalLog := []LogEntry{
+		{
+			Index: 0,
+			Term:  0,
+		},
+		{
+			Index: 1,
+			Term:  1,
+			Command: Command{
+				ClientID:  10,
+				SeqNumber: 1,
+				Op:        "SET",
+				Key:       "name",
+				Value:     "Himanshi",
+			},
+		},
+		{
+			Index: 2,
+			Term:  5,
+			Command: Command{
+				ClientID:  10,
+				SeqNumber: 2,
+				Op:        "DELETE",
+				Key:       "name",
+			},
+		},
+	}
 
-    data, err := encodeRaftState(
-        originalTerm,
-        originalVotedFor,
-        originalLog,
-    )
+	data, err := encodeRaftState(
+		originalTerm,
+		originalVotedFor,
+		originalLog,
+		originalCommitIndex,
+	)
+	if err != nil {
+		t.Fatalf("encodeRaftState failed: %v", err)
+	}
 
-    if err != nil {
-        t.Fatalf("encodeRaftState failed: %v", err)
-    }
+	term, votedFor, log, commitIndex, err := decodeRaftState(data)
+	if err != nil {
+		t.Fatalf("decodeRaftState failed: %v", err)
+	}
 
-    term, votedFor, log, err := decodeRaftState(data)
+	if term != originalTerm {
+		t.Fatalf("term = %d, want %d", term, originalTerm)
+	}
 
-    if err != nil {
-        t.Fatalf("decodeRaftState failed: %v", err)
-    }
+	if votedFor != originalVotedFor {
+		t.Fatalf("votedFor = %d, want %d", votedFor, originalVotedFor)
+	}
 
-    if term != originalTerm {
-        t.Fatalf("term = %d, want %d", term, originalTerm)
-    }
+	if !reflect.DeepEqual(log, originalLog) {
+		t.Fatalf("log was not restored correctly")
+	}
 
-    if votedFor != originalVotedFor {
-        t.Fatalf("votedFor = %d, want %d", votedFor, originalVotedFor)
-    }
-
-    if !reflect.DeepEqual(log, originalLog) {
-        t.Fatalf("log was not restored correctly")
-    }
+	if commitIndex != originalCommitIndex {
+		t.Fatalf("commitIndex = %d, want %d", commitIndex, originalCommitIndex)
+	}
 }

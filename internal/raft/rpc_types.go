@@ -1,23 +1,23 @@
 package raft
 
 type RequestVoteArgs struct {
-	Term         int 
-	CandidateID  int 
-	LastLogIndex int 
-	LastLogTerm  int 
+	Term         int
+	CandidateID  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 type RequestVoteReply struct {
-	Term        int  
-	VoteGranted bool 
+	Term        int
+	VoteGranted bool
 }
 
 // AppendEntriesArgs contains arguments for log replication and heartbeats.
 type AppendEntriesArgs struct {
-	Term         int       
-	LeaderID     int        
-	PrevLogIndex int        
-	PrevLogTerm  int        
+	Term         int
+	LeaderID     int
+	PrevLogIndex int
+	PrevLogTerm  int
 	Entries      []LogEntry // Log entries to store (empty for heartbeat)
 	LeaderCommit int        // Leader's commitIndex then the follower's apply loop can apply committed entries to its state machine.
 }
@@ -29,14 +29,13 @@ type AppendEntriesReply struct {
 }
 
 type ReadProbeArgs struct {
-    Term     int
-    LeaderID int
+	Term     int
+	LeaderID int
 }
 
 type ReadProbeReply struct {
-    Term int
+	Term int
 }
-
 
 // LastLogIndex + LastLogTerm
 //         ↓
@@ -49,5 +48,3 @@ type ReadProbeReply struct {
 // LeaderCommit
 //         ↓
 // "Which entries are known to be committed?"
-
-

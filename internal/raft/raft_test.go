@@ -2753,3 +2753,100 @@ func TestGetFailsIfLeadershipLostBeforeRead(t *testing.T) {
 		t.Fatalf("expected ErrWrongLeader, got %v", err)
 	}
 }
+
+func TestApplyLoopHandlesOutOfOrderMessages(t *testing.T) {
+	applyCh := make(chan ApplyMsg, 10)
+	engine := storage.NewMemEngine()
+
+	node := NewRaftNode(0, 1, applyCh, engine)
+
+	node.mu.Lock()
+	node.commitIndex = 3
+	node.mu.Unlock()
+
+	go node.applyLoop()
+	defer node.Stop()
+
+	applyCh <- ApplyMsg{
+		CommandValid: true,
+		CommandIndex: 1,
+		CommandTerm:  1,
+		Command: Command{
+			Op:    "SET",
+			Key:   "one",
+			Value: "1",
+		},
+	}
+	// Index 3 arrives before index 2.
+	applyCh <- ApplyMsg{
+		CommandValid: true,
+		CommandIndex: 3,
+		CommandTerm:  1,
+		Command: Command{
+			Op:    "SET",
+			Key:   "three",
+			Value: "3",
+		},
+	}
+
+	applyCh <- ApplyMsg{
+		CommandValid: true,
+		CommandIndex: 2,
+		CommandTerm:  1,
+		Command: Command{
+			Op:    "SET",
+			Key:   "two",
+			Value: "2",
+		},
+	}
+
+	// Wait for both entries to be applied in order.
+	deadline := time.Now().Add(time.Second)
+
+	for time.Now().Before(deadline) {
+		node.mu.Lock()
+		lastApplied := node.lastApplied
+		node.mu.Unlock()
+
+		if lastApplied == 3 {
+			break
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	node.mu.Lock()
+	lastApplied := node.lastApplied
+	node.mu.Unlock()
+
+	if lastApplied != 3 {
+		t.Fatalf(
+			"expected lastApplied=3, got %d",
+			lastApplied,
+		)
+	}
+
+	// Verify both commands reached the state machine.
+	for _, tc := range []struct {
+		key   string
+		value string
+	}{
+		{key: "two", value: "2"},
+		{key: "three", value: "3"},
+	} {
+		value, found, err := engine.Get([]byte(tc.key))
+		if err != nil {
+			t.Fatalf("Get(%q) failed: %v", tc.key, err)
+		}
+
+		if !found || string(value) != tc.value {
+			t.Fatalf(
+				"Get(%q) = %q, found=%v; want %q",
+				tc.key,
+				string(value),
+				found,
+				tc.value,
+			)
+		}
+	}
+}

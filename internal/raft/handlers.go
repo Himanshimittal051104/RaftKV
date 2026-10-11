@@ -22,6 +22,7 @@ func (rn *RaftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) 
 			newTerm,
 			newVotedFor,
 			rn.log,
+			rn.commitIndex,
 		); err != nil {
 			reply.Term = rn.currentTerm
 			return
@@ -56,6 +57,7 @@ func (rn *RaftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) 
 			rn.currentTerm,
 			args.CandidateID,
 			rn.log,
+			rn.commitIndex,
 		); err != nil {
 			return
 		}
@@ -72,10 +74,7 @@ func (rn *RaftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) 
 
 // AppendEntries handles log replication and heartbeats from the leader.
 
-func (rn *RaftNode) AppendEntries(
-	args *AppendEntriesArgs,
-	reply *AppendEntriesReply,
-) {
+func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rn.mu.Lock()
 
 	reply.Success = false
@@ -89,7 +88,7 @@ func (rn *RaftNode) AppendEntries(
 
 	// 2. Persist a higher term before updating in-memory state.
 	if args.Term > rn.currentTerm {
-		if err := rn.persistState(args.Term, -1, rn.log); err != nil {
+		if err := rn.persistState(args.Term, -1, rn.log, rn.commitIndex); err != nil {
 			reply.Term = rn.currentTerm
 			rn.mu.Unlock()
 			return
@@ -136,6 +135,10 @@ func (rn *RaftNode) AppendEntries(
 			continue
 		}
 
+		if localIndex <= rn.commitIndex {
+			rn.mu.Unlock()
+			return
+		}
 		// Conflict: remove this entry and all entries after it.
 		newLog = newLog[:localIndex]
 		newLog = append(newLog, args.Entries[argsIndex:]...)
@@ -149,6 +152,7 @@ func (rn *RaftNode) AppendEntries(
 			rn.currentTerm,
 			rn.votedFor,
 			newLog,
+			rn.commitIndex,
 		); err != nil {
 			reply.Term = rn.currentTerm
 			rn.mu.Unlock()
@@ -203,7 +207,7 @@ func (rn *RaftNode) ReadProbe(args *ReadProbeArgs, reply *ReadProbeReply) {
 	}
 
 	if args.Term > rn.currentTerm {
-		if err := rn.persistState(args.Term, -1, rn.log); err != nil {
+		if err := rn.persistState(args.Term, -1, rn.log, rn.commitIndex); err != nil {
 			reply.Term = rn.currentTerm
 			return
 		}

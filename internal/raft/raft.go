@@ -116,7 +116,7 @@ func NewRaftNodeWithPersister(me int, peersCount int, applyCh chan ApplyMsg, eng
 	}
 
 	if len(savedState) > 0 {
-		term, vote, restoredLog, err := decodeRaftState(savedState)
+		term, vote, restoredLog, commitIndex, err := decodeRaftState(savedState)
 		if err != nil {
 			panic(fmt.Sprintf("raft: failed to decode persisted state: %v", err))
 		}
@@ -124,6 +124,11 @@ func NewRaftNodeWithPersister(me int, peersCount int, applyCh chan ApplyMsg, eng
 		rn.currentTerm = term
 		rn.votedFor = vote
 		rn.log = restoredLog
+		if peersCount == 1 {
+			rn.commitIndex = commitIndex
+		} else {
+			rn.commitIndex = 0
+		}
 	}
 
 	rn.resetElectionTimeout() //This chooses a randomized election timeout and records the current time.
@@ -166,11 +171,18 @@ func (rn *RaftNode) Start(command Command) (int, int, bool) {
 	newLog := make([]LogEntry, len(rn.log)+1)
 	copy(newLog, rn.log)
 	newLog[len(rn.log)] = entry
+	newCommitIndex := rn.commitIndex
+
+	// In a single-node cluster, this entry will be committed locally.
+	if len(rn.peers) == 0 {
+		newCommitIndex = index
+	}
 
 	if err := rn.persistState(
 		rn.currentTerm,
 		rn.votedFor,
 		newLog,
+		newCommitIndex,
 	); err != nil {
 		return -1, -1, false
 	}
@@ -183,7 +195,7 @@ func (rn *RaftNode) Start(command Command) (int, int, bool) {
 
 	// In a single-node cluster, the leader itself is a majority.
 	if len(rn.peers) == 0 {
-		rn.commitIndex = index
+		rn.commitIndex = newCommitIndex
 		applyMsgs := rn.collectCommittedEntries()
 		go func() {
 			for _, msg := range applyMsgs {
@@ -432,52 +444,87 @@ func (rn *RaftNode) readIndex() (int, error) {
 }
 
 func (rn *RaftNode) applyLoop() {
+	pending := make(map[int]ApplyMsg)
+
 	for {
 		select {
 		case <-rn.stopCh:
 			return
 
 		case msg := <-rn.applyCh:
-
 			if !msg.CommandValid {
 				continue
 			}
 
-			var err error
+			rn.mu.Lock()
+			expectedIndex := rn.lastApplied + 1
+			rn.mu.Unlock()
 
-			switch msg.Command.Op {
-			case "SET":
-				err = rn.Engine.Put(
-					[]byte(msg.Command.Key),
-					[]byte(msg.Command.Value),
-				)
-
-			case "DELETE":
-				err = rn.Engine.Delete(
-					[]byte(msg.Command.Key),
-				)
+			if msg.CommandIndex < expectedIndex {
+				// Ignore an entry that has already been applied.
+				continue
 			}
 
-			if err == nil {
-				rn.mu.Lock()
+			if msg.CommandIndex > expectedIndex {
+				pending[msg.CommandIndex] = msg
+				continue
+			}
 
-				if msg.CommandIndex == rn.lastApplied+1 {
-					rn.lastApplied++
+			// Apply this message, then drain consecutive buffered messages.
+			current := msg
+
+			for {
+				err := rn.applyMessage(current)
+
+				if err != nil {
+					rn.notifyApplied(current.CommandIndex, err)
+					break
 				}
 
+				rn.mu.Lock()
+				if current.CommandIndex == rn.lastApplied+1 {
+					rn.lastApplied++
+				}
+				nextExpected := rn.lastApplied + 1
 				rn.mu.Unlock()
-			}
 
-			rn.notifyApplied(msg.CommandIndex, err)
+				rn.notifyApplied(current.CommandIndex, nil)
+				delete(pending, current.CommandIndex)
+
+				next, ok := pending[nextExpected]
+				if !ok {
+					break
+				}
+
+				current = next
+			}
 		}
 	}
 }
 
-func (rn *RaftNode) persistState(currentTerm int, votedFor int, log []LogEntry) error {
+func (rn *RaftNode) applyMessage(msg ApplyMsg) error {
+	switch msg.Command.Op {
+	case "SET":
+		return rn.Engine.Put(
+			[]byte(msg.Command.Key),
+			[]byte(msg.Command.Value),
+		)
+
+	case "DELETE":
+		return rn.Engine.Delete(
+			[]byte(msg.Command.Key),
+		)
+
+	default:
+		return fmt.Errorf("unsupported operation %q", msg.Command.Op)
+	}
+}
+func (rn *RaftNode) persistState(currentTerm int, votedFor int, log []LogEntry, commitIndex int) error {
 	state, err := encodeRaftState(
 		currentTerm,
 		votedFor,
 		log,
+		commitIndex,
 	)
 	if err != nil {
 		return err
@@ -491,10 +538,16 @@ func (rn *RaftNode) persistState(currentTerm int, votedFor int, log []LogEntry) 
 //
 // Call this before starting background goroutines or serving requests.
 func (rn *RaftNode) recoverSingleNodeState() error {
-	lastIndex := len(rn.log) - 1
-
 	// Replay log entries in order, skipping the dummy entry at index 0.
-	for i := 1; i <= lastIndex; i++ {
+	if rn.commitIndex < 0 || rn.commitIndex >= len(rn.log) {
+		return fmt.Errorf(
+			"invalid commit index %d for log length %d",
+			rn.commitIndex,
+			len(rn.log),
+		)
+	}
+
+	for i := 1; i <= rn.commitIndex; i++ {
 		entry := rn.log[i]
 
 		switch entry.Command.Op {
@@ -528,12 +581,12 @@ func (rn *RaftNode) recoverSingleNodeState() error {
 				entry.Command.Op,
 			)
 		}
+
 	}
 
 	// In this single-node configuration, the recovered durable log
 	// represents the committed state reconstructed above.
-	rn.commitIndex = lastIndex
-	rn.lastApplied = lastIndex
+	rn.lastApplied = rn.commitIndex
 
 	return nil
 }

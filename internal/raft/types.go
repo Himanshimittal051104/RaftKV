@@ -1,4 +1,5 @@
-package raft 
+package raft
+
 //This tells Go that this file belongs to the raft package.
 
 type Role int //Role -> integer representing the node's current state
@@ -23,9 +24,9 @@ func (r Role) String() string {
 }
 
 type Command struct {
-	ClientID  int64  
-	SeqNumber int64  
-	Op        string 
+	ClientID  int64
+	SeqNumber int64
+	Op        string
 	Key       string
 	Value     string
 }
@@ -36,8 +37,8 @@ type LogEntry struct {
 	Command Command
 }
 
-//An ApplyMsg represents a message from the Raft layer to the state machine.
-//Raft -> "This entry is now committed.Please apply it."-> State Machine
+// An ApplyMsg represents a message from the Raft layer to the state machine.
+// Raft -> "This entry is now committed.Please apply it."-> State Machine
 type ApplyMsg struct {
 	CommandValid bool
 	Command      Command
@@ -57,31 +58,31 @@ type StateMachine interface {
 	Restore(snapshot []byte) error
 }
 
-    //              CLIENT
-    //                 │
-    //                 │ SET A=10
-    //                 ▼
-    //              Command
-    //                 │
-    //                 ▼
-    //            LogEntry
-    //       ┌─────────┼─────────┐
-    //       │         │         │
-    //    Index      Term     Command
-    //                           │
-    //                           ▼
-    //                    Raft replication
-    //                           │
-    //                      majority ACK
-    //                           │
-    //                           ▼
-    //                        COMMIT
-    //                           │
-    //                           ▼
-    //                       ApplyMsg
-    //                           │
-    //                           ▼
-    //                    StateMachine
-    //                           │
-    //                           ▼
-    //                      KV State
+//              CLIENT
+//                 │
+//                 │ SET A=10
+//                 ▼
+//              Command
+//                 │
+//                 ▼
+//            LogEntry
+//       ┌─────────┼─────────┐
+//       │         │         │
+//    Index      Term     Command
+//                           │
+//                           ▼
+//                    Raft replication
+//                           │
+//                      majority ACK
+//                           │
+//                           ▼
+//                        COMMIT
+//                           │
+//                           ▼
+//                       ApplyMsg
+//                           │
+//                           ▼
+//                    StateMachine
+//                           │
+//                           ▼
+//                      KV State

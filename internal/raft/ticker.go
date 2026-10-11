@@ -54,6 +54,7 @@ func (rn *RaftNode) startElection() {
 		newTerm,
 		newVotedFor,
 		rn.log,
+		rn.commitIndex,
 	); err != nil {
 		rn.mu.Unlock()
 		return
@@ -122,6 +123,7 @@ func (rn *RaftNode) startElection() {
 					reply.Term,
 					-1,
 					rn.log,
+					rn.commitIndex,
 				); err != nil {
 					// Do not publish the higher term if persistence fails.
 					return
@@ -180,22 +182,23 @@ func (rn *RaftNode) broadcastAppendEntries() {
 
 		go func(peerID int) {
 			rn.mu.Lock()
+			sentNextIndex := rn.nextIndex[peerID]
 			if rn.role != Leader || rn.currentTerm != term {
 				rn.mu.Unlock()
 				return
 			}
 
-			prevLogIndex := rn.nextIndex[peerID] - 1
+			prevLogIndex := sentNextIndex - 1
 			if prevLogIndex < 0 {
 				prevLogIndex = 0
 			}
+
 			prevLogTerm := rn.log[prevLogIndex].Term
 
-			// Slice entries to send to this peer starting from nextIndex[peerID]
 			var entries []LogEntry
-			if rn.nextIndex[peerID] < len(rn.log) {
-				entries = make([]LogEntry, len(rn.log)-rn.nextIndex[peerID])
-				copy(entries, rn.log[rn.nextIndex[peerID]:])
+			if sentNextIndex < len(rn.log) {
+				entries = make([]LogEntry, len(rn.log)-sentNextIndex)
+				copy(entries, rn.log[sentNextIndex:])
 			}
 
 			args := AppendEntriesArgs{
@@ -219,7 +222,7 @@ func (rn *RaftNode) broadcastAppendEntries() {
 			}
 
 			if reply.Term > rn.currentTerm {
-				if err := rn.persistState(reply.Term, -1, rn.log); err != nil {
+				if err := rn.persistState(reply.Term, -1, rn.log, rn.commitIndex); err != nil {
 					// Persistence failed; don't publish the state change.
 					rn.mu.Unlock()
 					return
@@ -260,17 +263,21 @@ func (rn *RaftNode) broadcastAppendEntries() {
 						}
 					}
 				}
-			} else {
-				// If append failed because of log inconsistency, decrement nextIndex and retry
+			} else if rn.nextIndex[peerID] == sentNextIndex {
 				if rn.nextIndex[peerID] > 1 {
 					rn.nextIndex[peerID]--
 				}
 			}
 			rn.mu.Unlock()
 			for _, msg := range msgs {
+				if rn.applyCh == nil {
+					continue
+				}
 
-				if rn.applyCh != nil {
-					rn.applyCh <- msg
+				select {
+				case rn.applyCh <- msg:
+				case <-rn.stopCh:
+					return
 				}
 			}
 		}(i)
