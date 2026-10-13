@@ -731,9 +731,7 @@ func TestCommittedEntryCannotBeOverwrittenByOutdatedCandidate(t *testing.T) {
 		nodes[i].SetPeers(nodes)
 	}
 
-	// ------------------------------------------------------------
 	// 1. Node 0 is the leader in term 1.
-	// ------------------------------------------------------------
 
 	node0.mu.Lock()
 	node0.role = Leader
@@ -2255,7 +2253,10 @@ func TestFollowerAdvancesCommitIndexFromLeaderCommit(t *testing.T) {
 	if !reply.Success {
 		t.Fatal("follower should accept valid AppendEntries")
 	}
-
+	msg := <-follower.applyCh
+	if err := follower.applyMessage(msg); err != nil {
+		t.Fatalf("apply committed entry: %v", err)
+	}
 	follower.mu.Lock()
 	defer follower.mu.Unlock()
 
@@ -2263,6 +2264,16 @@ func TestFollowerAdvancesCommitIndexFromLeaderCommit(t *testing.T) {
 		t.Fatalf(
 			"expected follower commitIndex = 1, got %d",
 			follower.commitIndex,
+		)
+	}
+	value, found, err := follower.Engine.Get([]byte("x"))
+	if err != nil {
+		t.Fatalf("get committed value: %v", err)
+	}
+	if !found || string(value) != "10" {
+		t.Fatalf(
+			"follower state = (%q, %v), want (%q, true)",
+			string(value), found, "10",
 		)
 	}
 }
@@ -2848,5 +2859,158 @@ func TestApplyLoopHandlesOutOfOrderMessages(t *testing.T) {
 				tc.value,
 			)
 		}
+	}
+}
+
+func TestNewLeaderAppendsCurrentTermNoop(t *testing.T) {
+	applyCh := make(chan ApplyMsg, 20)
+
+	nodes := make([]*RaftNode, 3)
+	for i := 0; i < 3; i++ {
+		nodes[i] = NewRaftNode(
+			i,
+			3,
+			applyCh,
+			storage.NewMemEngine(),
+		)
+	}
+
+	for i := 0; i < 3; i++ {
+		nodes[i].SetPeers(nodes)
+	}
+
+	candidate := nodes[0]
+	candidate.mu.Lock()
+	candidate.currentTerm = 0
+	candidate.role = Follower
+	candidate.lastResetTime = time.Now().Add(-time.Second)
+	candidate.electionTimeout = 100 * time.Millisecond
+	candidate.mu.Unlock()
+
+	candidate.startElection()
+
+	// Wait for election to complete.
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		candidate.mu.Lock()
+		becameLeader := candidate.role == Leader
+		candidate.mu.Unlock()
+
+		if becameLeader {
+			break
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	candidate.mu.Lock()
+	if candidate.role != Leader {
+		candidate.mu.Unlock()
+		t.Fatal("candidate did not become leader")
+	}
+
+	lastIndex := len(candidate.log) - 1
+	if lastIndex < 1 {
+		candidate.mu.Unlock()
+		t.Fatal("new leader did not append a no-op entry")
+	}
+
+	entry := candidate.log[lastIndex]
+	term := candidate.currentTerm
+	candidate.mu.Unlock()
+
+	if entry.Term != term {
+		t.Fatalf(
+			"no-op term = %d, current term = %d",
+			entry.Term,
+			term,
+		)
+	}
+
+	if entry.Command.Op != "NOOP" {
+		t.Fatalf(
+			"expected last entry to be NOOP, got %q",
+			entry.Command.Op,
+		)
+	}
+
+	// Wait for the no-op to be committed.
+	deadline = time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		candidate.mu.Lock()
+		committed := candidate.commitIndex >= lastIndex
+		candidate.mu.Unlock()
+
+		if committed {
+			return
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	candidate.mu.Lock()
+	commitIndex := candidate.commitIndex
+	candidate.mu.Unlock()
+
+	t.Fatalf(
+		"expected no-op at index %d to be committed, commitIndex=%d",
+		lastIndex,
+		commitIndex,
+	)
+}
+
+func TestGetFailsIfTermChangesBeforeRead(t *testing.T) {
+	node := NewRaftNode(
+		0,
+		1,
+		make(chan ApplyMsg, 10),
+		storage.NewMemEngine(),
+	)
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 1
+	node.commitIndex = 1
+	node.lastApplied = 0
+
+	node.log = append(node.log, LogEntry{
+		Index: 1,
+		Term:  1,
+		Command: Command{
+			Op:    "SET",
+			Key:   "x",
+			Value: "value",
+		},
+	})
+	node.mu.Unlock()
+
+	done := make(chan struct{})
+	var err error
+
+	go func() {
+		_, _, err = node.Get("x")
+		close(done)
+	}()
+
+	// Allow Get to reach waitForApply.
+	time.Sleep(50 * time.Millisecond)
+
+	// Simulate a new leadership term before the read completes.
+	node.mu.Lock()
+	node.currentTerm = 2
+	node.role = Leader
+	node.lastApplied = 1
+	node.mu.Unlock()
+
+	node.notifyApplied(1, nil)
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("Get did not return")
+	}
+
+	if err != ErrWrongLeader {
+		t.Fatalf("expected ErrWrongLeader, got %v", err)
 	}
 }

@@ -3,11 +3,85 @@ package raft
 import (
 	"RaftKV/internal/storage"
 	"bytes"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
 )
+
+// type failingPersister struct{}
+
+// func (p *failingPersister) SaveRaftState(state []byte) error {
+// 	return fmt.Errorf("simulated persistence failure")
+// }
+
+// func (p *failingPersister) ReadRaftState() ([]byte, error) {
+// 	return nil, nil
+// }
+
+type failingPersister struct {
+	saveCalls int
+}
+
+func (p *failingPersister) SaveRaftState(state []byte) error {
+	p.saveCalls++
+
+	if p.saveCalls == 2 {
+		return fmt.Errorf("simulated log persistence failure")
+	}
+
+	return nil
+}
+
+func (p *failingPersister) ReadRaftState() ([]byte, error) {
+	return nil, nil
+}
+
+func TestFollowerDoesNotAcknowledgeEntryWhenPersistenceFails(t *testing.T) {
+	persister := &failingPersister{}
+
+	follower := NewRaftNodeWithPersister(
+		1, 2,
+		make(chan ApplyMsg, 10),
+		nil,
+		persister,
+	)
+	defer close(follower.stopCh)
+
+	args := AppendEntriesArgs{
+		Term:         1,
+		LeaderID:     0,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		Entries: []LogEntry{
+			{
+				Index: 1,
+				Term:  1,
+				Command: Command{
+					Op:    "SET",
+					Key:   "language",
+					Value: "Go",
+				},
+			},
+		},
+		LeaderCommit: 0,
+	}
+
+	var reply AppendEntriesReply
+	follower.AppendEntries(&args, &reply)
+
+	if reply.Success {
+		t.Fatal("follower acknowledged an entry despite persistence failure")
+	}
+
+	follower.mu.Lock()
+	defer follower.mu.Unlock()
+
+	if len(follower.log) != 1 {
+		t.Fatalf("log length = %d, want 1 (dummy entry only)", len(follower.log))
+	}
+}
 
 func TestMemPersisterSaveAndRead(t *testing.T) {
 	p := NewMemPersister()
@@ -296,7 +370,7 @@ func TestRaftNodeRecoversFromFilePersister(t *testing.T) {
 		},
 	}
 
-	encoded, err := encodeRaftState(4, 2, originalLog, 0)
+	encoded, err := encodeRaftState(4, 2, originalLog, 1)
 	if err != nil {
 		t.Fatalf("encode state: %v", err)
 	}
@@ -330,6 +404,11 @@ func TestRaftNodeRecoversFromFilePersister(t *testing.T) {
 
 	if node.votedFor != 2 {
 		t.Errorf("votedFor = %d, want 2", node.votedFor)
+	}
+
+	if node.commitIndex != 0 {
+		t.Errorf("commitIndex = %d, want 0 for multi-node restart",
+			node.commitIndex)
 	}
 
 	if !reflect.DeepEqual(node.log, originalLog) {
@@ -485,5 +564,161 @@ func TestFilePersisterMissingFile(t *testing.T) {
 
 	if state != nil {
 		t.Fatalf("state = %v, want nil for a missing file", state)
+	}
+}
+
+func TestFollowerAppliesEntryAfterRestartAndLeaderCommit(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
+
+	log := []LogEntry{
+		{Index: 0, Term: 0},
+		{
+			Index: 1,
+			Term:  1,
+			Command: Command{
+				Op:    "SET",
+				Key:   "language",
+				Value: "Go",
+			},
+		},
+	}
+
+	// Persist the follower's log, but no commit index.
+	state, err := encodeRaftState(1, -1, log, 0)
+	if err != nil {
+		t.Fatalf("encode state: %v", err)
+	}
+
+	persister, err := NewFilePersister(stateFile)
+	if err != nil {
+		t.Fatalf("create persister: %v", err)
+	}
+	if err := persister.SaveRaftState(state); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	engine := storage.NewMemEngine()
+	applyCh := make(chan ApplyMsg, 10)
+
+	// Restart the follower using the persisted state.
+	follower := NewRaftNodeWithPersister(
+		1, 2, applyCh, engine, persister,
+	)
+	defer close(follower.stopCh)
+
+	// The entry exists in the log but is not yet committed.
+	if follower.commitIndex != 0 {
+		t.Fatalf("commitIndex = %d, want 0", follower.commitIndex)
+	}
+
+	// Simulate the leader informing the restarted follower
+	// that entry 1 is committed.
+	args := AppendEntriesArgs{
+		Term:         1,
+		LeaderID:     0,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		LeaderCommit: 1,
+	}
+	var reply AppendEntriesReply
+	follower.AppendEntries(&args, &reply)
+
+	if !reply.Success {
+		t.Fatal("follower should accept valid AppendEntries")
+	}
+
+	// Process the ApplyMsg as the apply loop normally would.
+	select {
+	case msg := <-applyCh:
+		if err := follower.applyMessage(msg); err != nil {
+			t.Fatalf("apply committed entry: %v", err)
+		}
+	default:
+		t.Fatal("expected committed entry to be queued for application")
+	}
+
+	value, found, err := engine.Get([]byte("language"))
+	if err != nil {
+		t.Fatalf("get recovered value: %v", err)
+	}
+	if !found || string(value) != "Go" {
+		t.Fatalf("value = (%q, %v), want (%q, true)",
+			string(value), found, "Go")
+	}
+
+	follower.mu.Lock()
+	defer follower.mu.Unlock()
+	if follower.commitIndex != 1 {
+		t.Fatalf("commitIndex = %d, want 1", follower.commitIndex)
+	}
+}
+
+func TestFollowerPersistsNewLogEntryBeforeAcknowledging(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
+
+	persister, err := NewFilePersister(stateFile)
+	if err != nil {
+		t.Fatalf("create persister: %v", err)
+	}
+
+	follower := NewRaftNodeWithPersister(
+		1, 2,
+		make(chan ApplyMsg, 10),
+		nil,
+		persister,
+	)
+	defer close(follower.stopCh)
+
+	args := AppendEntriesArgs{
+		Term:         1,
+		LeaderID:     0,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		Entries: []LogEntry{
+			{
+				Index: 1,
+				Term:  1,
+				Command: Command{
+					Op:    "SET",
+					Key:   "language",
+					Value: "Go",
+				},
+			},
+		},
+		LeaderCommit: 0,
+	}
+
+	var reply AppendEntriesReply
+	follower.AppendEntries(&args, &reply)
+
+	if !reply.Success {
+		t.Fatal("follower should acknowledge the valid entry")
+	}
+
+	// Simulate a restart by creating a new node from the same file.
+	restarted := NewRaftNodeWithPersister(
+		1, 2,
+		make(chan ApplyMsg, 10),
+		nil,
+		persister,
+	)
+	defer close(restarted.stopCh)
+
+	restarted.mu.Lock()
+	defer restarted.mu.Unlock()
+
+	if len(restarted.log) != 2 {
+		t.Fatalf("recovered log length = %d, want 2", len(restarted.log))
+	}
+
+	entry := restarted.log[1]
+	if entry.Command.Key != "language" ||
+		entry.Command.Value != "Go" ||
+		entry.Term != 1 {
+		t.Fatalf("unexpected recovered entry: %+v", entry)
+	}
+
+	if restarted.commitIndex != 0 {
+		t.Fatalf("commitIndex = %d, want 0", restarted.commitIndex)
 	}
 }

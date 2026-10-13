@@ -238,6 +238,7 @@ func (rn *RaftNode) Get(key string) (string, bool, error) {
 		rn.mu.Unlock()
 		return "", false, ErrWrongLeader
 	}
+	term := rn.currentTerm
 	rn.mu.Unlock()
 
 	// Establish that this node is still the leader
@@ -256,7 +257,7 @@ func (rn *RaftNode) Get(key string) (string, bool, error) {
 
 	// Verify that we are still the leader before reading.
 	rn.mu.Lock()
-	if rn.role != Leader {
+	if rn.role != Leader || rn.currentTerm != term {
 		rn.mu.Unlock()
 		return "", false, ErrWrongLeader
 	}
@@ -361,11 +362,25 @@ func (rn *RaftNode) readIndex() (int, error) {
 	me := rn.me
 	peers := rn.peers
 
+	noopIndex := -1
+
+	for i := len(rn.log) - 1; i >= 1; i-- {
+		if rn.log[i].Term == term && rn.log[i].Command.Op == "NOOP"{
+			noopIndex = i
+			break
+		}
+	}
+
 	// The leader itself counts as one acknowledgement.
 	acks := 1
 
 	// Single-node cluster: leader already has a majority.
 	if acks > len(peers)/2 {
+		if noopIndex >= 0 && rn.commitIndex < noopIndex {
+			rn.mu.Unlock()
+			return 0, ErrReadIndexFailed
+		}
+
 		readIndex := rn.commitIndex
 		rn.mu.Unlock()
 		return readIndex, nil
@@ -408,6 +423,15 @@ func (rn *RaftNode) readIndex() (int, error) {
 
 		// Another node has a higher term.
 		if result.term > rn.currentTerm {
+			if err := rn.persistState(
+				result.term,
+				-1,
+				rn.log,
+				rn.commitIndex,
+			); err != nil {
+				rn.mu.Unlock()
+				return 0, err
+			}
 			rn.currentTerm = result.term
 			rn.role = Follower
 			rn.votedFor = -1
@@ -504,6 +528,10 @@ func (rn *RaftNode) applyLoop() {
 
 func (rn *RaftNode) applyMessage(msg ApplyMsg) error {
 	switch msg.Command.Op {
+
+	case "NOOP":
+		return nil
+
 	case "SET":
 		return rn.Engine.Put(
 			[]byte(msg.Command.Key),
@@ -551,6 +579,7 @@ func (rn *RaftNode) recoverSingleNodeState() error {
 		entry := rn.log[i]
 
 		switch entry.Command.Op {
+		case "NOOP": // No state-machine change is required.
 		case "SET":
 			if err := rn.Engine.Put(
 				[]byte(entry.Command.Key),

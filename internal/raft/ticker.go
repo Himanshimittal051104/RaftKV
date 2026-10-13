@@ -85,10 +85,33 @@ func (rn *RaftNode) startElection() {
 			println("Node", me, "BECAME LEADER for term", term)
 			rn.role = Leader
 
-			for j := range rn.peers {
-				rn.nextIndex[j] = len(rn.log)
-				rn.matchIndex[j] = 0
+			index := len(rn.log)
+			noop := LogEntry{
+				Index: index,
+				Term:  term,
+				Command: Command{
+					Op: "NOOP",
+				},
 			}
+
+			newLog := make([]LogEntry, len(rn.log)+1)
+			copy(newLog, rn.log)
+			newLog[index] = noop
+
+			if err := rn.persistState(
+				rn.currentTerm,
+				rn.votedFor,
+				newLog,
+				rn.commitIndex,
+			); err != nil {
+				rn.role = Follower
+				rn.mu.Unlock()
+				return
+			}
+
+			rn.log = newLog
+			rn.matchIndex[rn.me] = index
+			rn.nextIndex[rn.me] = index + 1
 
 			rn.mu.Unlock()
 			go rn.broadcastAppendEntries()
@@ -152,11 +175,43 @@ func (rn *RaftNode) startElection() {
 					println("Node", me, "BECAME LEADER for term", term)
 					rn.role = Leader
 
-					for j := range rn.peers {
-						rn.nextIndex[j] = len(rn.log)
-						rn.matchIndex[j] = 0
+					index := len(rn.log)
+					noop := LogEntry{
+						Index: index,
+						Term:  term,
+						Command: Command{
+							Op: "NOOP",
+						},
 					}
+
+					newLog := make([]LogEntry, len(rn.log)+1)
+					copy(newLog, rn.log)
+					newLog[index] = noop
+
+					if err := rn.persistState(
+						rn.currentTerm,
+						rn.votedFor,
+						newLog,
+						rn.commitIndex,
+					); err != nil {
+						rn.role = Follower
+						rn.mu.Unlock()
+						return
+					}
+
+					rn.log = newLog
+					rn.matchIndex[rn.me] = index
+					rn.nextIndex[rn.me] = index + 1
+
+					for j := range rn.peers {
+						if j != rn.me {
+							rn.nextIndex[j] = index
+							rn.matchIndex[j] = 0
+						}
+					}
+
 					go rn.broadcastAppendEntries()
+					return
 				}
 			}
 		}(i)
