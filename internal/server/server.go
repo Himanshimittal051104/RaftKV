@@ -10,7 +10,7 @@ import (
 
 type KVServer struct {
 	node *raft.RaftNode //This is the Raft node that actually handles consensus.
-	mux  *http.ServeMux //This is Go's HTTP router. It decides which handler receives an incoming HTTP request.
+	mux  *http.ServeMux //This is Go's HTTP multiplexer or router. It decides which handler receives an incoming HTTP request.It maps URL paths to handler functions.
 	//HTTP Client -> KVServer -> RaftNode
 }
 
@@ -24,6 +24,7 @@ type Response struct {
 	Value    string `json:"value"`
 	Found    bool   `json:"found"`
 	Error    string `json:"error,omitempty"`
+	//The omitempty tag omits a field when it has its zero value
 }
 
 func NewKVServer(node *raft.RaftNode) *KVServer { //This creates the HTTP server around an existing Raft node.
@@ -40,8 +41,10 @@ func (s *KVServer) registerRoutes() {
 }
 
 func (s *KVServer) handleKVRequest(w http.ResponseWriter, r *http.Request) {
+	//w is the response writer used to send the response to the client. r contains the incoming HTTP request.
+	
 	w.Header().Set("Content-Type", "application/json")
-
+	
 	switch r.Method {
 	case http.MethodPost:
 		var req PutRequest
@@ -52,8 +55,10 @@ func (s *KVServer) handleKVRequest(w http.ResponseWriter, r *http.Request) {
 
 		success, err := s.node.Put(req.Key, req.Value)
 		if errors.Is(err, raft.ErrWrongLeader) {
-			w.WriteHeader(http.StatusServiceUnavailable)
+			w.WriteHeader(http.StatusServiceUnavailable) //This sends the HTTP status code 503 Service Unavailable to the client.
 			json.NewEncoder(w).Encode(Response{Error: "not the leader"})
+			//json.NewEncoder(w) creates a JSON encoder that writes to the HTTP response writer w.
+			//.Encode(...) converts the Response struct into JSON and writes it to the response.
 			return
 		} else if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -111,7 +116,8 @@ func (s *KVServer) handleKVRequest(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *KVServer) ServeHTTP(w http.ResponseWriter, r *http.Request) { //It means KVServer itself implements the http.Handler interface.
+func (s *KVServer) ServeHTTP(w http.ResponseWriter, r *http.Request) { 
+	//It means KVServer itself implements the http.Handler interface.
 	s.mux.ServeHTTP(w, r)
 }
 

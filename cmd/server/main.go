@@ -51,5 +51,5 @@ func main() {
 
 // http: ->The protocol used to communicate with the server. Here, it's HTTP.
 // localhost->Means your own computer. It's the hostname that refers to your local machine.
-// :8080->The port your application listens on, specified in main.go.
+// :8080->The port your application listens on.
 }

@@ -17,8 +17,8 @@ func (rn *RaftNode) Stop() {
 }
 
 func (rn *RaftNode) runLoop() {
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
+	ticker := time.NewTicker(20 * time.Millisecond) //produces a tick every 20 milliseconds.
+	defer ticker.Stop() //ensures the ticker is stopped when runLoop() returns.
 
 	for {
 		select {
