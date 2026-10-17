@@ -16,8 +16,7 @@ type Persister interface {
 }
 
 // MemPersister is an in-memory implementation of Persister.
-// It is primarily useful for testing persistence semantics before
-// introducing actual disk-backed storage.
+// It is primarily useful for testing persistence semantics before introducing actual disk-backed storage.
 type MemPersister struct {
 	mu    sync.Mutex
 	state []byte
@@ -31,10 +30,9 @@ func (p *MemPersister) SaveRaftState(state []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Copy the bytes so the caller cannot mutate our stored state.
-	//If we did:p.state = state,then the caller could later modify state, and our supposedly persisted data would silently change.
-	p.state = append([]byte(nil), state...)
-
+	valcopy := make([]byte, len(state))
+	copy(valcopy, state)
+	p.state = valcopy
 	return nil
 }
 
@@ -43,7 +41,9 @@ func (p *MemPersister) ReadRaftState() ([]byte, error) {
 	defer p.mu.Unlock()
 
 	// Return a copy for the same reason.
-	return append([]byte(nil), p.state...), nil
+	valcopy := make([]byte, len(p.state))
+	copy(valcopy, p.state)
+	return valcopy, nil
 }
 
 // FilePersister stores Raft state in a file.

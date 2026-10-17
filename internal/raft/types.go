@@ -85,4 +85,4 @@ type StateMachine interface {
 //                    StateMachine
 //                           │
 //                           ▼
-//                      KV State
+//                      KV State Machine

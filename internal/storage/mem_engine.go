@@ -8,7 +8,7 @@ import (
 //It is your actual storage implementation for the storage.Engine interface
 type MemEngine struct {
 	mu   sync.Mutex
-	data map[string][]byte
+	data map[string][]byte //Your interface accepts keys as []byte, but Go map keys must be comparable. A byte slice cannot be used directly as a map key.
 }
 
 // NewMemEngine creates a new instance of MemEngine.
