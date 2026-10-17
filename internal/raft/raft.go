@@ -1,7 +1,7 @@
 package raft
 
 import (
-	"errors"    // Used to create predefined errors:
+	"errors"    // Used to create predefined errors
 	"math/rand" //Used to randomize the election timeout. Without randomization, multiple nodes could time out simultaneously and repeatedly start elections.
 	"sync"      //multiple goroutines can access the Raft node simultaneously.
 	"time"      //This handles election and heartbeat timing.
@@ -27,9 +27,9 @@ type RaftNode struct {
 	currentTerm int
 	votedFor    int        // -1 means no vote cast yet in currentTerm
 	log         []LogEntry // Log entries; index 0 is a dummy entry
+	commitIndex int
 
 	// Volatile state on all servers
-	commitIndex int
 	lastApplied int //lastApplied <= commitIndex
 	lastQueued  int
 	//After a crash, you can reconstruct the state machine from persistent storage/snapshot + log replay.
@@ -51,7 +51,7 @@ type RaftNode struct {
 	Engine storage.Engine //This connects Raft to your KV engine.
 
 	applyCh chan ApplyMsg //This is a Go channel. It's used to send committed Raft commands toward the application/state-machine layer.
-	stopCh  chan struct{} //This is typically used to tell background goroutines
+	stopCh  chan struct{} //This is typically used to tell background goroutines to stop running. The struct{} type is an empty struct, which takes up no memory. It's often used as a signal in channels(no data, only signals).
 
 	persister Persister
 }
@@ -67,7 +67,8 @@ func NewRaftNode(me int, peersCount int, applyCh chan ApplyMsg, engine storage.E
 		NewMemPersister(),
 	)
 }
-func NewPersistentRaftNode(me int, peersCount int, applyCh chan ApplyMsg, engine storage.Engine, stateFile string) (*RaftNode, error) {
+
+func NewPersistentRaftNode(me int, peersCount int, applyCh chan ApplyMsg, engine storage.Engine, stateFile string) (*RaftNode, error) { 
 	persister, err := NewFilePersister(stateFile)
 	if err != nil {
 		return nil, err
@@ -193,15 +194,17 @@ func (rn *RaftNode) Start(command Command) (int, int, bool) {
 	rn.matchIndex[rn.me] = index
 	rn.nextIndex[rn.me] = index + 1
 
+
 	// In a single-node cluster, the leader itself is a majority.
 	if len(rn.peers) == 0 {
 		rn.commitIndex = newCommitIndex
 		applyMsgs := rn.collectCommittedEntries()
 		go func() {
+			//The purpose is to send the application messages without making Start() wait synchronously for the receiver of applyCh. Without the go keyword, a send to an unbuffered channel—or a full buffered channel—could block Start() until a receiver became available.
 			for _, msg := range applyMsgs {
 				select {
-				case rn.applyCh <- msg:
-				case <-rn.stopCh:
+				case rn.applyCh <- msg: //the message can be sent to the application channel.
+				case <-rn.stopCh: //shutdown has been signalled, so the goroutine returns.
 					return
 				}
 			}
@@ -241,15 +244,13 @@ func (rn *RaftNode) Get(key string) (string, bool, error) {
 	term := rn.currentTerm
 	rn.mu.Unlock()
 
-	// Establish that this node is still the leader
-	// by obtaining a ReadIndex from a majority.
+	// Establish that this node is still the leader by obtaining a ReadIndex from a majority.
 	readIndex, err := rn.readIndex()
 	if err != nil {
 		return "", false, err
 	}
 
-	// wait until the state machine has applied
-	// everything through readIndex.
+	// wait until the state machine has applied everything through readIndex.
 
 	if err := rn.waitForApply(readIndex); err != nil {
 		return "", false, err
@@ -307,7 +308,7 @@ func (rn *RaftNode) waitForApply(index int) error {
 	case err := <-ch:
 		return err
 
-	case <-time.After(2 * time.Second):
+	case <-time.After(2 * time.Second): //it gives you a channel that will signal after two seconds have elapsed.
 		rn.mu.Lock()
 
 		delete(rn.applyWaiters, index)
@@ -547,6 +548,7 @@ func (rn *RaftNode) applyMessage(msg ApplyMsg) error {
 		return fmt.Errorf("unsupported operation %q", msg.Command.Op)
 	}
 }
+
 func (rn *RaftNode) persistState(currentTerm int, votedFor int, log []LogEntry, commitIndex int) error {
 	state, err := encodeRaftState(
 		currentTerm,
@@ -563,7 +565,6 @@ func (rn *RaftNode) persistState(currentTerm int, votedFor int, log []LogEntry, 
 
 // recoverSingleNodeState rebuilds the in-memory state machine
 // from the persisted log during single-node startup.
-//
 // Call this before starting background goroutines or serving requests.
 func (rn *RaftNode) recoverSingleNodeState() error {
 	// Replay log entries in order, skipping the dummy entry at index 0.
@@ -613,8 +614,7 @@ func (rn *RaftNode) recoverSingleNodeState() error {
 
 	}
 
-	// In this single-node configuration, the recovered durable log
-	// represents the committed state reconstructed above.
+	// In this single-node configuration, the recovered durable log represents the committed state reconstructed above.
 	rn.lastApplied = rn.commitIndex
 
 	return nil
