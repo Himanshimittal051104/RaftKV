@@ -102,7 +102,7 @@ func (rn *RaftNode) startElection() {
 				rn.currentTerm,
 				rn.votedFor,
 				newLog,
-				rn.commitIndex,
+				index,
 			); err != nil {
 				rn.role = Follower
 				rn.mu.Unlock()
@@ -110,10 +110,25 @@ func (rn *RaftNode) startElection() {
 			}
 
 			rn.log = newLog
+			rn.commitIndex = index
 			rn.matchIndex[rn.me] = index
 			rn.nextIndex[rn.me] = index + 1
 
+			msgs := rn.collectCommittedEntries()
+
 			rn.mu.Unlock()
+
+			for _, msg := range msgs {
+				if rn.applyCh == nil {
+					continue
+				}
+
+				select {
+				case rn.applyCh <- msg:
+				case <-rn.stopCh:
+					return
+				}
+			}
 			go rn.broadcastAppendEntries()
 		} else {
 			rn.mu.Unlock()

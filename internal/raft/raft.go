@@ -377,7 +377,7 @@ func (rn *RaftNode) readIndex() (int, error) {
 
 	// Single-node cluster: leader already has a majority.
 	if acks > len(peers)/2 {
-		if noopIndex >= 0 && rn.commitIndex < noopIndex {
+		if noopIndex < 0 || rn.commitIndex < noopIndex {
 			rn.mu.Unlock()
 			return 0, ErrReadIndexFailed
 		}
@@ -454,8 +454,11 @@ func (rn *RaftNode) readIndex() (int, error) {
 		}
 
 		if acks > len(peers)/2 {
-			// IMPORTANT:
-			// Capture commitIndex only AFTER quorum confirmation.
+			// Capture commitIndex only AFTER quorum confirmation and noop commited
+			if noopIndex < 0 || rn.commitIndex < noopIndex {
+				rn.mu.Unlock()
+				return 0, ErrReadIndexFailed
+			}
 			readIndex := rn.commitIndex
 
 			rn.mu.Unlock()

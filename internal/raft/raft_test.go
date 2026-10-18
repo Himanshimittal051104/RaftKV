@@ -2487,6 +2487,15 @@ func TestReadIndexMajority(t *testing.T) {
 	nodes[0].mu.Lock()
 	nodes[0].role = Leader
 	nodes[0].currentTerm = 5
+	// Build a log containing a committed NOOP from the current term.
+	nodes[0].log = make([]LogEntry, 8)
+	nodes[0].log[7] = LogEntry{
+		Index: 7,
+		Term:  5,
+		Command: Command{
+			Op: "NOOP",
+		},
+	}
 	nodes[0].commitIndex = 7
 	nodes[0].mu.Unlock()
 
@@ -2511,6 +2520,20 @@ func TestReadIndexSingleNode(t *testing.T) {
 	node.mu.Lock()
 	node.role = Leader
 	node.currentTerm = 3
+	node.log = node.log[:1]
+	node.log = append(node.log,
+		LogEntry{
+			Index: 1,
+			Term:  3,
+			Command: Command{
+				Op: "NOOP",
+			},
+		},
+		LogEntry{Index: 2},
+		LogEntry{Index: 3},
+		LogEntry{Index: 4},
+		LogEntry{Index: 5},
+	)
 	node.commitIndex = 5
 	node.mu.Unlock()
 
@@ -2579,7 +2602,21 @@ func TestGetWaitsForReadIndexToApply(t *testing.T) {
 	node.mu.Lock()
 	node.role = Leader
 	node.currentTerm = 1
-	node.commitIndex = 1
+	node.log = node.log[:1]
+	node.log = append(node.log,
+		LogEntry{
+			Index: 1,
+			Term:  1,
+			Command: Command{
+				Op: "NOOP",
+			},
+		},
+		LogEntry{
+			Index: 2,
+			Term: 1,
+		},
+	)
+	node.commitIndex = 2
 	node.lastApplied = 0
 	node.mu.Unlock()
 
@@ -2603,10 +2640,10 @@ func TestGetWaitsForReadIndexToApply(t *testing.T) {
 
 	// Simulate application of index 1.
 	node.mu.Lock()
-	node.lastApplied = 1
+	node.lastApplied = 2
 	node.mu.Unlock()
 
-	node.notifyApplied(1, nil)
+	node.notifyApplied(2, nil)
 
 	select {
 	case <-done:
@@ -2640,19 +2677,29 @@ func TestGetWaitsForReadIndexApplication(t *testing.T) {
 	leader.mu.Lock()
 	leader.role = Leader
 	leader.currentTerm = 1
-	leader.commitIndex = 1
-	leader.lastApplied = 0
-
 	// Create the committed log entry that Get() will fence on.
-	leader.log = append(leader.log, LogEntry{
-		Index: 1,
-		Term:  1,
-		Command: Command{
-			Op:    "SET",
-			Key:   "x",
-			Value: "value",
+	leader.log = leader.log[:1]
+	leader.log = append(leader.log,
+		LogEntry{
+			Index: 1,
+			Term:  1,
+			Command: Command{
+				Op: "NOOP",
+			},
 		},
-	})
+		LogEntry{
+			Index: 2,
+			Term:  1,
+			Command: Command{
+				Op:    "SET",
+				Key:   "x",
+				Value: "value",
+			},
+		},
+	)
+
+	leader.commitIndex = 2
+	leader.lastApplied = 0
 	leader.mu.Unlock()
 
 	done := make(chan struct{})
@@ -2682,10 +2729,10 @@ func TestGetWaitsForReadIndexApplication(t *testing.T) {
 	}
 
 	leader.mu.Lock()
-	leader.lastApplied = 1
+	leader.lastApplied = 2
 	leader.mu.Unlock()
 
-	leader.notifyApplied(1, nil)
+	leader.notifyApplied(2, nil)
 
 	select {
 	case <-done:
@@ -2717,18 +2764,29 @@ func TestGetFailsIfLeadershipLostBeforeRead(t *testing.T) {
 	node.mu.Lock()
 	node.role = Leader
 	node.currentTerm = 1
-	node.commitIndex = 1
-	node.lastApplied = 0
-
-	node.log = append(node.log, LogEntry{
-		Index: 1,
-		Term:  1,
-		Command: Command{
-			Op:    "SET",
-			Key:   "x",
-			Value: "value",
+	
+	node.log = node.log[:1]
+	node.log = append(node.log,
+		LogEntry{
+			Index: 1,
+			Term:  1,
+			Command: Command{
+				Op: "NOOP",
+			},
 		},
-	})
+		LogEntry{
+			Index: 2,
+			Term:  1,
+			Command: Command{
+				Op:    "SET",
+				Key:   "x",
+				Value: "value",
+			},
+		},
+	)
+
+	node.commitIndex = 2
+	node.lastApplied = 0
 	node.mu.Unlock()
 
 	done := make(chan struct{})
@@ -2749,10 +2807,10 @@ func TestGetFailsIfLeadershipLostBeforeRead(t *testing.T) {
 
 	// Simulate the read index becoming applied.
 	node.mu.Lock()
-	node.lastApplied = 1
+	node.lastApplied = 2
 	node.mu.Unlock()
 
-	node.notifyApplied(1, nil)
+	node.notifyApplied(2, nil)
 
 	select {
 	case <-done:
@@ -2970,18 +3028,27 @@ func TestGetFailsIfTermChangesBeforeRead(t *testing.T) {
 	node.mu.Lock()
 	node.role = Leader
 	node.currentTerm = 1
-	node.commitIndex = 1
-	node.lastApplied = 0
 
-	node.log = append(node.log, LogEntry{
-		Index: 1,
-		Term:  1,
-		Command: Command{
-			Op:    "SET",
-			Key:   "x",
-			Value: "value",
+	node.log = node.log[:1]
+	node.log = append(node.log,
+		LogEntry{
+			Index:   1,
+			Term:    1,
+			Command: Command{Op: "NOOP"},
 		},
-	})
+		LogEntry{
+			Index: 2,
+			Term:  1,
+			Command: Command{
+				Op:    "SET",
+				Key:   "x",
+				Value: "value",
+			},
+		},
+	)
+
+	node.commitIndex = 2
+	node.lastApplied = 0
 	node.mu.Unlock()
 
 	done := make(chan struct{})
@@ -2999,10 +3066,10 @@ func TestGetFailsIfTermChangesBeforeRead(t *testing.T) {
 	node.mu.Lock()
 	node.currentTerm = 2
 	node.role = Leader
-	node.lastApplied = 1
+	node.lastApplied = 2
 	node.mu.Unlock()
 
-	node.notifyApplied(1, nil)
+	node.notifyApplied(2, nil)
 
 	select {
 	case <-done:
