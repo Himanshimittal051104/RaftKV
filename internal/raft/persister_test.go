@@ -722,3 +722,372 @@ func TestFollowerPersistsNewLogEntryBeforeAcknowledging(t *testing.T) {
 		t.Fatalf("commitIndex = %d, want 0", restarted.commitIndex)
 	}
 }
+
+func TestFilePersisterRejectsEmptyPath(t *testing.T) {
+	p, err := NewFilePersister("")
+
+	if err == nil {
+		t.Fatal("expected error for empty state file path")
+	}
+
+	if p != nil {
+		t.Fatal("expected nil persister for empty state file path")
+	}
+}
+
+func TestFollowerPersistsRepairedConflictAcrossRestart(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
+
+	persister, err := NewFilePersister(stateFile)
+	if err != nil {
+		t.Fatalf("create persister: %v", err)
+	}
+
+	// Persist a follower log containing a conflicting entry X at index 2.
+	oldLog := []LogEntry{
+		{Index: 0, Term: 0},
+		{
+			Index: 1,
+			Term:  1,
+			Command: Command{
+				Op:    "SET",
+				Key:   "x",
+				Value: "A",
+			},
+		},
+		{
+			Index: 2,
+			Term:  3,
+			Command: Command{
+				Op:    "SET",
+				Key:   "x",
+				Value: "X",
+			},
+		},
+	}
+
+	state, err := encodeRaftState(3, -1, oldLog, 0)
+	if err != nil {
+		t.Fatalf("encode old state: %v", err)
+	}
+	if err := persister.SaveRaftState(state); err != nil {
+		t.Fatalf("save old state: %v", err)
+	}
+
+	follower := NewRaftNodeWithPersister(
+		1, 2, make(chan ApplyMsg, 10), nil, persister,
+	)
+	defer close(follower.stopCh)
+
+	// The leader sends its replacement entry B at index 2.
+	args := AppendEntriesArgs{
+		Term:         4,
+		LeaderID:     0,
+		PrevLogIndex: 1,
+		PrevLogTerm:  1,
+		Entries: []LogEntry{
+			{
+				Index: 2,
+				Term:  4,
+				Command: Command{
+					Op:    "SET",
+					Key:   "x",
+					Value: "B",
+				},
+			},
+		},
+		LeaderCommit: 0,
+	}
+
+	var reply AppendEntriesReply
+	follower.AppendEntries(&args, &reply)
+
+	if !reply.Success {
+		t.Fatal("follower should accept the replacement entry")
+	}
+
+	// Simulate restart by loading the same state file into a new node.
+	restarted := NewRaftNodeWithPersister(
+		1, 2, make(chan ApplyMsg, 10), nil, persister,
+	)
+	defer close(restarted.stopCh)
+
+	restarted.mu.Lock()
+	defer restarted.mu.Unlock()
+
+	if len(restarted.log) != 3 {
+		t.Fatalf("recovered log length = %d, want 3", len(restarted.log))
+	}
+
+	entry := restarted.log[2]
+	if entry.Term != 4 || entry.Command.Value != "B" {
+		t.Fatalf("recovered entry = %+v, want term 4 and value B", entry)
+	}
+}
+
+func TestGrantedVoteSurvivesRestart(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
+
+	persister, err := NewFilePersister(stateFile)
+	if err != nil {
+		t.Fatalf("create persister: %v", err)
+	}
+
+	follower := NewRaftNodeWithPersister(
+		0, 3, make(chan ApplyMsg, 10), nil, persister,
+	)
+	defer close(follower.stopCh)
+
+	args := RequestVoteArgs{
+		Term:         1,
+		CandidateID:  1,
+		LastLogIndex: 0,
+		LastLogTerm:  0,
+	}
+
+	var reply RequestVoteReply
+	follower.RequestVote(&args, &reply)
+
+	if !reply.VoteGranted {
+		t.Fatal("expected vote to be granted")
+	}
+
+	// Reconstruct the follower using the same disk-backed state.
+	restarted := NewRaftNodeWithPersister(
+		0, 3, make(chan ApplyMsg, 10), nil, persister,
+	)
+	defer close(restarted.stopCh)
+
+	restarted.mu.Lock()
+	if restarted.currentTerm != 1 {
+		t.Errorf("currentTerm = %d, want 1", restarted.currentTerm)
+	}
+	if restarted.votedFor != 1 {
+		t.Errorf("votedFor = %d, want 1", restarted.votedFor)
+	}
+	restarted.mu.Unlock()
+
+	// The restarted follower must not vote for another candidate
+	// in the same term.
+	secondRequest := RequestVoteArgs{
+		Term:         1,
+		CandidateID:  2,
+		LastLogIndex: 0,
+		LastLogTerm:  0,
+	}
+
+	var secondReply RequestVoteReply
+	restarted.RequestVote(&secondRequest, &secondReply)
+
+	if secondReply.VoteGranted {
+		t.Fatal("follower granted a second vote in the same term")
+	}
+}
+
+func TestFollowerDoesNotGrantVoteWhenPersistenceFails(t *testing.T) {
+	persister := &failingPersister{
+		saveCalls: 0,
+	}
+
+	follower := NewRaftNodeWithPersister(
+		0, 3, make(chan ApplyMsg, 10), nil, persister,
+	)
+	defer close(follower.stopCh)
+
+	args := RequestVoteArgs{
+		Term:         1,
+		CandidateID:  1,
+		LastLogIndex: 0,
+		LastLogTerm:  0,
+	}
+
+	var reply RequestVoteReply
+	follower.RequestVote(&args, &reply)
+
+	if reply.VoteGranted {
+		t.Fatal("follower granted vote despite persistence failure")
+	}
+
+	follower.mu.Lock()
+	defer follower.mu.Unlock()
+
+	if follower.currentTerm != 1 {
+		t.Errorf("currentTerm = %d, want 1", follower.currentTerm)
+	}
+	if follower.votedFor != -1 {
+		t.Errorf("votedFor = %d, want -1", follower.votedFor)
+	}
+}
+
+func TestPersistentNodeRecoversDeletedKey(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
+
+	log := []LogEntry{
+		{Index: 0, Term: 0},
+		{
+			Index: 1,
+			Term:  1,
+			Command: Command{
+				Op:    "SET",
+				Key:   "language",
+				Value: "Go",
+			},
+		},
+		{
+			Index: 2,
+			Term:  1,
+			Command: Command{
+				Op:  "DELETE",
+				Key: "language",
+			},
+		},
+	}
+
+	// Both entries are committed.
+	state, err := encodeRaftState(1, -1, log, 2)
+	if err != nil {
+		t.Fatalf("encode state: %v", err)
+	}
+
+	persister, err := NewFilePersister(stateFile)
+	if err != nil {
+		t.Fatalf("create persister: %v", err)
+	}
+	if err := persister.SaveRaftState(state); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	engine := storage.NewMemEngine()
+	node, err := NewPersistentRaftNode(
+		0, 1, make(chan ApplyMsg, 10), engine, stateFile,
+	)
+	if err != nil {
+		t.Fatalf("recover persistent node: %v", err)
+	}
+	defer node.Stop()
+
+	_, found, err := engine.Get([]byte("language"))
+	if err != nil {
+		t.Fatalf("get recovered key: %v", err)
+	}
+	if found {
+		t.Fatal("deleted key should not exist after recovery")
+	}
+}
+
+type failingRecoveryEngine struct{}
+
+func (e *failingRecoveryEngine) Put(key, value []byte) error {
+	return fmt.Errorf("simulated Put failure")
+}
+
+func (e *failingRecoveryEngine) Get(key []byte) ([]byte, bool, error) {
+	return nil, false, nil
+}
+
+func (e *failingRecoveryEngine) Delete(key []byte) error {
+	return nil
+}
+
+func (e *failingRecoveryEngine) Close() error {
+	return nil
+}
+
+func TestRecoveryReturnsErrorWhenPutFails(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
+
+	log := []LogEntry{
+		{Index: 0, Term: 0},
+		{
+			Index: 1,
+			Term:  1,
+			Command: Command{
+				Op:    "SET",
+				Key:   "language",
+				Value: "Go",
+			},
+		},
+	}
+
+	state, err := encodeRaftState(1, -1, log, 1)
+	if err != nil {
+		t.Fatalf("encode state: %v", err)
+	}
+
+	persister, err := NewFilePersister(stateFile)
+	if err != nil {
+		t.Fatalf("create persister: %v", err)
+	}
+	if err := persister.SaveRaftState(state); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	_, err = NewPersistentRaftNode(
+		0, 1,
+		make(chan ApplyMsg, 10),
+		&failingRecoveryEngine{},
+		stateFile,
+	)
+
+	if err == nil {
+		t.Fatal("expected recovery to fail when Engine.Put fails")
+	}
+}
+
+type failingRecoveryDeleteEngine struct{}
+
+func (e *failingRecoveryDeleteEngine) Put(key, value []byte) error {
+	return nil
+}
+
+func (e *failingRecoveryDeleteEngine) Get(key []byte) ([]byte, bool, error) {
+	return nil, false, nil
+}
+
+func (e *failingRecoveryDeleteEngine) Delete(key []byte) error {
+	return fmt.Errorf("simulated Delete failure")
+}
+
+func (e *failingRecoveryDeleteEngine) Close() error {
+	return nil
+}
+
+func TestRecoveryReturnsErrorWhenDeleteFails(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
+
+	log := []LogEntry{
+		{Index: 0, Term: 0},
+		{
+			Index: 1,
+			Term:  1,
+			Command: Command{
+				Op:  "DELETE",
+				Key: "language",
+			},
+		},
+	}
+
+	state, err := encodeRaftState(1, -1, log, 1)
+	if err != nil {
+		t.Fatalf("encode state: %v", err)
+	}
+
+	persister, err := NewFilePersister(stateFile)
+	if err != nil {
+		t.Fatalf("create persister: %v", err)
+	}
+	if err := persister.SaveRaftState(state); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	_, err = NewPersistentRaftNode(
+		0, 1,
+		make(chan ApplyMsg, 10),
+		&failingRecoveryDeleteEngine{},
+		stateFile,
+	)
+
+	if err == nil {
+		t.Fatal("expected recovery to fail when Engine.Delete fails")
+	}
+}
