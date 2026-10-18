@@ -1,11 +1,11 @@
 package raft
 
 import (
+	"RaftKV/internal/storage"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
-
-	"RaftKV/internal/storage"
 )
 
 func TestBroadcastAppendEntriesCommitsMajority(t *testing.T) {
@@ -3188,4 +3188,137 @@ func TestReadIndexFailsWhenMajorityUnavailable(t *testing.T) {
 
 	nodes[2].mu.Unlock()
 	nodes[1].mu.Unlock()
+}
+
+func TestThreeNodeClusterRecoversCommittedValueAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+
+	statePaths := []string{
+		filepath.Join(dir, "node0.state"),
+		filepath.Join(dir, "node1.state"),
+		filepath.Join(dir, "node2.state"),
+	}
+
+	const n = 3
+
+	startCluster := func() ([]*RaftNode, []*storage.MemEngine, []chan ApplyMsg) {
+		nodes := make([]*RaftNode, n)
+		engines := make([]*storage.MemEngine, n)
+		applyChs := make([]chan ApplyMsg, n)
+
+		for i := 0; i < n; i++ {
+			engines[i] = storage.NewMemEngine()
+			applyChs[i] = make(chan ApplyMsg, 100)
+
+			node, err := NewPersistentRaftNode(
+				i,
+				n,
+				applyChs[i],
+				engines[i],
+				statePaths[i],
+			)
+			if err != nil {
+				t.Fatalf("create persistent node %d: %v", i, err)
+			}
+
+			nodes[i] = node
+		}
+
+		for _, node := range nodes {
+			node.SetPeers(nodes)
+		}
+
+		for _, node := range nodes {
+			node.StartBackground()
+		}
+
+		return nodes, engines, applyChs
+	}
+
+	stopCluster := func(nodes []*RaftNode) {
+		for _, node := range nodes {
+			node.Stop()
+		}
+	}
+
+	waitForLeader := func(nodes []*RaftNode) int {
+		deadline := time.Now().Add(5 * time.Second)
+
+		for time.Now().Before(deadline) {
+			leader := -1
+			leaderCount := 0
+
+			for i, node := range nodes {
+				node.mu.Lock()
+				isLeader := node.role == Leader
+				node.mu.Unlock()
+
+				if isLeader {
+					leader = i
+					leaderCount++
+				}
+			}
+
+			if leaderCount == 1 {
+				return leader
+			}
+
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		return -1
+	}
+
+	// Start the original cluster.
+	nodes, _, _ := startCluster()
+
+	leader := waitForLeader(nodes)
+	if leader == -1 {
+		stopCluster(nodes)
+		t.Fatal("cluster failed to elect a leader")
+	}
+
+	// Commit a value before restarting.
+	ok, err := nodes[leader].Put("language", "Go")
+	if err != nil || !ok {
+		stopCluster(nodes)
+		t.Fatalf("failed to write value before restart: ok=%v, err=%v", ok, err)
+	}
+
+	stopCluster(nodes)
+	time.Sleep(100 * time.Millisecond)
+
+	// Reconstruct every node from its original persistent state file.
+	nodes, _, _ = startCluster()
+
+	t.Cleanup(func() { //tells Go to execute a function when the test finishes, whether it passes or fails.
+		stopCluster(nodes)
+	})
+
+	leader = waitForLeader(nodes)
+	if leader == -1 {
+		t.Fatal("cluster failed to elect a leader after restart")
+	}
+
+	// Submit a new write so the new leader can commit its current-term
+	// entry and advance commitment over the previous log entries.
+	ok, err = nodes[leader].Put("restart-check", "ok")
+	if err != nil || !ok {
+		stopCluster(nodes)
+		t.Fatalf("failed to write value before restart: ok=%v, err=%v", ok, err)
+	}
+
+	// Check that the value committed before the restart is recovered.
+	deadline := time.Now().Add(3 * time.Second)
+
+	for time.Now().Before(deadline) {
+		value, found, err := nodes[leader].Get("language")
+		if err == nil && found && value == "Go" {
+			return
+		}
+
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	t.Fatal("previously committed value was not recovered after restart")
 }

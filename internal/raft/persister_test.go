@@ -1091,3 +1091,86 @@ func TestRecoveryReturnsErrorWhenDeleteFails(t *testing.T) {
 		t.Fatal("expected recovery to fail when Engine.Delete fails")
 	}
 }
+
+func TestMultiNodeFollowerReplaysCommittedEntriesAfterRestart(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
+
+	persister, err := NewFilePersister(stateFile)
+	if err != nil {
+		t.Fatalf("create persister: %v", err)
+	}
+
+	// Simulate a persisted log containing one committed SET entry.
+	log := []LogEntry{
+		{Index: 0, Term: 0},
+		{
+			Index: 1,
+			Term:  1,
+			Command: Command{
+				Op:    "SET",
+				Key:   "language",
+				Value: "Go",
+			},
+		},
+	}
+
+	state, err := encodeRaftState(1, -1, log, 1)
+	if err != nil {
+		t.Fatalf("encode state: %v", err)
+	}
+
+	if err := persister.SaveRaftState(state); err != nil {
+		t.Fatalf("persist state: %v", err)
+	}
+
+	engine := storage.NewMemEngine()
+	applyCh := make(chan ApplyMsg, 10)
+
+	// Restart as a multi-node follower.
+	node := NewRaftNodeWithPersister(
+		1, 3, applyCh, engine, persister,
+	)
+	go node.applyLoop()
+	defer node.Stop()
+
+	// A multi-node restart begins with commitIndex = 0.
+	if node.commitIndex != 0 {
+		t.Fatalf("commitIndex = %d, want 0", node.commitIndex)
+	}
+
+	// Simulate the leader informing the follower that index 1 is committed.
+	args := AppendEntriesArgs{
+		Term:         1,
+		LeaderID:     0,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		LeaderCommit: 1,
+	}
+	var reply AppendEntriesReply
+	node.AppendEntries(&args, &reply)
+
+	if !reply.Success {
+		t.Fatal("AppendEntries failed")
+	}
+
+	// Wait for the follower to apply the committed entry.
+	deadline := time.After(time.Second)
+	for {
+		value, found, err := engine.Get([]byte("language"))
+		if err != nil {
+			t.Fatalf("engine Get: %v", err)
+		}
+		if found {
+			if string(value) != "Go" {
+				t.Fatalf("value = %q, want %q", value, "Go")
+			}
+			break
+		}
+
+		select {
+		case <-deadline:
+			t.Fatal("follower did not apply the committed entry")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
