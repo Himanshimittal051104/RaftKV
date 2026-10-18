@@ -416,10 +416,10 @@ func (rn *RaftNode) readIndex() (int, error) {
 	}
 
 	// Count valid acknowledgements.
+	timer := time.NewTimer(500 * time.Millisecond)
+	defer timer.Stop()
 	for i := 0; i < len(peers)-1; i++ {
 		var result probeResult
-		timer := time.NewTimer(500 * time.Millisecond)
-		defer timer.Stop()
 		select { //In Go, select lets a goroutine wait on multiple channel operations.
 		case result = <-results:
 		case <-timer.C:
