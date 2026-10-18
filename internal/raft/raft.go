@@ -68,7 +68,7 @@ func NewRaftNode(me int, peersCount int, applyCh chan ApplyMsg, engine storage.E
 	)
 }
 
-func NewPersistentRaftNode(me int, peersCount int, applyCh chan ApplyMsg, engine storage.Engine, stateFile string) (*RaftNode, error) { 
+func NewPersistentRaftNode(me int, peersCount int, applyCh chan ApplyMsg, engine storage.Engine, stateFile string) (*RaftNode, error) {
 	persister, err := NewFilePersister(stateFile)
 	if err != nil {
 		return nil, err
@@ -193,7 +193,6 @@ func (rn *RaftNode) Start(command Command) (int, int, bool) {
 	//Update leader's own replication state. Since the leader has obviously appended the entry to its own log:
 	rn.matchIndex[rn.me] = index
 	rn.nextIndex[rn.me] = index + 1
-
 
 	// In a single-node cluster, the leader itself is a majority.
 	if len(rn.peers) == 0 {
@@ -366,7 +365,7 @@ func (rn *RaftNode) readIndex() (int, error) {
 	noopIndex := -1
 
 	for i := len(rn.log) - 1; i >= 1; i-- {
-		if rn.log[i].Term == term && rn.log[i].Command.Op == "NOOP"{
+		if rn.log[i].Term == term && rn.log[i].Command.Op == "NOOP" {
 			noopIndex = i
 			break
 		}
@@ -418,7 +417,14 @@ func (rn *RaftNode) readIndex() (int, error) {
 
 	// Count valid acknowledgements.
 	for i := 0; i < len(peers)-1; i++ {
-		result := <-results
+		var result probeResult
+		timer := time.NewTimer(500 * time.Millisecond)
+		defer timer.Stop()
+		select { //In Go, select lets a goroutine wait on multiple channel operations.
+		case result = <-results:
+		case <-timer.C:
+			return 0, ErrReadIndexFailed
+		}
 
 		rn.mu.Lock()
 

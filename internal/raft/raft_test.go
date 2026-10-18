@@ -2613,7 +2613,7 @@ func TestGetWaitsForReadIndexToApply(t *testing.T) {
 		},
 		LogEntry{
 			Index: 2,
-			Term: 1,
+			Term:  1,
 		},
 	)
 	node.commitIndex = 2
@@ -2764,7 +2764,7 @@ func TestGetFailsIfLeadershipLostBeforeRead(t *testing.T) {
 	node.mu.Lock()
 	node.role = Leader
 	node.currentTerm = 1
-	
+
 	node.log = node.log[:1]
 	node.log = append(node.log,
 		LogEntry{
@@ -3080,4 +3080,112 @@ func TestGetFailsIfTermChangesBeforeRead(t *testing.T) {
 	if err != ErrWrongLeader {
 		t.Fatalf("expected ErrWrongLeader, got %v", err)
 	}
+}
+
+func TestReadIndexReturnsWhenFollowerDoesNotRespond(t *testing.T) {
+	nodes := make([]*RaftNode, 3)
+
+	for i := 0; i < 3; i++ {
+		nodes[i] = NewRaftNode(
+			i,
+			3,
+			make(chan ApplyMsg, 10),
+			storage.NewMemEngine(),
+		)
+	}
+
+	for i := range nodes {
+		nodes[i].SetPeers(nodes)
+	}
+
+	// Configure node 0 as leader with a committed current-term NOOP.
+	nodes[0].mu.Lock()
+	nodes[0].role = Leader
+	nodes[0].currentTerm = 5
+	nodes[0].log = make([]LogEntry, 2)
+	nodes[0].log[1] = LogEntry{
+		Index: 1,
+		Term:  5,
+		Command: Command{
+			Op: "NOOP",
+		},
+	}
+	nodes[0].commitIndex = 1
+	nodes[0].mu.Unlock()
+
+	// Hold node 2's mutex so its ReadProbe cannot complete.
+	nodes[2].mu.Lock()
+	defer nodes[2].mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := nodes[0].readIndex()
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		// Node 1 can provide the second acknowledgement needed
+		// for a majority in this three-node cluster.
+		if err != nil {
+			t.Fatalf("readIndex failed despite receiving a majority: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("readIndex did not return after reaching a majority")
+	}
+}
+
+func TestReadIndexFailsWhenMajorityUnavailable(t *testing.T) {
+	nodes := make([]*RaftNode, 3)
+
+	for i := 0; i < 3; i++ {
+		nodes[i] = NewRaftNode(
+			i,
+			3,
+			make(chan ApplyMsg, 10),
+			storage.NewMemEngine(),
+		)
+	}
+
+	for i := range nodes {
+		nodes[i].SetPeers(nodes)
+	}
+
+	// Configure node 0 as leader with a committed current-term NOOP.
+	nodes[0].mu.Lock()
+	nodes[0].role = Leader
+	nodes[0].currentTerm = 5
+	nodes[0].log = make([]LogEntry, 2)
+	nodes[0].log[1] = LogEntry{
+		Index: 1,
+		Term:  5,
+		Command: Command{
+			Op: "NOOP",
+		},
+	}
+	nodes[0].commitIndex = 1
+	nodes[0].mu.Unlock()
+
+	// Block both followers so neither can acknowledge the probe.
+	nodes[1].mu.Lock()
+	nodes[2].mu.Lock()
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := nodes[0].readIndex()
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected readIndex to fail without a majority")
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("readIndex did not return when a majority was unavailable")
+	}
+
+	nodes[2].mu.Unlock()
+	nodes[1].mu.Unlock()
 }
