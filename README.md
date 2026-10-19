@@ -2,11 +2,11 @@
 
 > A fault-tolerant distributed key-value store built from scratch in Go using the Raft consensus algorithm.
 
-RaftKV is a distributed key-value store designed to explore the internals of
-distributed systems, consensus, replicated state machines, and fault-tolerant
-storage.
+RaftKV is a learning-oriented distributed key-value store designed to explore distributed systems, consensus, replicated state machines, and fault-tolerant storage.
 
-The system currently implements Raft-based leader election, heartbeats, log replication, conflict resolution, majority-based commitment, a replicated key-value state machine, and linearizable reads using a ReadIndex-based mechanism.
+The project currently implements Raft-based leader election, heartbeats, log replication, conflict resolution, majority-based commitment, a replicated key-value state machine, ReadIndex-based linearizable reads, file-based persistence of Raft state, basic recovery logic, and an HTTP API.
+
+**Development status**: Persistence and basic recovery are implemented. Comprehensive crash-recovery testing and multi-node restart validation remain in progress.
 
 ---
 
@@ -15,8 +15,7 @@ The system currently implements Raft-based leader election, heartbeats, log repl
 ### Raft Consensus
 
 - Leader election using randomized election timeouts
-- Candidate self-voting
-- Majority-based leader election
+- Candidate self-voting and Majority-based leader election
 - Term-based leadership
 - `RequestVote` RPC
 - `AppendEntries` RPC
@@ -28,6 +27,7 @@ The system currently implements Raft-based leader election, heartbeats, log repl
 - Ordered application of committed entries
 - Higher-term detection and leader step-down
 - Election timer handling and stale-term protection
+- NOOP entries to help a newly elected leader establish a current-term commitment point
 
 ### Linearizable Reads
 
@@ -82,14 +82,44 @@ A dedicated `ReadProbe` RPC is used instead of AppendEntries so that read confir
 
 ### Key-Value Store
 
-Supports:
+Supported Operations:
 
-- `PUT`
-- `GET`
-- `DELETE`
+- `PUT` — create or update a key
+- `GET` — retrieve a value
+- `DELETE` — remove a value
 
-The key-value state machine is separated from the Raft consensus layer
-through a storage abstraction.
+The key-value state machine is separated from the Raft consensus layer through a storage abstraction.
+
+### Write Request Deduplication
+
+Write requests use a client ID and sequence number to identify individual requests.
+
+
+- Identical repeated requests can reuse an existing log entry.
+- Reusing a request ID with a different command is rejected.
+- Conflicting request-ID reuse returns HTTP 409 Conflict.
+
+
+Deduplication across leadership changes and recovery still requires further verification.
+
+### Persistence and Recovery
+
+RaftKV persists the following Raft state:
+
+- currentTerm
+- votedFor
+- log
+- commitIndex
+
+The file persister writes to a temporary file, synchronizes and closes it, and then renames it into place.
+
+During startup, persisted state is decoded and validated. Invalid persisted state causes initialization to return an error.
+
+Basic recovery is implemented. The single-node startup path can reconstruct committed key-value state by replaying committed log entries.
+
+**Important distinction**: Raft state persistence is implemented, but the current key-value storage engine (MemEngine) stores data in memory. The implemented single-node recovery path reconstructs committed key-value state from the log; a dedicated persistent key-value engine is not yet implemented.
+
+Comprehensive crash-recovery testing, interrupted-write scenarios, and multi-node restart validation remain in progress.
 
 ### Storage Abstraction
 
