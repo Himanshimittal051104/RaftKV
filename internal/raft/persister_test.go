@@ -1092,6 +1092,141 @@ func TestRecoveryReturnsErrorWhenDeleteFails(t *testing.T) {
 	}
 }
 
+type retryableRecoveryEngine struct {
+	data      map[string]string
+	putCount  int
+	failAtPut int
+}
+
+func newRetryableRecoveryEngine(failAtPut int) *retryableRecoveryEngine {
+	return &retryableRecoveryEngine{
+		data:      make(map[string]string),
+		failAtPut: failAtPut,
+	}
+}
+
+func (e *retryableRecoveryEngine) Put(key, value []byte) error {
+	e.putCount++
+
+	if e.putCount == e.failAtPut {
+		return fmt.Errorf("simulated temporary Put failure")
+	}
+
+	e.data[string(key)] = string(value)
+	return nil
+}
+
+func (e *retryableRecoveryEngine) Get(key []byte) ([]byte, bool, error) {
+	value, found := e.data[string(key)]
+	return []byte(value), found, nil
+}
+
+func (e *retryableRecoveryEngine) Delete(key []byte) error {
+	delete(e.data, string(key))
+	return nil
+}
+
+func (e *retryableRecoveryEngine) Close() error {
+	return nil
+}
+
+func TestRecoveryRetryAfterPartialFailure(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
+
+	log := []LogEntry{
+		{Index: 0, Term: 0},
+		{
+			Index: 1,
+			Term:  1,
+			Command: Command{
+				Op:    "SET",
+				Key:   "language",
+				Value: "Go",
+			},
+		},
+		{
+			Index: 2,
+			Term:  1,
+			Command: Command{
+				Op:    "SET",
+				Key:   "city",
+				Value: "Delhi",
+			},
+		},
+		{
+			Index: 3,
+			Term:  1,
+			Command: Command{
+				Op:    "SET",
+				Key:   "database",
+				Value: "RaftKV",
+			},
+		},
+	}
+
+	state, err := encodeRaftState(1, -1, log, 3)
+	if err != nil {
+		t.Fatalf("encode state: %v", err)
+	}
+
+	persister, err := NewFilePersister(stateFile)
+	if err != nil {
+		t.Fatalf("create persister: %v", err)
+	}
+	if err := persister.SaveRaftState(state); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	engine := newRetryableRecoveryEngine(2)
+
+	// The second SET fails during recovery.
+	_, err = NewPersistentRaftNode(
+		0,
+		1,
+		make(chan ApplyMsg, 10),
+		engine,
+		stateFile,
+	)
+	if err == nil {
+		t.Fatal("expected first recovery attempt to fail")
+	}
+
+	// The first entry should have been applied before the failure.
+	if value := engine.data["language"]; value != "Go" {
+		t.Fatalf("language = %q, want Go", value)
+	}
+
+	// Disable the simulated failure and retry with the same engine.
+	engine.failAtPut = 0
+
+	node, err := NewPersistentRaftNode(
+		0,
+		1,
+		make(chan ApplyMsg, 10),
+		engine,
+		stateFile,
+	)
+	if err != nil {
+		t.Fatalf("second recovery attempt failed: %v", err)
+	}
+
+	if node.lastApplied != 3 {
+		t.Fatalf("lastApplied = %d, want 3", node.lastApplied)
+	}
+
+	expected := map[string]string{
+		"language": "Go",
+		"city":     "Delhi",
+		"database": "RaftKV",
+	}
+
+	for key, want := range expected {
+		if got := engine.data[key]; got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
+		}
+	}
+}
+
 func TestMultiNodeFollowerReplaysCommittedEntriesAfterRestart(t *testing.T) {
 	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
 
