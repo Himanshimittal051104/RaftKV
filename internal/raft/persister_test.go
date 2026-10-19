@@ -133,6 +133,7 @@ func TestPersisterRoundTrip(t *testing.T) {
 	p := NewMemPersister()
 
 	originalLog := []LogEntry{
+		{Index: 0, Term: 0},
 		{Index: 1, Term: 1, Command: Command{
 			ClientID:  101,
 			SeqNumber: 1,

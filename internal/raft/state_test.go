@@ -69,3 +69,95 @@ func TestEncodeDecodeRaftState(t *testing.T) {
 		t.Fatalf("commitIndex = %d, want %d", commitIndex, originalCommitIndex)
 	}
 }
+
+func TestDecodeRaftStateRejectsInvalidState(t *testing.T) {
+	validLog := []LogEntry{
+		{Index: 0, Term: 0},
+		{Index: 1, Term: 1, Command: Command{
+			Op:    "SET",
+			Key:   "language",
+			Value: "Go",
+		}},
+		{Index: 2, Term: 2, Command: Command{
+			Op:  "DELETE",
+			Key: "old-key",
+		}},
+	}
+
+	tests := []struct {
+		name        string
+		currentTerm int
+		votedFor    int
+		log         []LogEntry
+		commitIndex int
+	}{
+		{
+			name:        "negative current term",
+			currentTerm: -1,
+			votedFor:    -1,
+			log:         validLog,
+			commitIndex: 0,
+		},
+		{
+			name:        "votedFor below negative one",
+			currentTerm: 2,
+			votedFor:    -2,
+			log:         validLog,
+			commitIndex: 0,
+		},
+		{
+			name:        "missing dummy entry",
+			currentTerm: 2,
+			votedFor:    -1,
+			log:         validLog[1:],
+			commitIndex: 0,
+		},
+		{
+			name:        "non-contiguous log indices",
+			currentTerm: 2,
+			votedFor:    -1,
+			log: []LogEntry{
+				{Index: 0, Term: 0},
+				{Index: 2, Term: 1},
+			},
+			commitIndex: 0,
+		},
+		{
+			name:        "commit index beyond log",
+			currentTerm: 2,
+			votedFor:    -1,
+			log:         validLog,
+			commitIndex: 3,
+		},
+		{
+			name:        "decreasing log terms",
+			currentTerm: 2,
+			votedFor:    -1,
+			log: []LogEntry{
+				{Index: 0, Term: 0},
+				{Index: 1, Term: 2},
+				{Index: 2, Term: 1},
+			},
+			commitIndex: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := encodeRaftState(
+				tt.currentTerm,
+				tt.votedFor,
+				tt.log,
+				tt.commitIndex,
+			)
+			if err != nil {
+				t.Fatalf("encodeRaftState failed: %v", err)
+			}
+
+			_, _, _, _, err = decodeRaftState(data)
+			if err == nil {
+				t.Fatal("decodeRaftState succeeded; want validation error")
+			}
+		})
+	}
+}
