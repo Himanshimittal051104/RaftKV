@@ -75,6 +75,7 @@ func TestKVServerNetworkAPI(t *testing.T) {
 		t.Fatalf("Failed to marshal request: %v", err)
 	}
 	resp, err := http.Post(testServers[followerIdx].URL+"/kv", "application/json", bytes.NewBuffer(body))
+	// err is network error, resp is HTTP response. If the follower is not reachable, err will be non-nil. If the follower is reachable but returns an error status, err will be nil and resp.StatusCode will indicate the error.
 	if err != nil {
 		t.Fatalf("Failed to send request to follower: %v", err)
 	}
@@ -136,4 +137,95 @@ func TestKVServerNetworkAPI(t *testing.T) {
 	}
 
 	t.Logf("HTTP GET verified successfully: 'framework' = '%s'", getResult.Value)
+}
+
+func TestKVServerRejectsConflictingRequestID(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 10)
+	engine := storage.NewMemEngine()
+	node := raft.NewRaftNode(0, 1, applyCh, engine)
+	node.StartBackground()
+
+	server := httptest.NewServer(NewKVServer(node))
+	defer server.Close()
+	defer node.Stop()
+
+	// First request: retry until it succeeds or the deadline expires.
+	firstBody, err := json.Marshal(WriteRequest{
+		ClientID:  10,
+		SeqNumber: 1,
+		Key:       "framework",
+		Value:     "RaftKV",
+	})
+	if err != nil {
+		t.Fatalf("Failed to marshal first request: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	var firstResp *http.Response
+
+	for time.Now().Before(deadline) {
+		resp, err := http.Post(
+			server.URL+"/kv",
+			"application/json",
+			bytes.NewBuffer(firstBody),
+		)
+
+		if err == nil {
+			if resp.StatusCode == http.StatusOK {
+				firstResp = resp
+				break
+			}
+			resp.Body.Close()
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if firstResp == nil {
+		t.Fatal("First request did not succeed before the deadline")
+	}
+	firstResp.Body.Close()
+
+	// Second request: same ID, different value.
+	secondBody, err := json.Marshal(WriteRequest{
+		ClientID:  10,
+		SeqNumber: 1,
+		Key:       "framework",
+		Value:     "DifferentValue",
+	})
+	if err != nil {
+		t.Fatalf("Failed to marshal conflicting request: %v", err)
+	}
+
+	secondResp, err := http.Post(
+		server.URL+"/kv",
+		"application/json",
+		bytes.NewBuffer(secondBody),
+	)
+	if err != nil {
+		t.Fatalf("Failed to send conflicting request: %v", err)
+	}
+	defer secondResp.Body.Close()
+
+	if secondResp.StatusCode != http.StatusConflict {
+		t.Fatalf(
+			"Expected conflicting request status 409, got %d",
+			secondResp.StatusCode,
+		)
+	}
+
+	// Ensure the original value remains unchanged.
+	value, found, err := engine.Get([]byte("framework"))
+	if err != nil {
+		t.Fatalf("Failed to read stored value: %v", err)
+	}
+	if !found || string(value) != "RaftKV" {
+		t.Fatalf(
+			"Expected original value 'RaftKV', got found=%v, value=%q",
+			found,
+			string(value),
+		)
+	}
+
+	t.Log("Conflicting request ID correctly returned HTTP 409")
 }

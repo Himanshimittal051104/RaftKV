@@ -32,13 +32,13 @@ func TestBroadcastAppendEntriesCommitsMajority(t *testing.T) {
 	leader.mu.Unlock()
 
 	// Leader appends a command.
-	index, term, ok := leader.Start(Command{
+	index, term, err := leader.Start(Command{
 		Op:    "SET",
 		Key:   "x",
 		Value: "100",
 	})
 
-	if !ok {
+	if err != nil {
 		t.Fatal("leader rejected command")
 	}
 
@@ -322,13 +322,13 @@ func TestLeaderCommitsAfterMajorityReplication(t *testing.T) {
 	leader.mu.Unlock()
 
 	// Append a command through Start().
-	index, term, ok := leader.Start(Command{
+	index, term, err := leader.Start(Command{
 		Op:    "SET",
 		Key:   "x",
 		Value: "10",
 	})
 
-	if !ok {
+	if err != nil {
 		t.Fatal("leader should accept command")
 	}
 
@@ -514,19 +514,19 @@ func TestStartRejectedByFollower(t *testing.T) {
 	engine := storage.NewMemEngine()
 	node := NewRaftNode(0, 1, make(chan ApplyMsg, 10), engine)
 
-	index, term, ok := node.Start(Command{
+	index, term, err := node.Start(Command{
 		Op:    "SET",
 		Key:   "x",
 		Value: "10",
 	})
 
-	if ok {
+	if err == nil {
 		t.Fatal("follower should reject Start()")
 	}
 
 	if index != -1 || term != -1 {
-		t.Fatalf("expected (-1, -1, false), got (%d, %d, %v)",
-			index, term, ok)
+		t.Fatalf("expected (-1, -1, \"not a leader\"), got (%d, %d, %v)",
+			index, term, err)
 	}
 }
 
@@ -548,9 +548,9 @@ func TestStartLeaderAppendsEntry(t *testing.T) {
 		Value: "10",
 	}
 
-	index, term, ok := node.Start(cmd)
+	index, term, err := node.Start(cmd)
 
-	if !ok {
+	if err != nil {
 		t.Fatal("leader should accept Start()")
 	}
 
@@ -594,13 +594,13 @@ func TestStartDoesNotCommit(t *testing.T) {
 	node.matchIndex = make([]int, 1)
 	node.mu.Unlock()
 
-	_, _, ok := node.Start(Command{
+	_, _, err := node.Start(Command{
 		Op:    "SET",
 		Key:   "x",
 		Value: "10",
 	})
 
-	if !ok {
+	if err != nil {
 		t.Fatal("leader should accept command")
 	}
 
@@ -879,13 +879,13 @@ func TestLeaderDoesNotCommitWithoutMajority(t *testing.T) {
 	node0.mu.Unlock()
 
 	// Append a new entry.
-	index, _, ok := node0.Start(Command{
+	index, _, err := node0.Start(Command{
 		Op:    "SET",
 		Key:   "x",
 		Value: "100",
 	})
 
-	if !ok {
+	if err!=nil {
 		t.Fatal("leader should accept command")
 	}
 
@@ -3345,8 +3345,8 @@ func TestStartDeduplicatesRepeatedRequest(t *testing.T) {
 	}
 
 	// First request.
-	index1, term1, isLeader1 := node.Start(command)
-	if !isLeader1 {
+	index1, term1, err := node.Start(command)
+	if err!=nil {
 		t.Fatal("First request was rejected by the leader")
 	}
 
@@ -3382,8 +3382,8 @@ func TestStartDeduplicatesRepeatedRequest(t *testing.T) {
 	node.mu.Unlock()
 
 	// Retry the exact same request after it has been applied.
-	index2, term2, isLeader2 := node.Start(command)
-	if !isLeader2 {
+	index2, term2, err := node.Start(command)
+	if err != nil {
 		t.Fatal("Duplicate request was rejected by the leader")
 	}
 
@@ -3436,8 +3436,8 @@ func TestStartRejectsConflictingDuplicateRequest(t *testing.T) {
 		Value:     "RaftKV",
 	}
 
-	index1, _, isLeader := node.Start(command1)
-	if !isLeader {
+	index1, _, err := node.Start(command1)
+	if err != nil {
 		t.Fatal("First request was rejected")
 	}
 
@@ -3454,9 +3454,9 @@ func TestStartRejectsConflictingDuplicateRequest(t *testing.T) {
 		Value:     "DifferentValue",
 	}
 
-	index2, _, isLeader2 := node.Start(command2)
+	index2, _, err := node.Start(command2)
 
-	if isLeader2 {
+	if err == nil {
 		t.Fatal("Expected conflicting duplicate request to be rejected")
 	}
 
