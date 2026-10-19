@@ -38,15 +38,49 @@ func (p *failingPersister) ReadRaftState() ([]byte, error) {
 	return nil, nil
 }
 
+type readFailingPersister struct{}
+
+func (p *readFailingPersister) SaveRaftState(state []byte) error {
+	return nil
+}
+
+func (p *readFailingPersister) ReadRaftState() ([]byte, error) {
+	return nil, fmt.Errorf("simulated persistence read failure")
+}
+
+func TestConstructorReturnsErrorWhenReadingPersistedStateFails(t *testing.T) {
+	persister := &readFailingPersister{}
+
+	node, err := NewRaftNodeWithPersister(
+		0,
+		1,
+		make(chan ApplyMsg, 1),
+		nil,
+		persister,
+	)
+
+	if err == nil {
+		t.Fatal("expected an error when reading persisted state fails")
+	}
+
+	if node != nil {
+		t.Fatal("expected nil node when persisted state cannot be read")
+	}
+}
+
 func TestFollowerDoesNotAcknowledgeEntryWhenPersistenceFails(t *testing.T) {
 	persister := &failingPersister{}
 
-	follower := NewRaftNodeWithPersister(
+	follower, err := NewRaftNodeWithPersister(
 		1, 2,
 		make(chan ApplyMsg, 10),
 		nil,
 		persister,
 	)
+	if err != nil {
+		t.Fatalf("failed to initialize follower: %v", err)
+	}
+
 	defer close(follower.stopCh)
 
 	args := AppendEntriesArgs{
@@ -222,13 +256,16 @@ func TestRaftNodeRestoresPersistedState(t *testing.T) {
 	}
 
 	// Construct a new node using the same persister.
-	node := NewRaftNodeWithPersister(
+	node, err := NewRaftNodeWithPersister(
 		0,
 		1,
 		make(chan ApplyMsg),
 		nil,
 		persister,
 	)
+	if err != nil {
+		t.Fatalf("failed to initialize node: %v", err)
+	}
 
 	defer close(node.stopCh)
 
@@ -386,13 +423,16 @@ func TestRaftNodeRecoversFromFilePersister(t *testing.T) {
 		t.Fatalf("recreate persister: %v", err)
 	}
 
-	node := NewRaftNodeWithPersister(
+	node, err := NewRaftNodeWithPersister(
 		0,
 		3,
 		make(chan ApplyMsg, 10),
 		nil,
 		p2,
 	)
+	if err != nil {
+		t.Fatalf("failed to initialize node: %v", err)
+	}
 
 	defer close(node.stopCh)
 
@@ -602,9 +642,12 @@ func TestFollowerAppliesEntryAfterRestartAndLeaderCommit(t *testing.T) {
 	applyCh := make(chan ApplyMsg, 10)
 
 	// Restart the follower using the persisted state.
-	follower := NewRaftNodeWithPersister(
+	follower, err := NewRaftNodeWithPersister(
 		1, 2, applyCh, engine, persister,
 	)
+	if err != nil {
+		t.Fatalf("failed to initialize follower: %v", err)
+	}
 	defer close(follower.stopCh)
 
 	// The entry exists in the log but is not yet committed.
@@ -662,12 +705,15 @@ func TestFollowerPersistsNewLogEntryBeforeAcknowledging(t *testing.T) {
 		t.Fatalf("create persister: %v", err)
 	}
 
-	follower := NewRaftNodeWithPersister(
+	follower, err := NewRaftNodeWithPersister(
 		1, 2,
 		make(chan ApplyMsg, 10),
 		nil,
 		persister,
 	)
+	if err != nil {
+		t.Fatalf("failed to initialize follower: %v", err)
+	}
 	defer close(follower.stopCh)
 
 	args := AppendEntriesArgs{
@@ -697,12 +743,15 @@ func TestFollowerPersistsNewLogEntryBeforeAcknowledging(t *testing.T) {
 	}
 
 	// Simulate a restart by creating a new node from the same file.
-	restarted := NewRaftNodeWithPersister(
+	restarted, err := NewRaftNodeWithPersister(
 		1, 2,
 		make(chan ApplyMsg, 10),
 		nil,
 		persister,
 	)
+	if err != nil {
+		t.Fatalf("failed to initialize restarted node: %v", err)
+	}
 	defer close(restarted.stopCh)
 
 	restarted.mu.Lock()
@@ -775,9 +824,12 @@ func TestFollowerPersistsRepairedConflictAcrossRestart(t *testing.T) {
 		t.Fatalf("save old state: %v", err)
 	}
 
-	follower := NewRaftNodeWithPersister(
+	follower, err := NewRaftNodeWithPersister(
 		1, 2, make(chan ApplyMsg, 10), nil, persister,
 	)
+	if err != nil {
+		t.Fatalf("failed to initialize follower: %v", err)
+	}
 	defer close(follower.stopCh)
 
 	// The leader sends its replacement entry B at index 2.
@@ -808,9 +860,12 @@ func TestFollowerPersistsRepairedConflictAcrossRestart(t *testing.T) {
 	}
 
 	// Simulate restart by loading the same state file into a new node.
-	restarted := NewRaftNodeWithPersister(
+	restarted, err := NewRaftNodeWithPersister(
 		1, 2, make(chan ApplyMsg, 10), nil, persister,
 	)
+	if err != nil {
+		t.Fatalf("failed to initialize restarted node: %v", err)
+	}
 	defer close(restarted.stopCh)
 
 	restarted.mu.Lock()
@@ -834,9 +889,12 @@ func TestGrantedVoteSurvivesRestart(t *testing.T) {
 		t.Fatalf("create persister: %v", err)
 	}
 
-	follower := NewRaftNodeWithPersister(
+	follower, err := NewRaftNodeWithPersister(
 		0, 3, make(chan ApplyMsg, 10), nil, persister,
 	)
+	if err != nil {
+		t.Fatalf("failed to initialize follower: %v", err)
+	}
 	defer close(follower.stopCh)
 
 	args := RequestVoteArgs{
@@ -854,9 +912,12 @@ func TestGrantedVoteSurvivesRestart(t *testing.T) {
 	}
 
 	// Reconstruct the follower using the same disk-backed state.
-	restarted := NewRaftNodeWithPersister(
+	restarted, err := NewRaftNodeWithPersister(
 		0, 3, make(chan ApplyMsg, 10), nil, persister,
 	)
+	if err != nil {
+		t.Fatalf("failed to initialize restarted node: %v", err)
+	}
 	defer close(restarted.stopCh)
 
 	restarted.mu.Lock()
@@ -890,9 +951,12 @@ func TestFollowerDoesNotGrantVoteWhenPersistenceFails(t *testing.T) {
 		saveCalls: 0,
 	}
 
-	follower := NewRaftNodeWithPersister(
+	follower, err := NewRaftNodeWithPersister(
 		0, 3, make(chan ApplyMsg, 10), nil, persister,
 	)
+	if err != nil {
+		t.Fatalf("failed to initialize follower: %v", err)
+	}
 	defer close(follower.stopCh)
 
 	args := RequestVoteArgs{
@@ -1263,9 +1327,12 @@ func TestMultiNodeFollowerReplaysCommittedEntriesAfterRestart(t *testing.T) {
 	applyCh := make(chan ApplyMsg, 10)
 
 	// Restart as a multi-node follower.
-	node := NewRaftNodeWithPersister(
+	node, err := NewRaftNodeWithPersister(
 		1, 3, applyCh, engine, persister,
 	)
+	if err != nil {
+		t.Fatalf("failed to initialize restarted node: %v", err)
+	}
 	go node.applyLoop()
 	defer node.Stop()
 
@@ -1308,5 +1375,29 @@ func TestMultiNodeFollowerReplaysCommittedEntriesAfterRestart(t *testing.T) {
 			t.Fatal("follower did not apply the committed entry")
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+}
+
+func TestConstructorReturnsErrorForCorruptPersistedState(t *testing.T) {
+	persister := NewMemPersister()
+
+	if err := persister.SaveRaftState([]byte("corrupt persisted state")); err != nil {
+		t.Fatalf("failed to save test state: %v", err)
+	}
+
+	node, err := NewRaftNodeWithPersister(
+		0,
+		1,
+		make(chan ApplyMsg, 1),
+		nil,
+		persister,
+	)
+
+	if err == nil {
+		t.Fatal("expected an error for corrupt persisted state")
+	}
+
+	if node != nil {
+		t.Fatal("expected nil node when persisted state is corrupt")
 	}
 }

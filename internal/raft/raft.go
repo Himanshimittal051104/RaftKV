@@ -27,9 +27,9 @@ type RaftNode struct {
 	currentTerm int
 	votedFor    int        // -1 means no vote cast yet in currentTerm
 	log         []LogEntry // Log entries; index 0 is a dummy entry
-	commitIndex int
 
 	// Volatile state on all servers
+	commitIndex int // for single-node clusters, commitIndex can be set to the last log index. In multi-node clusters, commitIndex is updated based on the leader's commitIndex , so for single-node clusters we are also persisting commitIndex.
 	lastApplied int //lastApplied <= commitIndex
 	lastQueued  int
 	//After a crash, you can reconstruct the state machine from persistent storage/snapshot + log replay.
@@ -59,13 +59,18 @@ type RaftNode struct {
 // NewRaftNode creates and initializes a node in the Follower state.
 func NewRaftNode(me int, peersCount int, applyCh chan ApplyMsg, engine storage.Engine) *RaftNode {
 
-	return NewRaftNodeWithPersister(
+	node, err := NewRaftNodeWithPersister(
 		me,
 		peersCount,
 		applyCh,
 		engine,
 		NewMemPersister(),
 	)
+	if err != nil {
+		// The in-memory persister should not fail during initialization.
+		panic(fmt.Sprintf("raft: failed to initialize in-memory node: %v", err))
+	}
+	return node
 }
 
 func NewPersistentRaftNode(me int, peersCount int, applyCh chan ApplyMsg, engine storage.Engine, stateFile string) (*RaftNode, error) {
@@ -74,13 +79,17 @@ func NewPersistentRaftNode(me int, peersCount int, applyCh chan ApplyMsg, engine
 		return nil, err
 	}
 
-	node := NewRaftNodeWithPersister(
+	node, err := NewRaftNodeWithPersister(
 		me,
 		peersCount,
 		applyCh,
 		engine,
 		persister,
 	)
+
+	if err != nil {
+		return nil, err
+	}
 
 	// Recover application state for our single-node configuration.
 	if peersCount == 1 {
@@ -92,7 +101,7 @@ func NewPersistentRaftNode(me int, peersCount int, applyCh chan ApplyMsg, engine
 	return node, nil
 }
 
-func NewRaftNodeWithPersister(me int, peersCount int, applyCh chan ApplyMsg, engine storage.Engine, persister Persister) *RaftNode {
+func NewRaftNodeWithPersister(me int, peersCount int, applyCh chan ApplyMsg, engine storage.Engine, persister Persister) (*RaftNode, error) {
 	rn := &RaftNode{ //You're allocating a RaftNode and getting a pointer to it.
 		me:              me,
 		currentTerm:     0,
@@ -113,13 +122,13 @@ func NewRaftNodeWithPersister(me int, peersCount int, applyCh chan ApplyMsg, eng
 
 	savedState, err := persister.ReadRaftState()
 	if err != nil {
-		panic(fmt.Sprintf("raft: failed to read persisted state: %v", err))
+		return nil, fmt.Errorf("raft: failed to read persisted state: %w", err)
 	}
 
 	if len(savedState) > 0 {
 		term, vote, restoredLog, commitIndex, err := decodeRaftState(savedState)
 		if err != nil {
-			panic(fmt.Sprintf("raft: failed to decode persisted state: %v", err))
+			return nil, fmt.Errorf("raft: failed to decode persisted state: %w", err)
 		}
 
 		rn.currentTerm = term
@@ -133,7 +142,7 @@ func NewRaftNodeWithPersister(me int, peersCount int, applyCh chan ApplyMsg, eng
 	}
 
 	rn.resetElectionTimeout() //This chooses a randomized election timeout and records the current time.
-	return rn                 //Returns the initialized node.
+	return rn, nil            //Returns the initialized node.
 }
 
 // SetPeers connects this node to its cluster peers.
