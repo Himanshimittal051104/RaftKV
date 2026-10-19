@@ -67,6 +67,10 @@ func (s *KVServer) handleKVRequest(w http.ResponseWriter, r *http.Request) {
 			//json.NewEncoder(w) creates a JSON encoder that writes to the HTTP response writer w.
 			//.Encode(...) converts the Response struct into JSON and writes it to the response.
 			return
+		} else if errors.Is(err, raft.ErrRequestIDConflict) {
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(Response{Error: "request ID reused with a different command"})
+			return
 		} else if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(Response{Error: err.Error()})
@@ -120,6 +124,10 @@ func (s *KVServer) handleKVRequest(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			json.NewEncoder(w).Encode(Response{Error: "not the leader"})
 			return
+		} else if errors.Is(err, raft.ErrRequestIDConflict) {
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(Response{Error: "request ID reused with a different command"})
+			return
 		} else if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(Response{Error: err.Error()})
@@ -147,3 +155,4 @@ func (s *KVServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // 405 = Method Not Allowed
 // 500 = Internal Server Error
 // 503 = Service Unavailable
+// 409 =Conflict

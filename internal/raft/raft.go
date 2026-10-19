@@ -12,9 +12,10 @@ import (
 
 // Instead of repeatedly creating new error instances, we define them as package-level variables.
 var (
-	ErrWrongLeader     = errors.New("raft: node is not the leader")   //"The client contacted a node that isn't currently the leader."
-	ErrTimeout         = errors.New("raft: client request timed out") //represents a client request that did not complete within the expected time.
-	ErrReadIndexFailed = errors.New("read index quorum failed")
+	ErrWrongLeader       = errors.New("raft: node is not the leader")   //"The client contacted a node that isn't currently the leader."
+	ErrTimeout           = errors.New("raft: client request timed out") //represents a client request that did not complete within the expected time.
+	ErrReadIndexFailed   = errors.New("read index quorum failed")
+	ErrRequestIDConflict = errors.New("request ID reused with a different command")
 )
 
 type RaftNode struct {
@@ -165,12 +166,12 @@ func (rn *RaftNode) resetElectionTimeout() {
 }
 
 // Start is called by the client to submit a new command.
-func (rn *RaftNode) Start(command Command) (int, int, bool) {
+func (rn *RaftNode) Start(command Command) (int, int, error) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
 	if rn.role != Leader {
-		return -1, -1, false
+		return -1, -1, ErrWrongLeader
 	}
 
 	if command.ClientID != 0 && command.SeqNumber > 0 {
@@ -186,10 +187,10 @@ func (rn *RaftNode) Start(command Command) (int, int, bool) {
 
 				if existingCommand != command {
 					// The same request ID cannot represent two different commands.
-					return -1, -1, false
+					return -1, -1, ErrRequestIDConflict
 				}
 
-				return existingIndex, rn.log[existingIndex].Term, true
+				return existingIndex, rn.log[existingIndex].Term, nil
 			}
 
 			// Stale map entry: remove it and append normally.
@@ -221,7 +222,7 @@ func (rn *RaftNode) Start(command Command) (int, int, bool) {
 		newLog,
 		newCommitIndex,
 	); err != nil {
-		return -1, -1, false
+		return -1, -1, err
 	}
 
 	rn.log = newLog
@@ -254,7 +255,7 @@ func (rn *RaftNode) Start(command Command) (int, int, bool) {
 		}()
 	}
 
-	return index, term, true //"Yes, I'm the leader.The command is at this log index and term." At this point:The command is NOT committed yet.It has only been appended to the leader's local log.
+	return index, term, nil //"Yes, I'm the leader.The command is at this log index and term." At this point:The command is NOT committed yet.It has only been appended to the leader's local log.
 }
 
 // Put submits a SET command to the cluster via Raft consensus.
@@ -267,9 +268,10 @@ func (rn *RaftNode) Put(clientID, seqNumber int64, key, value string) (bool, err
 		Value:     value,
 	}
 
-	index, _, isLeader := rn.Start(cmd)
-	if !isLeader {
-		return false, ErrWrongLeader
+	index, _, err := rn.Start(cmd)
+
+	if err != nil {
+		return false, err
 	}
 
 	rn.mu.Lock()
@@ -332,9 +334,9 @@ func (rn *RaftNode) Delete(clientID, seqNumber int64, key string) (bool, error) 
 		Key:       key,
 	}
 
-	index, _, isLeader := rn.Start(cmd)
-	if !isLeader {
-		return false, ErrWrongLeader
+	index, _, err := rn.Start(cmd)
+	if err != nil {
+		return false, err
 	}
 
 	rn.mu.Lock()

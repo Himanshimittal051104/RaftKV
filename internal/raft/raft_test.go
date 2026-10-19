@@ -3335,7 +3335,7 @@ func TestStartDeduplicatesRepeatedRequest(t *testing.T) {
 	node.mu.Unlock()
 
 	go node.applyLoop()
-	
+
 	command := Command{
 		ClientID:  3,
 		SeqNumber: 1,
@@ -3412,4 +3412,78 @@ func TestStartDeduplicatesRepeatedRequest(t *testing.T) {
 		index1,
 		logLenAfterSecond,
 	)
+}
+
+func TestStartRejectsConflictingDuplicateRequest(t *testing.T) {
+	applyCh := make(chan ApplyMsg, 10)
+	engine := storage.NewMemEngine()
+
+	node := NewRaftNode(0, 1, applyCh, engine)
+	defer node.Stop()
+
+	// Make this node the leader for a deterministic unit test.
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 1
+	node.mu.Unlock()
+
+	// First request.
+	command1 := Command{
+		ClientID:  3,
+		SeqNumber: 1,
+		Op:        "SET",
+		Key:       "framework",
+		Value:     "RaftKV",
+	}
+
+	index1, _, isLeader := node.Start(command1)
+	if !isLeader {
+		t.Fatal("First request was rejected")
+	}
+
+	node.mu.Lock()
+	logLenBefore := len(node.log)
+	node.mu.Unlock()
+
+	// Same request ID, but a different value.
+	command2 := Command{
+		ClientID:  3,
+		SeqNumber: 1,
+		Op:        "SET",
+		Key:       "framework",
+		Value:     "DifferentValue",
+	}
+
+	index2, _, isLeader2 := node.Start(command2)
+
+	if isLeader2 {
+		t.Fatal("Expected conflicting duplicate request to be rejected")
+	}
+
+	if index2 != -1 {
+		t.Fatalf("Expected index -1 for conflicting request, got %d", index2)
+	}
+
+	node.mu.Lock()
+	logLenAfter := len(node.log)
+	node.mu.Unlock()
+
+	if logLenAfter != logLenBefore {
+		t.Fatalf(
+			"Conflicting request changed log length: before=%d, after=%d",
+			logLenBefore,
+			logLenAfter,
+		)
+	}
+
+	// Confirm the original request is still recorded at its original index.
+	node.mu.Lock()
+	existingCommand := node.log[index1].Command
+	node.mu.Unlock()
+
+	if existingCommand != command1 {
+		t.Fatalf("Original command was changed: got %+v", existingCommand)
+	}
+
+	t.Log("Conflicting duplicate request correctly rejected")
 }
