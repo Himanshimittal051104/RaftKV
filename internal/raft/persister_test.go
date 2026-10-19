@@ -490,7 +490,7 @@ func TestPersistentNodeRecoversStateMachine(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	if _, err := node1.Put("language", "Go"); err != nil {
+	if _, err := node1.Put(1, 1, "language", "Go"); err != nil {
 		t.Fatalf("put language=Go: %v", err)
 	}
 

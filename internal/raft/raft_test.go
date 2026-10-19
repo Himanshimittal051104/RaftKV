@@ -464,7 +464,7 @@ func TestClientAPIAndLeaderRedirection(t *testing.T) {
 	followerID := (leaderID + 1) % n
 	follower := nodes[followerID]
 
-	_, err := follower.Put("test_key", "test_val")
+	_, err := follower.Put(1, 1, "test_key", "test_val")
 	if !errors.Is(err, ErrWrongLeader) {
 		t.Fatalf("Expected ErrWrongLeader on follower Put, got: %v", err)
 	}
@@ -472,7 +472,7 @@ func TestClientAPIAndLeaderRedirection(t *testing.T) {
 	t.Log("Follower correctly rejected Put with ErrWrongLeader")
 
 	// Test 2: Write a value through the leader.
-	success, err := leader.Put("city", "Delhi")
+	success, err := leader.Put(1, 2, "city", "Delhi")
 	if !success || err != nil {
 		t.Fatalf("Failed to Put on leader: %v", err)
 	}
@@ -480,7 +480,7 @@ func TestClientAPIAndLeaderRedirection(t *testing.T) {
 	t.Log("Put command submitted successfully to leader")
 
 	// Test 3: Read the value from the leader.
-	val, found, err := leader.Get("city")
+	val, found, err := leader.Get(1, 3, "city")
 	if err != nil || !found || val != "Delhi" {
 		t.Fatalf(
 			"Failed to Get correct value: val=%s, found=%v, err=%v",
@@ -491,7 +491,7 @@ func TestClientAPIAndLeaderRedirection(t *testing.T) {
 	t.Logf("Get verified on leader: 'city' = '%s'", val)
 
 	// Test 4: Delete the value through the leader.
-	success, err = leader.Delete("city")
+	success, err = leader.Delete(1, 4, "city")
 	if !success || err != nil {
 		t.Fatalf("Failed to Delete on leader: %v", err)
 	}
@@ -499,7 +499,7 @@ func TestClientAPIAndLeaderRedirection(t *testing.T) {
 	t.Log("Delete command submitted successfully")
 
 	// Verify the deletion.
-	_, found, err = leader.Get("city")
+	_, found, err = leader.Get(1, 5, "city")
 	if err != nil {
 		t.Fatalf("Get after Delete failed: %v", err)
 	}
@@ -1407,7 +1407,7 @@ func TestCommittedCommandReleasesClient(t *testing.T) {
 	done := make(chan error, 1)
 
 	go func() {
-		_, err := leader.Put("city", "Delhi")
+		_, err := leader.Put(1, 1, "city", "Delhi")
 		done <- err
 	}()
 
@@ -2625,7 +2625,7 @@ func TestGetWaitsForReadIndexToApply(t *testing.T) {
 	done := make(chan struct{})
 
 	go func() {
-		_, _, _ = node.Get("key")
+		_, _, _ = node.Get(1, 1, "key")
 		close(done)
 	}()
 
@@ -2710,7 +2710,7 @@ func TestGetWaitsForReadIndexApplication(t *testing.T) {
 	)
 
 	go func() {
-		value, found, err = leader.Get("x")
+		value, found, err = leader.Get(1, 1, "x")
 		close(done)
 	}()
 
@@ -2793,7 +2793,7 @@ func TestGetFailsIfLeadershipLostBeforeRead(t *testing.T) {
 	var err error
 
 	go func() {
-		_, _, err = node.Get("x")
+		_, _, err = node.Get(1, 1, "x")
 		close(done)
 	}()
 
@@ -3055,7 +3055,7 @@ func TestGetFailsIfTermChangesBeforeRead(t *testing.T) {
 	var err error
 
 	go func() {
-		_, _, err = node.Get("x")
+		_, _, err = node.Get(1, 1, "x")
 		close(done)
 	}()
 
@@ -3279,7 +3279,7 @@ func TestThreeNodeClusterRecoversCommittedValueAfterRestart(t *testing.T) {
 	}
 
 	// Commit a value before restarting.
-	ok, err := nodes[leader].Put("language", "Go")
+	ok, err := nodes[leader].Put(1, 1, "language", "Go")
 	if err != nil || !ok {
 		stopCluster(nodes)
 		t.Fatalf("failed to write value before restart: ok=%v, err=%v", ok, err)
@@ -3302,7 +3302,7 @@ func TestThreeNodeClusterRecoversCommittedValueAfterRestart(t *testing.T) {
 
 	// Submit a new write so the new leader can commit its current-term
 	// entry and advance commitment over the previous log entries.
-	ok, err = nodes[leader].Put("restart-check", "ok")
+	ok, err = nodes[leader].Put(1, 2, "restart-check", "ok")
 	if err != nil || !ok {
 		stopCluster(nodes)
 		t.Fatalf("failed to write value before restart: ok=%v, err=%v", ok, err)
@@ -3312,7 +3312,7 @@ func TestThreeNodeClusterRecoversCommittedValueAfterRestart(t *testing.T) {
 	deadline := time.Now().Add(3 * time.Second)
 
 	for time.Now().Before(deadline) {
-		value, found, err := nodes[leader].Get("language")
+		value, found, err := nodes[leader].Get(1, 3, "language")
 		if err == nil && found && value == "Go" {
 			return
 		}
@@ -3321,4 +3321,95 @@ func TestThreeNodeClusterRecoversCommittedValueAfterRestart(t *testing.T) {
 	}
 
 	t.Fatal("previously committed value was not recovered after restart")
+}
+
+func TestStartDeduplicatesRepeatedRequest(t *testing.T) {
+	applyCh := make(chan ApplyMsg, 10)
+	engine := storage.NewMemEngine()
+
+	node := NewRaftNode(0, 1, applyCh, engine)
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 1
+	node.mu.Unlock()
+
+	go node.applyLoop()
+	
+	command := Command{
+		ClientID:  3,
+		SeqNumber: 1,
+		Op:        "SET",
+		Key:       "framework",
+		Value:     "RaftKV",
+	}
+
+	// First request.
+	index1, term1, isLeader1 := node.Start(command)
+	if !isLeader1 {
+		t.Fatal("First request was rejected by the leader")
+	}
+
+	// Wait until the request has been applied.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		node.mu.Lock()
+		applied := node.lastApplied >= index1
+		node.mu.Unlock()
+
+		if applied {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("Timed out waiting for log index %d to be applied", index1)
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Verify that the first request actually changed the state machine.
+	value, found, err := engine.Get([]byte("framework"))
+	if err != nil {
+		t.Fatalf("Failed to read stored value: %v", err)
+	}
+	if !found || string(value) != "RaftKV" {
+		t.Fatalf("Expected stored value 'RaftKV', got %q", string(value))
+	}
+
+	node.mu.Lock()
+	logLenAfterFirst := len(node.log)
+	node.mu.Unlock()
+
+	// Retry the exact same request after it has been applied.
+	index2, term2, isLeader2 := node.Start(command)
+	if !isLeader2 {
+		t.Fatal("Duplicate request was rejected by the leader")
+	}
+
+	node.mu.Lock()
+	logLenAfterSecond := len(node.log)
+	node.mu.Unlock()
+
+	if index1 != index2 {
+		t.Fatalf("Expected the same log index, got %d and %d", index1, index2)
+	}
+
+	if term1 != term2 {
+		t.Fatalf("Expected the same term, got %d and %d", term1, term2)
+	}
+
+	if logLenAfterFirst != logLenAfterSecond {
+		t.Fatalf(
+			"Duplicate request appended another entry: log length changed from %d to %d",
+			logLenAfterFirst,
+			logLenAfterSecond,
+		)
+	}
+
+	t.Logf(
+		"Deduplication verified after application: index=%d, log length=%d",
+		index1,
+		logLenAfterSecond,
+	)
 }

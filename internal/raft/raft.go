@@ -53,7 +53,8 @@ type RaftNode struct {
 	applyCh chan ApplyMsg //This is a Go channel. It's used to send committed Raft commands toward the application/state-machine layer.
 	stopCh  chan struct{} //This is typically used to tell background goroutines to stop running. The struct{} type is an empty struct, which takes up no memory. It's often used as a signal in channels(no data, only signals).
 
-	persister Persister
+	persister    Persister
+	requestIndex map[RequestID]int
 }
 
 // NewRaftNode creates and initializes a node in the Follower state.
@@ -118,6 +119,7 @@ func NewRaftNodeWithPersister(me int, peersCount int, applyCh chan ApplyMsg, eng
 		Engine:          engine, // Assign engine here
 		applyWaiters:    make(map[int]chan error),
 		persister:       persister,
+		requestIndex:    make(map[RequestID]int),
 	}
 
 	savedState, err := persister.ReadRaftState()
@@ -134,6 +136,7 @@ func NewRaftNodeWithPersister(me int, peersCount int, applyCh chan ApplyMsg, eng
 		rn.currentTerm = term
 		rn.votedFor = vote
 		rn.log = restoredLog
+		rn.rebuildRequestIndex()
 		if peersCount == 1 {
 			rn.commitIndex = commitIndex
 		} else {
@@ -170,6 +173,30 @@ func (rn *RaftNode) Start(command Command) (int, int, bool) {
 		return -1, -1, false
 	}
 
+	if command.ClientID != 0 && command.SeqNumber > 0 {
+		requestID := RequestID{
+			ClientID:  command.ClientID,
+			SeqNumber: command.SeqNumber,
+		}
+
+		if existingIndex, found := rn.requestIndex[requestID]; found {
+			// Reuse the existing log position for this request.
+			if existingIndex > 0 && existingIndex < len(rn.log) {
+				existingCommand := rn.log[existingIndex].Command
+
+				if existingCommand != command {
+					// The same request ID cannot represent two different commands.
+					return -1, -1, false
+				}
+
+				return existingIndex, rn.log[existingIndex].Term, true
+			}
+
+			// Stale map entry: remove it and append normally.
+			delete(rn.requestIndex, requestID)
+		}
+	}
+
 	index := len(rn.log)
 	term := rn.currentTerm //The new log entry belongs to the leader's current term.
 	entry := LogEntry{
@@ -199,6 +226,14 @@ func (rn *RaftNode) Start(command Command) (int, int, bool) {
 
 	rn.log = newLog
 
+	if command.ClientID != 0 && command.SeqNumber > 0 {
+		requestID := RequestID{
+			ClientID:  command.ClientID,
+			SeqNumber: command.SeqNumber,
+		}
+		rn.requestIndex[requestID] = index
+	}
+
 	//Update leader's own replication state. Since the leader has obviously appended the entry to its own log:
 	rn.matchIndex[rn.me] = index
 	rn.nextIndex[rn.me] = index + 1
@@ -223,11 +258,13 @@ func (rn *RaftNode) Start(command Command) (int, int, bool) {
 }
 
 // Put submits a SET command to the cluster via Raft consensus.
-func (rn *RaftNode) Put(key, value string) (bool, error) {
+func (rn *RaftNode) Put(clientID, seqNumber int64, key, value string) (bool, error) {
 	cmd := Command{
-		Op:    "SET",
-		Key:   key,
-		Value: value,
+		ClientID:  clientID,
+		SeqNumber: seqNumber,
+		Op:        "SET",
+		Key:       key,
+		Value:     value,
 	}
 
 	index, _, isLeader := rn.Start(cmd)
@@ -235,15 +272,21 @@ func (rn *RaftNode) Put(key, value string) (bool, error) {
 		return false, ErrWrongLeader
 	}
 
-	if err := rn.waitForApply(index); err != nil {
-		return false, err
+	rn.mu.Lock()
+	alreadyApplied := rn.lastApplied >= index
+	rn.mu.Unlock()
+
+	if !alreadyApplied {
+		if err := rn.waitForApply(index); err != nil {
+			return false, err
+		}
 	}
 
 	return true, nil
 }
 
 // Get reads directly from the engine if the node is a verified leader.
-func (rn *RaftNode) Get(key string) (string, bool, error) {
+func (rn *RaftNode) Get(clientID, seqNumber int64, key string) (string, bool, error) {
 	rn.mu.Lock()
 	if rn.role != Leader {
 		rn.mu.Unlock()
@@ -281,10 +324,12 @@ func (rn *RaftNode) Get(key string) (string, bool, error) {
 }
 
 // Delete submits a DELETE command to the cluster via Raft consensus.
-func (rn *RaftNode) Delete(key string) (bool, error) {
+func (rn *RaftNode) Delete(clientID, seqNumber int64, key string) (bool, error) {
 	cmd := Command{
-		Op:  "DELETE",
-		Key: key,
+		ClientID:  clientID,
+		SeqNumber: seqNumber,
+		Op:        "DELETE",
+		Key:       key,
 	}
 
 	index, _, isLeader := rn.Start(cmd)
@@ -292,8 +337,14 @@ func (rn *RaftNode) Delete(key string) (bool, error) {
 		return false, ErrWrongLeader
 	}
 
-	if err := rn.waitForApply(index); err != nil {
-		return false, err
+	rn.mu.Lock()
+	alreadyApplied := rn.lastApplied >= index
+	rn.mu.Unlock()
+
+	if !alreadyApplied {
+		if err := rn.waitForApply(index); err != nil {
+			return false, err
+		}
 	}
 
 	return true, nil
@@ -636,4 +687,23 @@ func (rn *RaftNode) recoverSingleNodeState() error {
 	rn.lastApplied = rn.commitIndex
 
 	return nil
+}
+
+func (rn *RaftNode) rebuildRequestIndex() {
+	rn.requestIndex = make(map[RequestID]int)
+
+	for i := 1; i < len(rn.log); i++ {
+		command := rn.log[i].Command
+
+		if command.ClientID == 0 || command.SeqNumber <= 0 {
+			continue
+		}
+
+		requestID := RequestID{
+			ClientID:  command.ClientID,
+			SeqNumber: command.SeqNumber,
+		}
+
+		rn.requestIndex[requestID] = i
+	}
 }

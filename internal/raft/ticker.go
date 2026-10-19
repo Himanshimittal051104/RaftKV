@@ -18,7 +18,7 @@ func (rn *RaftNode) Stop() {
 
 func (rn *RaftNode) runLoop() {
 	ticker := time.NewTicker(20 * time.Millisecond) //produces a tick every 20 milliseconds.
-	defer ticker.Stop() //ensures the ticker is stopped when runLoop() returns.
+	defer ticker.Stop()                             //ensures the ticker is stopped when runLoop() returns.
 
 	for {
 		select {
@@ -110,6 +110,7 @@ func (rn *RaftNode) startElection() {
 			}
 
 			rn.log = newLog
+			rn.rebuildRequestIndex()
 			rn.commitIndex = index
 			rn.matchIndex[rn.me] = index
 			rn.nextIndex[rn.me] = index + 1
@@ -215,6 +216,7 @@ func (rn *RaftNode) startElection() {
 					}
 
 					rn.log = newLog
+					rn.rebuildRequestIndex()
 					rn.matchIndex[rn.me] = index
 					rn.nextIndex[rn.me] = index + 1
 

@@ -1,15 +1,14 @@
 package server
 
 import (
+	"RaftKV/internal/raft"
+	"RaftKV/internal/storage"
 	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
-
-	"RaftKV/internal/raft"
-	"RaftKV/internal/storage"
 )
 
 func TestKVServerNetworkAPI(t *testing.T) {
@@ -46,7 +45,7 @@ func TestKVServerNetworkAPI(t *testing.T) {
 	start := time.Now()
 	for time.Since(start) < 3*time.Second {
 		for i := 0; i < n; i++ {
-			body, _ := json.Marshal(PutRequest{Key: "ping", Value: "pong"})
+			body, _ := json.Marshal(WriteRequest{ClientID: 1, SeqNumber: 1, Key: "ping", Value: "pong"}) //converts that struct into JSON bytes.
 			resp, err := http.Post(testServers[i].URL+"/kv", "application/json", bytes.NewBuffer(body))
 			if err == nil {
 				if resp.StatusCode == http.StatusOK {
@@ -71,7 +70,10 @@ func TestKVServerNetworkAPI(t *testing.T) {
 	followerIdx := (leaderIdx + 1) % n
 
 	// Test 1: Follower returns StatusServiceUnavailable (Wrong Leader)
-	body, _ := json.Marshal(PutRequest{Key: "hello", Value: "world"})
+	body, err := json.Marshal(WriteRequest{ClientID: 2, SeqNumber: 1, Key: "hello", Value: "world"})
+	if err != nil {
+		t.Fatalf("Failed to marshal request: %v", err)
+	}
 	resp, err := http.Post(testServers[followerIdx].URL+"/kv", "application/json", bytes.NewBuffer(body))
 	if err != nil {
 		t.Fatalf("Failed to send request to follower: %v", err)
@@ -84,7 +86,10 @@ func TestKVServerNetworkAPI(t *testing.T) {
 	t.Log("Follower network endpoint correctly rejected write with 503")
 
 	// Test 2: Successful PUT on Leader Server
-	putBody, _ := json.Marshal(PutRequest{Key: "framework", Value: "RaftKV"})
+	putBody, err := json.Marshal(WriteRequest{ClientID: 3, SeqNumber: 1, Key: "framework", Value: "RaftKV"})
+	if err != nil {
+		t.Fatalf("Failed to marshal PUT request: %v", err)
+	}
 	resp, err = http.Post(testServers[leaderIdx].URL+"/kv", "application/json", bytes.NewBuffer(putBody))
 	if err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatalf("Failed PUT on leader server: %v, status: %v", err, resp.StatusCode)
@@ -96,16 +101,39 @@ func TestKVServerNetworkAPI(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Test 3: Successful GET on Leader Server
-	getResp, err := http.Get(testServers[leaderIdx].URL + "/kv?key=framework")
-	if err != nil || getResp.StatusCode != http.StatusOK {
+	getBody, err := json.Marshal(WriteRequest{ClientID: 3, SeqNumber: 2, Key: "framework"})
+	if err != nil {
+		t.Fatalf("Failed to marshal GET request: %v", err)
+	}
+
+	getReq, err := http.NewRequest(http.MethodGet, testServers[leaderIdx].URL+"/kv", bytes.NewBuffer(getBody))
+	if err != nil {
+		t.Fatalf("Failed to create GET request: %v", err)
+	}
+	getReq.Header.Set("Content-Type", "application/json")
+
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil {
 		t.Fatalf("Failed GET on leader server: %v", err)
 	}
 	defer getResp.Body.Close()
 
-	var getResult Response
-	json.NewDecoder(getResp.Body).Decode(&getResult)
-	if !getResult.Found || getResult.Value != "RaftKV" {
-		t.Fatalf("Expected value 'RaftKV', got found=%v, value='%s'", getResult.Found, getResult.Value)
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d", getResp.StatusCode)
 	}
+
+	var getResult Response
+	if err := json.NewDecoder(getResp.Body).Decode(&getResult); err != nil {
+		t.Fatalf("Failed to decode GET response: %v", err)
+	}
+
+	if !getResult.Found || getResult.Value != "RaftKV" {
+		t.Fatalf(
+			"Expected value 'RaftKV', got found=%v, value='%s'",
+			getResult.Found,
+			getResult.Value,
+		)
+	}
+
 	t.Logf("HTTP GET verified successfully: 'framework' = '%s'", getResult.Value)
 }

@@ -70,11 +70,11 @@ func (p *FilePersister) SaveRaftState(state []byte) error {
 
 	dir := filepath.Dir(p.path)
 
-	if err := os.MkdirAll(dir, 0755); err != nil {//Ensures the destination directory exists.
+	if err := os.MkdirAll(dir, 0755); err != nil { //Ensures the destination directory exists.
 		return fmt.Errorf("create state directory: %w", err)
 	}
 
-	tmp, err := os.CreateTemp(dir, ".raft-state-*") //creates a temporary file in the same directory as the destination file. This is important because renaming files across different filesystems can fail.	
+	tmp, err := os.CreateTemp(dir, ".raft-state-*") //creates a temporary file in the same directory as the destination file. This is important because renaming files across different filesystems can fail.
 	if err != nil {
 		return fmt.Errorf("create temporary state file: %w", err)
 	}

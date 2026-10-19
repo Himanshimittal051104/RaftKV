@@ -51,6 +51,11 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type RequestID struct {
+	ClientID  int64
+	SeqNumber int64
+}
+
 type StateMachine interface {
 	Apply(cmd Command) (result string, err error)
 	Get(key string) (value string, exists bool)
