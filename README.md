@@ -131,21 +131,37 @@ underlying storage implementation.
 
 ### HTTP API
 
-The key-value store is exposed through an HTTP server.
+The key-value store is exposed through an HTTP server at /kv.
 
-Current endpoint:
+The current handlers accept a JSON WriteRequest containing:
 
-```text
-/kv
+- ClientID
+- SeqNumber
+- Key
+- Value — used for write operations
+
+The request ID is validated before processing.
+
+HTTP responses include:
+
+- `200 OK` — successful operation
+- `400 Bad Request` — invalid or malformed request
+- `409 Conflict` — request ID reused with a different command
+- `500 Internal Server Error` — unexpected internal failure
+- `503 Service Unavailable` — request sent to a node that is not the leader
+
+The current implementation expects JSON request bodies for POST, GET, and DELETE. GET request bodies are supported by the implementation and its tests, but some HTTP clients and intermediaries handle them inconsistently.
+
+Example write request shape (use the exact JSON field names defined by the WriteRequest struct):
+```json
+{
+  "ClientID": 10,
+  "SeqNumber": 1,
+  "Key": "name",
+  "Value": "RaftKV"
+}
 ```
-
-Supported operations:
-
-```text
-POST   /kv
-GET    /kv?key=<key>
-DELETE /kv?key=<key>
-```
+A successful write returns a response indicating success. GET responses include the retrieved value and a found field. The exact response fields are defined by the server's Response type.
 
 ---
 
