@@ -13,7 +13,9 @@ func (rn *RaftNode) StartBackground() {
 
 // Stop cleanly terminates the node's loop.
 func (rn *RaftNode) Stop() {
-	close(rn.stopCh)
+    rn.stopOnce.Do(func() {
+        close(rn.stopCh)
+    })
 }
 
 func (rn *RaftNode) runLoop() {

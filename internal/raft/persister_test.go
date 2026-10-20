@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"testing"
 	"time"
+	"os"
 )
 
 // type failingPersister struct{}
@@ -1401,3 +1402,31 @@ func TestConstructorReturnsErrorForCorruptPersistedState(t *testing.T) {
 		t.Fatal("expected nil node when persisted state is corrupt")
 	}
 }
+
+
+func TestFilePersisterSaveFailsWhenDestinationIsDirectory(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "raft-state")
+
+	if err := os.Mkdir(statePath, 0755); err != nil {
+		t.Fatalf("create destination directory: %v", err)
+	}
+
+	persister, err := NewFilePersister(statePath)
+	if err != nil {
+		t.Fatalf("create persister: %v", err)
+	}
+
+	if err := persister.SaveRaftState([]byte("new-state")); err == nil {
+		t.Fatal("expected save to fail when destination is a directory")
+	}
+
+	info, err := os.Stat(statePath)
+	if err != nil {
+		t.Fatalf("destination directory was unexpectedly removed: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatal("destination is no longer a directory")
+	}
+}
+

@@ -20,7 +20,7 @@ var (
 
 type RaftNode struct {
 	mu sync.Mutex //This protects the node's shared state.
-
+	stopOnce sync.Once
 	peers []*RaftNode // Direct in-memory pointers to peers for Phase 1 testing
 	me    int         // Index of this node in peers[]
 

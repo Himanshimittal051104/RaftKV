@@ -3487,3 +3487,418 @@ func TestStartRejectsConflictingDuplicateRequest(t *testing.T) {
 
 	t.Log("Conflicting duplicate request correctly rejected")
 }
+
+func TestStartDeduplicatesRequestAfterRestart(t *testing.T) {
+    applyCh := make(chan ApplyMsg, 10)
+    persister := NewMemPersister()
+
+    command := Command{
+        ClientID:  3,
+        SeqNumber: 1,
+        Op:        "SET",
+        Key:       "framework",
+        Value:     "RaftKV",
+    }
+
+    // Create the original node.
+    node, err := NewRaftNodeWithPersister(
+        0, 1, applyCh, storage.NewMemEngine(), persister,
+    )
+    if err != nil {
+        t.Fatalf("create original node: %v", err)
+    }
+
+    node.mu.Lock()
+    node.role = Leader
+    node.currentTerm = 1
+    node.mu.Unlock()
+
+    // Persist the first request.
+    index1, term1, err := node.Start(command)
+    if err != nil {
+        t.Fatalf("first request failed: %v", err)
+    }
+
+    node.Stop()
+
+    // Simulate a restart using the same persister.
+    restarted, err := NewRaftNodeWithPersister(
+        0, 1, make(chan ApplyMsg, 10),
+        storage.NewMemEngine(), persister,
+    )
+    if err != nil {
+        t.Fatalf("restart node: %v", err)
+    }
+    defer restarted.Stop()
+
+    // Start() accepts writes only from a leader.
+    restarted.mu.Lock()
+    restarted.role = Leader
+    restarted.mu.Unlock()
+
+    // Retry the exact same request.
+    index2, term2, err := restarted.Start(command)
+    if err != nil {
+        t.Fatalf("duplicate request after restart failed: %v", err)
+    }
+
+    restarted.mu.Lock()
+    logLen := len(restarted.log)
+    restarted.mu.Unlock()
+
+    if index2 != index1 {
+        t.Fatalf("expected original index %d, got %d", index1, index2)
+    }
+
+    if term2 != term1 {
+        t.Fatalf("expected original term %d, got %d", term1, term2)
+    }
+
+    if logLen != index1+1 {
+        t.Fatalf("duplicate appended an entry: log length=%d", logLen)
+    }
+}
+
+func TestStartRejectsConflictingRequestAfterRestart(t *testing.T) {
+    applyCh := make(chan ApplyMsg, 10)
+    persister := NewMemPersister()
+
+    original, err := NewRaftNodeWithPersister(
+        0, 1, applyCh, storage.NewMemEngine(), persister,
+    )
+    if err != nil {
+        t.Fatalf("create original node: %v", err)
+    }
+
+    original.mu.Lock()
+    original.role = Leader
+    original.currentTerm = 1
+    original.mu.Unlock()
+
+    command1 := Command{
+        ClientID:  3,
+        SeqNumber: 1,
+        Op:        "SET",
+        Key:       "framework",
+        Value:     "RaftKV",
+    }
+
+    index1, _, err := original.Start(command1)
+    if err != nil {
+        t.Fatalf("first request failed: %v", err)
+    }
+
+    original.Stop()
+
+    restarted, err := NewRaftNodeWithPersister(
+        0, 1, make(chan ApplyMsg, 10),
+        storage.NewMemEngine(), persister,
+    )
+    if err != nil {
+        t.Fatalf("restart node: %v", err)
+    }
+    defer restarted.Stop()
+
+    restarted.mu.Lock()
+    restarted.role = Leader
+    restarted.mu.Unlock()
+
+    command2 := command1
+    command2.Value = "DifferentValue"
+
+    index2, _, err := restarted.Start(command2)
+
+    if !errors.Is(err, ErrRequestIDConflict) {
+        t.Fatalf("expected ErrRequestIDConflict, got %v", err)
+    }
+
+    if index2 != -1 {
+        t.Fatalf("expected index -1, got %d", index2)
+    }
+
+    restarted.mu.Lock()
+    defer restarted.mu.Unlock()
+
+    if len(restarted.log) != index1+1 {
+        t.Fatalf("log changed after conflicting request: length=%d",
+            len(restarted.log))
+    }
+
+    if restarted.log[index1].Command != command1 {
+        t.Fatal("original command was changed")
+    }
+}
+
+
+func waitForLeader(t *testing.T, nodes []*RaftNode, timeout time.Duration) *RaftNode {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		var leader *RaftNode
+		leaderCount := 0
+
+		for _, node := range nodes {
+			node.mu.Lock()
+			isLeader := node.role == Leader
+			node.mu.Unlock()
+
+			if isLeader {
+				leader = node
+				leaderCount++
+			}
+		}
+
+		if leaderCount == 1 {
+			return leader
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatal("timed out waiting for exactly one leader")
+	return nil
+}
+
+
+func TestStartDeduplicatesRequestAfterLeadershipChange(t *testing.T) {
+	nodes := make([]*RaftNode, 3)
+
+	for i := range nodes {
+		nodes[i] = NewRaftNode(
+			i,
+			3,
+			make(chan ApplyMsg, 100),
+			storage.NewMemEngine(),
+		)
+		defer nodes[i].Stop()
+	}
+
+	for i := range nodes {
+		nodes[i].SetPeers(nodes)
+	}
+
+	// Start the real Raft background loops.
+	for i := range nodes {
+		nodes[i].StartBackground()
+	}
+
+	// Wait for the initial leader.
+	oldLeader := waitForLeader(t, nodes, 3*time.Second)
+
+	command := Command{
+		ClientID:  3,
+		SeqNumber: 1,
+		Op:        "SET",
+		Key:       "framework",
+		Value:     "RaftKV",
+	}
+
+	originalIndex, originalTerm, err := oldLeader.Start(command)
+	if err != nil {
+		t.Fatalf("failed to submit original request: %v", err)
+	}
+
+	// Wait until at least one follower has the request in its log.
+	var survivingFollower *RaftNode
+	deadline := time.Now().Add(3 * time.Second)
+
+	for time.Now().Before(deadline) {
+		for _, node := range nodes {
+			if node == oldLeader {
+				continue
+			}
+
+			node.mu.Lock()
+			hasEntry := len(node.log) > originalIndex &&
+				node.log[originalIndex].Command.ClientID == command.ClientID &&
+				node.log[originalIndex].Command.SeqNumber == command.SeqNumber
+			node.mu.Unlock()
+
+			if hasEntry {
+				survivingFollower = node
+				break
+			}
+		}
+
+		if survivingFollower != nil {
+			break
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if survivingFollower == nil {
+		t.Fatal("request was not replicated to any follower")
+	}
+
+	// Stop the old leader so it cannot send heartbeats.
+	oldLeader.Stop()
+
+	// The remaining nodes should elect a new leader.
+	remainingNodes := make([]*RaftNode, 0, 2)
+	for _, node := range nodes {
+		if node != oldLeader {
+			remainingNodes = append(remainingNodes, node)
+		}
+	}
+
+	newLeader := waitForLeader(t, remainingNodes, 5*time.Second)
+
+	// Retry the same request on the new leader.
+	index, term, err := newLeader.Start(command)
+	if err != nil {
+		t.Fatalf("new leader rejected identical retry: %v", err)
+	}
+
+	if index != originalIndex {
+		t.Fatalf("expected original index %d, got %d", originalIndex, index)
+	}
+
+	if term != originalTerm {
+		t.Fatalf("expected original term %d, got %d", originalTerm, term)
+	}
+
+	newLeader.mu.Lock()
+	defer newLeader.mu.Unlock()
+
+	requestID := RequestID{
+		ClientID:  command.ClientID,
+		SeqNumber: command.SeqNumber,
+	}
+
+	if got := newLeader.requestIndex[requestID]; got != originalIndex {
+		t.Fatalf("requestIndex = %d, want %d", got, originalIndex)
+	}
+}
+
+func TestStartRejectsConflictingRequestAfterLeadershipChange(t *testing.T) {
+	nodes := make([]*RaftNode, 3)
+
+	for i := range nodes {
+		nodes[i] = NewRaftNode(
+			i,
+			3,
+			make(chan ApplyMsg, 100),
+			storage.NewMemEngine(),
+		)
+		defer nodes[i].Stop()
+	}
+
+	for i := range nodes {
+		nodes[i].SetPeers(nodes)
+	}
+
+	// Start the real Raft background loops.
+	for i := range nodes {
+		nodes[i].StartBackground()
+	}
+
+	// Wait for the initial leader.
+	oldLeader := waitForLeader(t, nodes, 3*time.Second)
+
+	command := Command{
+		ClientID:  3,
+		SeqNumber: 1,
+		Op:        "SET",
+		Key:       "framework",
+		Value:     "RaftKV",
+	}
+
+	originalIndex, _, err := oldLeader.Start(command)
+	if err != nil {
+		t.Fatalf("failed to submit original request: %v", err)
+	}
+
+	// Wait until at least one follower has the request in its log.
+	var survivingFollower *RaftNode
+	deadline := time.Now().Add(3 * time.Second)
+
+	for time.Now().Before(deadline) {
+		for _, node := range nodes {
+			if node == oldLeader {
+				continue
+			}
+
+			node.mu.Lock()
+			hasEntry := len(node.log) > originalIndex &&
+				node.log[originalIndex].Command.ClientID == command.ClientID &&
+				node.log[originalIndex].Command.SeqNumber == command.SeqNumber
+			node.mu.Unlock()
+
+			if hasEntry {
+				survivingFollower = node
+				break
+			}
+		}
+
+		if survivingFollower != nil {
+			break
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if survivingFollower == nil {
+		t.Fatal("request was not replicated to any follower")
+	}
+
+	// Stop the old leader so it cannot send heartbeats.
+	oldLeader.Stop()
+
+	// Wait for a new leader among the remaining nodes.
+	remainingNodes := make([]*RaftNode, 0, 2)
+
+	for _, node := range nodes {
+		if node != oldLeader {
+			remainingNodes = append(remainingNodes, node)
+		}
+	}
+
+	newLeader := waitForLeader(t, remainingNodes, 5*time.Second)
+
+	// Reuse the same request ID with a different command value.
+	conflictingCommand := command
+	conflictingCommand.Value = "DifferentValue"
+
+	newLeader.mu.Lock()
+	logLenBefore := len(newLeader.log)
+	newLeader.mu.Unlock()
+
+	_, _, err = newLeader.Start(conflictingCommand)
+
+	if !errors.Is(err, ErrRequestIDConflict) {
+		t.Fatalf(
+			"expected ErrRequestIDConflict, got %v",
+			err,
+		)
+	}
+
+	// A conflicting retry must not append another log entry.
+	newLeader.mu.Lock()
+	logLenAfter := len(newLeader.log)
+
+	requestID := RequestID{
+		ClientID:  command.ClientID,
+		SeqNumber: command.SeqNumber,
+	}
+	requestIndex := newLeader.requestIndex[requestID]
+	newLeader.mu.Unlock()
+
+	if logLenAfter != logLenBefore {
+		t.Fatalf(
+			"conflicting retry changed log length: before=%d, after=%d",
+			logLenBefore,
+			logLenAfter,
+		)
+	}
+
+	if requestIndex != originalIndex {
+		t.Fatalf(
+			"request index changed: got %d, want %d",
+			requestIndex,
+			originalIndex,
+		)
+	}
+}
