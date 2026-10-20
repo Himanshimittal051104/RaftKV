@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+	"sync"
+	"fmt"
 )
 
 func TestBroadcastAppendEntriesCommitsMajority(t *testing.T) {
@@ -3133,7 +3135,7 @@ func TestReadIndexReturnsWhenFollowerDoesNotRespond(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("readIndex did not return after reaching a majority")
 	}
-}
+}	
 
 func TestReadIndexFailsWhenMajorityUnavailable(t *testing.T) {
 	nodes := make([]*RaftNode, 3)
@@ -3900,5 +3902,229 @@ func TestStartRejectsConflictingRequestAfterLeadershipChange(t *testing.T) {
 			requestIndex,
 			originalIndex,
 		)
+	}
+}
+
+
+func TestConcurrentDuplicateRequestsAppendOnlyOneEntry(t *testing.T) {
+	node := NewRaftNode(
+		0,
+		1,
+		make(chan ApplyMsg, 100),
+		storage.NewMemEngine(),
+	)
+	defer node.Stop()
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 1
+	node.mu.Unlock()
+
+	command := Command{
+		ClientID:  42,
+		SeqNumber: 1,
+		Op:        "SET",
+		Key:       "language",
+		Value:     "Go",
+	}
+
+	const requests = 20
+
+	type result struct {
+		index int
+		term  int
+		err   error
+	}
+
+	results := make(chan result, requests)
+	start := make(chan struct{})
+
+	node.mu.Lock()
+	initialLogLen := len(node.log)
+	node.mu.Unlock()
+
+	var wg sync.WaitGroup
+	for i := 0; i < requests; i++ {
+		wg.Add(1) //increases the counter by 1
+
+		go func() { //Starts a goroutine. Each goroutine runs independently and can execute concurrently with the others.
+			defer wg.Done() //decreases the counter by 1
+			<-start //Each goroutine waits to receive a value from start. Because the channel has not been closed yet and no value has been sent, the goroutines block here.
+
+			index, term, err := node.Start(command)
+			results <- result{
+				index: index,
+				term:  term,
+				err:   err,
+			}
+		}()
+	}
+
+	close(start) //Closing the channel releases all goroutines blocked on <-start. They can now proceed without waiting for one another.
+	wg.Wait() 
+	//When each goroutine exits, defer wg.Done() decreases the counter by one. The goroutine running wg.Wait() resumes only when the counter reaches zero.
+	close(results)
+
+	var expectedIndex, expectedTerm int
+	first := true
+
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("concurrent duplicate request failed: %v", result.err)
+		}
+
+		if first {
+			expectedIndex = result.index
+			expectedTerm = result.term
+			first = false
+			continue
+		}
+
+		if result.index != expectedIndex {
+			t.Fatalf(
+				"concurrent requests returned different indices: %d and %d",
+				expectedIndex,
+				result.index,
+			)
+		}
+
+		if result.term != expectedTerm {
+			t.Fatalf(
+				"concurrent requests returned different terms: %d and %d",
+				expectedTerm,
+				result.term,
+			)
+		}
+	}
+
+	node.mu.Lock()
+	finalLogLen := len(node.log)
+	node.mu.Unlock()
+
+	if finalLogLen != initialLogLen+1 {
+		t.Fatalf(
+			"expected exactly one appended entry: before=%d, after=%d",
+			initialLogLen,
+			finalLogLen,
+		)
+	}
+}
+
+
+func TestConcurrentDistinctRequestsAppendAllEntries(t *testing.T) {
+	node := NewRaftNode(
+		0,
+		1,
+		make(chan ApplyMsg, 100),
+		storage.NewMemEngine(),
+	)
+	defer node.Stop()
+
+	node.mu.Lock()
+	node.role = Leader
+	node.currentTerm = 1
+	initialLogLen := len(node.log)
+	node.mu.Unlock()
+
+	const requests = 20
+
+	type result struct {
+		seqNumber int
+		index     int
+		term      int
+		err       error
+	}
+
+	results := make(chan result, requests)
+	start := make(chan struct{})
+
+	var wg sync.WaitGroup
+
+	for i := 1; i <= requests; i++ {
+		wg.Add(1)
+
+		go func(seq int) {
+			defer wg.Done()
+			<-start
+
+			command := Command{
+				ClientID:  42,
+				SeqNumber: int64(seq),
+				Op:        "SET",
+				Key:       fmt.Sprintf("key-%d", seq),
+				Value:     fmt.Sprintf("value-%d", seq),
+			}
+
+			index, term, err := node.Start(command)
+
+			results <- result{
+				seqNumber: seq,
+				index:     index,
+				term:      term,
+				err:       err,
+			}
+		}(i)
+	}
+
+	close(start)
+	wg.Wait()
+	close(results)
+
+	seenIndices := make(map[int]bool)
+	seenSequences := make(map[int]bool)
+
+	for res := range results {
+		if res.err != nil {
+			t.Fatalf(
+				"request %d failed: %v",
+				res.seqNumber,
+				res.err,
+			)
+		}
+
+		if seenIndices[res.index] {
+			t.Fatalf("multiple requests received log index %d", res.index)
+		}
+		seenIndices[res.index] = true
+
+		if seenSequences[res.seqNumber] {
+			t.Fatalf("duplicate result for sequence number %d", res.seqNumber)
+		}
+		seenSequences[res.seqNumber] = true
+	}
+
+	if len(seenIndices) != requests {
+		t.Fatalf("expected %d unique indices, got %d", requests, len(seenIndices))
+	}
+
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	if len(node.log) != initialLogLen+requests {
+		t.Fatalf(
+			"expected %d new log entries, got %d",
+			requests,
+			len(node.log)-initialLogLen,
+		)
+	}
+
+	for seq := 1; seq <= requests; seq++ {
+		requestID := RequestID{
+			ClientID:  42,
+			SeqNumber: int64(seq),
+		}
+
+		index, exists := node.requestIndex[requestID]
+		if !exists {
+			t.Fatalf("request index missing for sequence number %d", seq)
+		}
+
+		if node.log[index].Command.SeqNumber != int64(seq) {
+			t.Fatalf(
+				"request %d maps to incorrect log entry at index %d",
+				seq,
+				index,
+			)
+		}
 	}
 }
