@@ -4243,3 +4243,118 @@ func TestConcurrentRequestsDuringLeadershipStepDown(t *testing.T) {
 		}
 	}
 }
+
+
+func TestConcurrentWritesDuringRealElection(t *testing.T) {
+	nodes := make([]*RaftNode, 3)
+
+	for i := range nodes {
+		nodes[i] = NewRaftNode(
+			i,
+			3,
+			make(chan ApplyMsg, 100),
+			storage.NewMemEngine(),
+		)
+		defer nodes[i].Stop()
+	}
+
+	for i := range nodes {
+		nodes[i].SetPeers(nodes)
+		nodes[i].StartBackground()
+	}
+
+	// Wait for the initial leader.
+	oldLeader := waitForLeader(t, nodes, 3*time.Second)
+
+	// Ensure the cluster has settled before triggering the election.
+	time.Sleep(100 * time.Millisecond)
+
+	// Stop the old leader so the remaining nodes must elect a new one.
+	oldLeader.Stop()
+
+	remainingNodes := make([]*RaftNode, 0, 2)
+	for _, node := range nodes {
+		if node != oldLeader {
+			remainingNodes = append(remainingNodes, node)
+		}
+	}
+
+	// Start requests while the remaining nodes are running elections.
+	const requests = 20
+	start := make(chan struct{})
+
+	type result struct {
+		seq   int64
+		index int
+		err   error
+	}
+
+	results := make(chan result, requests)
+	var wg sync.WaitGroup
+
+	for i := int64(1); i <= requests; i++ {
+		wg.Add(1)
+
+		go func(seq int64) {
+			defer wg.Done()
+			<-start
+
+			// Send each request to one of the surviving nodes.
+			node := remainingNodes[int(seq%int64(len(remainingNodes)))]
+
+			command := Command{
+				ClientID:  77,
+				SeqNumber: seq,
+				Op:        "SET",
+				Key:       fmt.Sprintf("election-key-%d", seq),
+				Value:     fmt.Sprintf("value-%d", seq),
+			}
+
+			index, _, err := node.Start(command)
+			results <- result{seq: seq, index: index, err: err}
+		}(i)
+	}
+
+	close(start)
+	wg.Wait()
+	close(results)
+
+	// Requests can succeed on the elected leader or be rejected on a follower.
+	accepted := make(map[int64]int)
+	for res := range results {
+		if res.err == nil {
+			accepted[res.seq] = res.index
+		} else if !errors.Is(res.err, ErrWrongLeader) {
+			t.Fatalf("request %d returned unexpected error: %v", res.seq, res.err)
+		}
+	}
+
+	// Wait for the cluster to elect a new leader.
+	newLeader := waitForLeader(t, remainingNodes, 5*time.Second)
+	if newLeader == oldLeader {
+		t.Fatal("stopped node unexpectedly became leader")
+	}
+
+	// Confirm every accepted request exists in the node that accepted it.
+	for seq, index := range accepted {
+		found := false
+
+		for _, node := range remainingNodes {
+			node.mu.Lock()
+			if index > 0 && index < len(node.log) &&
+				node.log[index].Command.ClientID == 77 &&
+				node.log[index].Command.SeqNumber == seq {
+				found = true
+			}
+			node.mu.Unlock()
+
+			if found {
+				break
+			}
+		}
+
+		if !found {
+			t.Fatalf("accepted request %d was not found in the surviving logs", seq)
+		}
+	}
+}
