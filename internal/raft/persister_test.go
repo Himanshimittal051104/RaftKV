@@ -1403,6 +1403,40 @@ func TestConstructorReturnsErrorForCorruptPersistedState(t *testing.T) {
 	}
 }
 
+func TestFilePersisterConstructorRejectsCorruptState(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "raft-state.bin")
+
+	persister, err := NewFilePersister(statePath)
+	if err != nil {
+		t.Fatalf("create persister: %v", err)
+	}
+
+	if err := persister.SaveRaftState([]byte("corrupt persisted state")); err != nil {
+		t.Fatalf("save corrupt state: %v", err)
+	}
+
+	// Recreate the persister to simulate loading state after a restart.
+	restartedPersister, err := NewFilePersister(statePath)
+	if err != nil {
+		t.Fatalf("recreate persister: %v", err)
+	}
+
+	node, err := NewRaftNodeWithPersister(
+		0,
+		1,
+		make(chan ApplyMsg, 1),
+		nil,
+		restartedPersister,
+	)
+
+	if err == nil {
+		t.Fatal("expected an error for corrupt persisted state")
+	}
+
+	if node != nil {
+		t.Fatal("expected nil node when persisted state is corrupt")
+	}
+}
 
 func TestFilePersisterSaveFailsWhenDestinationIsDirectory(t *testing.T) {
 	dir := t.TempDir()
@@ -1430,3 +1464,135 @@ func TestFilePersisterSaveFailsWhenDestinationIsDirectory(t *testing.T) {
 	}
 }
 
+
+type failNextSavePersister struct {
+	underlying Persister
+	failNext   bool
+}
+
+func (p *failNextSavePersister) SaveRaftState(state []byte) error {
+	if p.failNext {
+		p.failNext = false
+		return fmt.Errorf("simulated disk persistence failure")
+	}
+
+	return p.underlying.SaveRaftState(state)
+}
+
+func (p *failNextSavePersister) ReadRaftState() ([]byte, error) {
+	return p.underlying.ReadRaftState()
+}
+
+func TestFollowerPreservesDiskStateWhenLogPersistenceFails(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "raft-state.bin")
+
+	filePersister, err := NewFilePersister(statePath)
+	if err != nil {
+		t.Fatalf("create file persister: %v", err)
+	}
+
+	// First persist a valid log containing one entry.
+	oldLog := []LogEntry{
+		{Index: 0, Term: 0},
+		{
+			Index: 1,
+			Term:  1,
+			Command: Command{
+				Op:    "SET",
+				Key:   "language",
+				Value: "Go",
+			},
+		},
+	}
+
+	oldState, err := encodeRaftState(1, -1, oldLog, 0)
+	if err != nil {
+		t.Fatalf("encode old state: %v", err)
+	}
+
+	if err := filePersister.SaveRaftState(oldState); err != nil {
+		t.Fatalf("save old state: %v", err)
+	}
+
+	// Wrap the file persister and fail the next save.
+	persister := &failNextSavePersister{
+		underlying: filePersister,
+		failNext:   true,
+	}
+
+	follower, err := NewRaftNodeWithPersister(
+		1,
+		2,
+		make(chan ApplyMsg, 10),
+		nil,
+		persister,
+	)
+	if err != nil {
+		t.Fatalf("initialize follower: %v", err)
+	}
+
+	// The incoming entry conflicts with the existing entry at index 1.
+	args := AppendEntriesArgs{
+		Term:         1,
+		LeaderID:     0,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		Entries: []LogEntry{
+			{
+				Index: 1,
+				Term:  2,
+				Command: Command{
+					Op:    "SET",
+					Key:   "language",
+					Value: "Rust",
+				},
+			},
+		},
+		LeaderCommit: 0,
+	}
+
+	var reply AppendEntriesReply
+	follower.AppendEntries(&args, &reply)
+
+	if reply.Success {
+		t.Fatal("follower acknowledged an entry whose persistence failed")
+	}
+
+	// Confirm the in-memory log still contains the original entry.
+	follower.mu.Lock()
+	if len(follower.log) != 2 {
+		follower.mu.Unlock()
+		t.Fatalf("in-memory log length = %d, want 2", len(follower.log))
+	}
+
+	if follower.log[1].Command.Value != "Go" {
+		got := follower.log[1].Command.Value
+		follower.mu.Unlock()
+		t.Fatalf("in-memory value = %q, want Go", got)
+	}
+	follower.mu.Unlock()
+
+	// Simulate a restart by creating a fresh node from the same file.
+	restarted, err := NewRaftNodeWithPersister(
+		1,
+		2,
+		make(chan ApplyMsg, 10),
+		nil,
+		filePersister,
+	)
+	if err != nil {
+		t.Fatalf("restart follower: %v", err)
+	}
+
+	restarted.mu.Lock()
+	defer restarted.mu.Unlock()
+
+	if len(restarted.log) != 2 {
+		t.Fatalf("recovered log length = %d, want 2", len(restarted.log))
+	}
+
+	entry := restarted.log[1]
+	if entry.Term != 1 || entry.Command.Value != "Go" {
+		t.Fatalf("recovered entry = %+v, want original Go entry", entry)
+	}
+}
