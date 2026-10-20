@@ -4130,6 +4130,7 @@ func TestConcurrentDistinctRequestsAppendAllEntries(t *testing.T) {
 }
 
 
+
 func TestConcurrentRequestsDuringLeadershipStepDown(t *testing.T) {
 	node := NewRaftNode(
 		0,
@@ -4150,14 +4151,14 @@ func TestConcurrentRequestsDuringLeadershipStepDown(t *testing.T) {
 	var wg sync.WaitGroup
 
 	type result struct {
-		seq int64
+		seq   int64
 		index int
-		err error
+		err   error
 	}
 
 	results := make(chan result, requests)
 
-	// Launch requests that will race with the leadership change.
+	// Launch requests that wait until the test releases them.
 	for i := int64(1); i <= requests; i++ {
 		wg.Add(1)
 
@@ -4174,86 +4175,71 @@ func TestConcurrentRequestsDuringLeadershipStepDown(t *testing.T) {
 			}
 
 			index, _, err := node.Start(command)
-			results <- result{
-				seq:   seq,
-				index: index,
-				err:   err,
-			}
+			results <- result{seq: seq, index: index, err: err}
 		}(i)
 	}
 
-	// Release all request goroutines and step down concurrently.
+	// Phase 1: requests while the node is leader must succeed.
 	close(start)
 
-	node.mu.Lock()
-	node.role = Follower
-	node.mu.Unlock()
-
+	// Wait for all concurrent requests to finish before stepping down.
 	wg.Wait()
 	close(results)
 
 	accepted := make(map[int64]int)
-	rejected := 0
 
 	for res := range results {
-		switch {
-		case res.err == nil:
-			accepted[res.seq] = res.index
-		case errors.Is(res.err, ErrWrongLeader):
-			rejected++
-		default:
-			t.Fatalf("request %d returned unexpected error: %v", res.seq, res.err)
+		if res.err != nil {
+			t.Fatalf("request %d should succeed before step-down: %v", res.seq, res.err)
+		}
+		accepted[res.seq] = res.index
+	}
+
+	if len(accepted) != requests {
+		t.Fatalf("expected %d accepted requests, got %d", requests, len(accepted))
+	}
+
+	// Phase 2: after step-down, new writes must be rejected.
+	node.mu.Lock()
+	node.role = Follower
+	node.mu.Unlock()
+
+	for i := int64(requests + 1); i <= requests+10; i++ {
+		command := Command{
+			ClientID:  42,
+			SeqNumber: i,
+			Op:        "SET",
+			Key:       fmt.Sprintf("key-%d", i),
+			Value:     fmt.Sprintf("value-%d", i),
+		}
+
+		index, _, err := node.Start(command)
+
+		if !errors.Is(err, ErrWrongLeader) {
+			t.Fatalf("request %d: expected ErrWrongLeader, got %v", i, err)
+		}
+
+		if index != -1 {
+			t.Fatalf("request %d: expected index -1, got %d", i, index)
 		}
 	}
 
-	// Every request must either have been accepted before step-down
-	// or rejected after step-down.
-	if len(accepted)+rejected != requests {
-		t.Fatalf(
-			"accounted for %d of %d requests",
-			len(accepted)+rejected,
-			requests,
-		)
+	// Confirm the rejected requests did not append entries.
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	expectedLogLen := 1 + requests // Include dummy entry at index 0.
+	if len(node.log) != expectedLogLen {
+		t.Fatalf("expected log length %d, got %d", expectedLogLen, len(node.log))
 	}
 
-	// Every accepted request must have a unique log index.
-	seenIndices := make(map[int]bool)
 	for seq, index := range accepted {
-		if seenIndices[index] {
-			t.Fatalf("multiple requests share log index %d", index)
-		}
-		seenIndices[index] = true
-
-		node.mu.Lock()
 		if index <= 0 || index >= len(node.log) {
-			node.mu.Unlock()
 			t.Fatalf("request %d has invalid log index %d", seq, index)
 		}
 
-		entry := node.log[index]
-		node.mu.Unlock()
-
-		if entry.Command.SeqNumber != seq {
-			t.Fatalf(
-				"request %d maps to entry for sequence %d",
-				seq,
-				entry.Command.SeqNumber,
-			)
+		if node.log[index].Command.SeqNumber != seq {
+			t.Fatalf("request %d maps to wrong log entry", seq)
 		}
 	}
-
-	node.mu.Lock()
-	logLen := len(node.log)
-	node.mu.Unlock()
-
-	if logLen != 1+len(accepted) {
-		t.Fatalf(
-			"expected %d log entries including dummy entry, got %d",
-			1+len(accepted),
-			logLen,
-		)
-	}
-
-	t.Logf("accepted %d requests before step-down; rejected %d after step-down",
-		len(accepted), rejected)
 }
