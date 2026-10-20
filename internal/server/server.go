@@ -23,8 +23,8 @@ type WriteRequest struct {
 
 type Response struct {
 	Success bool   `json:"success,omitempty"`
-	Value   string `json:"value"`
-	Found   bool   `json:"found"`
+	Value   string `json:"value,omitempty"`
+	Found   bool   `json:"found,omitempty"`
 	Error   string `json:"error,omitempty"`
 	//The omitempty tag omits a field when it has its zero value
 }

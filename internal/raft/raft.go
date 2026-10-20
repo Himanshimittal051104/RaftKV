@@ -19,10 +19,10 @@ var (
 )
 
 type RaftNode struct {
-	mu sync.Mutex //This protects the node's shared state.
+	mu       sync.Mutex //This protects the node's shared state.
 	stopOnce sync.Once
-	peers []*RaftNode // Direct in-memory pointers to peers for Phase 1 testing
-	me    int         // Index of this node in peers[]
+	peers    []*RaftNode // Direct in-memory pointers to peers for Phase 1 testing
+	me       int         // Index of this node in peers[]
 
 	//According to Raft, these are the pieces of state that eventually need to survive a crash.
 	currentTerm int
@@ -56,6 +56,7 @@ type RaftNode struct {
 
 	persister    Persister
 	requestIndex map[RequestID]int
+	stateMachine StateMachine
 }
 
 // NewRaftNode creates and initializes a node in the Follower state.
@@ -317,7 +318,19 @@ func (rn *RaftNode) Get(clientID, seqNumber int64, key string) (string, bool, er
 	}
 	rn.mu.Unlock()
 
+	if rn.stateMachine != nil {
+		val, found, err := rn.stateMachine.Get([]byte(key))
+
+		if err != nil {
+			return "", false, err
+		}
+
+		return string(val), found, nil
+	}
+
+	// Backward compatibility for existing tests/constructors
 	val, found, err := rn.Engine.Get([]byte(key))
+
 	if err != nil {
 		return "", false, err
 	}
@@ -599,6 +612,12 @@ func (rn *RaftNode) applyLoop() {
 }
 
 func (rn *RaftNode) applyMessage(msg ApplyMsg) error {
+	if rn.stateMachine != nil {
+		return rn.stateMachine.Apply(msg)
+	}
+
+	// Backward-compatible path for existing callers and tests
+	// that have not configured a state machine.
 	switch msg.Command.Op {
 
 	case "NOOP":

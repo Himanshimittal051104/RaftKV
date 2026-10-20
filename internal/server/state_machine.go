@@ -3,6 +3,7 @@ package server
 import (
 	"RaftKV/internal/raft"
 	"RaftKV/internal/storage"
+	"fmt"
 )
 
 type KVStateMachine struct {
@@ -23,6 +24,9 @@ func (sm *KVStateMachine) Apply(msg raft.ApplyMsg) error {
 	cmd := msg.Command
 
 	switch cmd.Op {
+	case "NOOP":
+		return nil
+
 	case "SET":
 		return sm.engine.Put(
 			[]byte(cmd.Key),
@@ -34,11 +38,11 @@ func (sm *KVStateMachine) Apply(msg raft.ApplyMsg) error {
 			[]byte(cmd.Key),
 		)
 
-	case "GET":
-		// GET is a read operation and should not modify the state machine.
-		return nil
-
 	default:
-		return nil
+		return fmt.Errorf("unsupported operation %q", msg.Command.Op)
 	}
+}
+
+func (sm *KVStateMachine) Get(key []byte) ([]byte, bool, error) {
+	return sm.engine.Get(key)
 }

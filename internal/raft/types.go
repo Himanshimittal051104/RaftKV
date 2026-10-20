@@ -57,8 +57,8 @@ type RequestID struct {
 }
 
 type StateMachine interface {
-	Apply(cmd Command) (result string, err error)
-	Get(key string) (value string, exists bool)
+	Apply(msg ApplyMsg) ( err error)
+	Get(key []byte) (value string,found bool, err error)
 	Snapshot() ([]byte, error)
 	Restore(snapshot []byte) error
 }

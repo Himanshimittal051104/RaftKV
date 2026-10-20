@@ -21,8 +21,19 @@ func main() {
 
 	stateFile := filepath.Join(dataDir, "raft-state.bin")
 
+	walFile := filepath.Join(dataDir, "wal.log")
+
 	// Create the storage engine.
-	engine := storage.NewMemEngine()
+	engine, err := storage.NewFileEngine(walFile)
+	if err != nil {
+		log.Fatalf("create storage engine: %v", err)
+	}
+
+	defer func() {
+		if err := engine.Close(); err != nil {
+			log.Printf("close storage engine: %v", err)
+		}
+	}()
 
 	// Create a disk-backed Raft node.
 	node, err := raft.NewPersistentRaftNode(
@@ -41,11 +52,19 @@ func main() {
 
 	// Expose the key-value HTTP API.
 	kvServer := server.NewKVServer(node) //creates your KV server object. But it does not start listening for HTTP requests yet.
+	httpServer := &http.Server{
+		Addr:    ":8080",
+		Handler: kvServer,
+	}
 
 	log.Printf("RaftKV server listening on :8080")
 	log.Printf("Raft state file: %s", stateFile)
+	log.Printf("Storage WAL file: %s", walFile)
 
-	if err := http.ListenAndServe(":8080", kvServer); err != nil {//This starts listening on port 8080 and passes incoming HTTP requests to kvServer for handling.
+
+	if err := httpServer.ListenAndServe(); err != nil &&	 err != http.ErrServerClosed {
+		//This starts listening on port 8080 and passes incoming HTTP requests to kvServer for handling.
+		// If err == http.ErrServerClosed, the server stopped intentionally, so don't report it as a failure.
 		log.Fatalf("HTTP server failed: %v", err)
 	}
 
