@@ -674,7 +674,7 @@ func (rn *RaftNode) recoverSingleNodeState() error {
 			CommandIndex: entry.Index,
 			CommandTerm:  entry.Term,
 		}
-		if err := rn.stateMachine.Apply(msg); err != nil {
+		if err := rn.applyMessage(msg); err != nil {
 			return fmt.Errorf(
 				"recover log index %d: %w",
 				i,
