@@ -66,7 +66,7 @@ func NewFileEngine(walPath string) (*FileEngine, error) {
 		return nil, err
 	}
 
-	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+	if _, err := f.Seek(0, io.SeekEnd); err != nil { //f.Seek(offset, whence)
 		_ = f.Close()
 		return nil, fmt.Errorf("seek WAL end: %w", err)
 	}
@@ -101,6 +101,9 @@ func (e *FileEngine) recover() error {
 			// An incomplete last record can be caused by a crash mid-append.
 			if err := e.file.Truncate(validBytes); err != nil {
 				return fmt.Errorf("truncate incomplete WAL record: %w", err)
+			}
+			if err := e.file.Sync(); err != nil {
+				return fmt.Errorf("sync WAL after truncation: %w", err)
 			}
 			break
 		}

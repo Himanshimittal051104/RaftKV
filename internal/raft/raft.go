@@ -668,40 +668,20 @@ func (rn *RaftNode) recoverSingleNodeState() error {
 
 	for i := 1; i <= rn.commitIndex; i++ {
 		entry := rn.log[i]
-
-		switch entry.Command.Op {
-		case "NOOP": // No state-machine change is required.
-		case "SET":
-			if err := rn.Engine.Put(
-				[]byte(entry.Command.Key),
-				[]byte(entry.Command.Value),
-			); err != nil {
-				return fmt.Errorf(
-					"recover SET at index %d: %w",
-					i,
-					err,
-				)
-			}
-
-		case "DELETE":
-			if err := rn.Engine.Delete(
-				[]byte(entry.Command.Key),
-			); err != nil {
-				return fmt.Errorf(
-					"recover DELETE at index %d: %w",
-					i,
-					err,
-				)
-			}
-
-		default:
+		msg := ApplyMsg{
+			CommandValid: true,
+			Command:      entry.Command,
+			CommandIndex: entry.Index,
+			CommandTerm:  entry.Term,
+		}
+		if err := rn.stateMachine.Apply(msg); err != nil {
 			return fmt.Errorf(
-				"recover log index %d: unsupported operation %q",
+				"recover log index %d: %w",
 				i,
-				entry.Command.Op,
+				err,
 			)
 		}
-
+		
 	}
 
 	// In this single-node configuration, the recovered durable log represents the committed state reconstructed above.
