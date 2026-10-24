@@ -4,10 +4,9 @@
 
 RaftKV is a learning-oriented distributed key-value store designed to explore distributed systems, consensus, replicated state machines, and fault-tolerant storage.
 
-The project currently implements Raft-based leader election, heartbeats, log replication, conflict resolution, majority-based commitment, a replicated key-value state machine, ReadIndex-based linearizable reads, file-based persistence of Raft state, basic recovery logic, and an HTTP API.
+The project implements Raft-based leader election, heartbeats, log replication, conflict resolution, majority-based commitment, ReadIndex-based linearizable reads, request deduplication, an HTTP API, file-based Raft state persistence, and a WAL-backed file storage engine with recovery support.
 
-**Development status**: Persistence and basic recovery are implemented. Comprehensive crash-recovery testing and multi-node restart validation remain in progress.
-
+**Development status: Core Raft consensus, ReadIndex-based linearizable reads, request deduplication, file-based Raft state persistence, and a WAL-backed key-value storage engine are implemented. The existing Raft, server, and storage test suites have been reported as passing. Safe shutdown, snapshots, log compaction, and broader fault testing remain on the roadmap.
 ---
 
 ## Features
@@ -44,7 +43,7 @@ Instead, the leader:
 3. Obtains confirmation from a majority of the cluster.
 4. Establishes a `readIndex` from the committed state.
 5. Waits until the local state machine has applied through that index.
-6. Performs the read directly from the local storage engine.
+6. Performs the read from the local storage engine using state-machine.
 7. Re-checks leadership before returning the result.
 
 
@@ -70,6 +69,9 @@ Committed Read Index
   │
   ▼
 Wait for Application
+  │
+  ▼
+State Machine
   │
   ▼
 Storage Engine
@@ -100,26 +102,33 @@ Write requests use a client ID and sequence number to identify individual reques
 - Conflicting request-ID reuse returns HTTP 409 Conflict.
 
 
-Deduplication across leadership changes and recovery still requires further verification.
+Tests cover repeated requests across leadership changes and restart, including rejection of conflicting request-ID reuse.
+
 
 ### Persistence and Recovery
 
-RaftKV persists the following Raft state:
+RaftKV implements two separate persistence mechanisms:
 
-- currentTerm
-- votedFor
-- log
-- commitIndex
+**Raft State Persistence**
+- Persists `currentTerm`, `votedFor`, and the `Raft log` using a file-based persister.
+- Writes persisted state to a temporary file, synchronizes and closes it, and renames it into place.
+- Validates persisted state during startup and returns an error if the state is invalid.
+- commitIndex is not persisted; commitment information must be re-established through the Raft protocol and recovery logic after restart.
 
-The file persister writes to a temporary file, synchronizes and closes it, and then renames it into place.
+**WAL-Backed Key-Value Storage**
+- Implements a dedicated file-backed `FileEngine` that persists key-value operations using a write-ahead log (WAL).
+- Records `SET`, `DELETE`, and `NOOP` operations in the WAL.
+- Flushes and synchronizes WAL writes to disk.
+- Replays WAL records during startup to reconstruct key-value state.
+- Detects and truncates an incomplete final WAL record during recovery.
 
-During startup, persisted state is decoded and validated. Invalid persisted state causes initialization to return an error.
+**Recovery and Testing**
 
-Basic recovery is implemented. The single-node startup path can reconstruct committed key-value state by replaying committed log entries.
+The Raft recovery path restores persisted consensus state and replays committed entries where supported by the current startup flow. The storage engine independently recovers its key-value data from the WAL.
 
-**Important distinction**: Raft state persistence is implemented, but the current key-value storage engine (MemEngine) stores data in memory. The implemented single-node recovery path reconstructs committed key-value state from the log; a dedicated persistent key-value engine is not yet implemented.
+Tests cover persisted-state validation, restart recovery, WAL recovery, persistence failures, and relevant Raft safety properties. Broader multi-node crash-recovery and fault-injection testing remain useful areas for further validation.
 
-Comprehensive crash-recovery testing, interrupted-write scenarios, and multi-node restart validation remain in progress.
+**Important distinction:** Raft state persistence and WAL-backed key-value persistence are implemented separately. Their end-to-end recovery behavior must remain consistent across crashes and restarts.
 
 
 ### HTTP API
@@ -162,56 +171,74 @@ A successful write returns a response indicating success. GET responses include 
 At a high level, RaftKV follows this architecture:
 
 ```text
-                         Client
-                            |
-                            v
-                     HTTP KV Server
-                            |
-                            v
-                         Raft Node
-                            |
-                 +----------+----------------+
-                 |                           |
-                 v                           |
-              Raft Log                       |
-                 |                           |
-          +------+-------+                   |
-          |              |                   |
-          v              v                   |
-Replication to     Committed Entries         |
-Followers                 |                  |
-                          v                  |
-                      applyLoop()            |
-                          |                  |
-                          v                  |
-                       ApplyMsg              | ReadIndex-based GET
-                          |                  |
-                          v                  |
-                      applyMessage()         |
-                          |                  |
-                    +-----+-----+            |
-                    |           |            |
-                    v           v            |
-                   SET        DELETE         |
-                    |           |            |
-                    v           v            |
-               Engine.Put  Engine.Delete     |
-                    |           |            |
-                    +-----+-----+------------+
-                          |
-                          v
-                  MemEngine (In-Memory KV)
+
+                              Client
+                                 |
+                                 v
+                          HTTP KV Server
+                                 |
+                    +------------+-------------+
+                    |                          |
+                    v                          v
+               Write Request            ReadIndex-based GET
+                    |                          |
+                    v                          v
+                 Raft Node                Leader Check
+                    |                          |
+                    v                          v
+                 Raft Log                ReadProbe Quorum
+                    |                          |
+           +--------+---------+                v
+           |                  |            Read Index
+           v                  v                |
+   Replication to       Committed Entries      v
+     Followers                |            Wait for Apply
+           |                  |                |
+           v                  v                v
+ broadcastAppendEntries()  applyLoop()     KVStateMachine
+           |                  |                |
+           v                  v                v
+  Majority Acknowledgment  ApplyMsg          Get()
+           |                  |                |
+           v                  v                v
+ Advance CommitIndex     KVStateMachine      Engine.Get()
+                              |                |
+                              v                v
+                            Apply()          FileEngine
+                              |                |
+                              v                v
+                 +------------+------------+  Response
+                 |            |            |
+                 v            v            v
+                SET         DELETE        NOOP
+                 |            |            |
+                 v            v            v
+            Engine.Put() Engine.Delete()  Engine.Noop()
+                 |            |             |
+                 +------+-----+-----+-------+
+                              |
+                              v
+                         FileEngine
+                              |
+                              v
+                         WAL (wal.log)
+                             |
+                             v
+                            Disk
+
+
 ```
 ### Write Path
 A write follows :
 ```text
+
 Client
   |
   v
 HTTP KV Server
   |
   v
-Leader
+Raft Node (Leader)
   |
   v
 Append command to Raft log
@@ -220,25 +247,39 @@ Append command to Raft log
 Replicate to followers
   |
   v
-Majority replicated
+Majority replication
   |
   v
-Commit
+Advance commitIndex
   |
   v
 applyLoop() receives ApplyMsg
   |
   v
-applyMessage()
+stateMachine.apply()
   |
-  v
-Engine.Put() or Engine.Delete()
-  |
-  v
-MemEngine
-  |
-  v
-Client response
+  +-------------------+-------------------+
+  |                   |                   |
+  v                   v                   v
+ SET                 DELETE              NOOP
+  |                   |                   |
+  v                   v                   v
+Engine.Put()     Engine.Delete()       No storage
+  |                   |                 mutation
+  +-------------------+-------------------+
+                      |
+                      v
+                  FileEngine
+                      |
+                      v
+                  WAL (wal.log)
+                      |
+                      v
+                    Disk
+                      |
+                      v
+               Client response
+
 ```
 
 The system distinguishes between:
@@ -249,6 +290,7 @@ Append ≠ Commit ≠ Apply
 ### Read Path
 Reads use a different path from writes:
 ```text
+
 Client
   |
   v
@@ -261,13 +303,26 @@ ReadIndex-based GET
 Leader confirms quorum using ReadProbe
   |
   v
-Wait for local application through read index
+Establish safe readIndex
   |
   v
-Read from Engine
+Wait for local application through readIndex
   |
   v
-Response
+KVStateMachine
+  |
+  v
+Engine.Get()
+  |
+  v
+FileEngine
+  |
+  v
+Return value / found status
+  |
+  v
+HTTP Response to Client
+
 ```
 
 GET requests are not appended to the Raft log and are read directly from the engine after the ReadIndex checks.
@@ -283,12 +338,12 @@ The current implementation keeps the following state in memory:
 currentTerm
 votedFor
 log
-commitIndex
 ```
 
 ### Volatile State
 ```text
-lastApplied
+commitIndex
+lastQueued
 ```
 
 ### Leader-Specific Volatile State
@@ -376,7 +431,8 @@ A log entry becomes eligible for commitment when it has been replicated on a maj
 
 The leader advances commitIndex, and committed entries are applied in order. The current application path is:
 ```text
-Committed log entry
+
+Committed Log Entry
         |
         v
     applyLoop()
@@ -385,16 +441,35 @@ Committed log entry
      ApplyMsg
         |
         v
-  applyMessage()
+   State Machine
         |
         +---- SET ------> Engine.Put()
+        |                      |
+        |                      v
+        |                  FileEngine
+        |                      |
+        |                      v
+        |                  WAL (wal.log)
         |
         +---- DELETE ---> Engine.Delete()
+        |                      |
+        |                      v
+        |                  FileEngine
+        |                      |
+        |                      v
+        |                  WAL (wal.log)
         |
-        +---- NOOP -----> No engine operation
+        +---- NOOP -----> Engine.Noop()
+                               |
+                               v
+                           FileEngine
+                               |
+                               v
+                           WAL (wal.log)
+
 ```
 
-`applyLoop()` buffers out-of-order messages and processes consecutive entries in index order. It advances `lastApplied` and notifies requests waiting for application. The `applyMessage()` function currently handles `NOOP`, `SET`, and `DELETE`. 
+`applyLoop()` receives ApplyMsg messages from the Raft node, buffers out-of-order messages by command index, and coordinates their sequential processing through the state machine. It retrieves the current lastApplied index from the state machine and processes only the next expected command.
 
 ---
 
@@ -402,15 +477,22 @@ Committed log entry
 The storage abstraction is defined by:
 ```go
 type Engine interface {
-    Put(key, value []byte) error
-    Get(key []byte) ([]byte, bool, error)
-    Delete(key []byte) error
-    Close() error
+	Put(index int, key, value []byte) error
+	Get(key []byte) ([]byte, bool, error)
+	Delete(index int, key []byte) error
+	Noop(index int) error
+	LastApplied() (int, error)
+	Open() error
+	Close() error
+	IsClosed() bool
+	IsFailed() bool
 }
 ```
-The current implementation is `MemEngine`, which stores values in memory using a Go map. `applyMessage()` calls `Engine.Put()` for `SET` commands and `Engine.Delete()` for `DELETE` commands. `GET` operations read from the engine after the ReadIndex checks.
+The storage package includes `MemEngine` and a file-backed `FileEngine`. `MemEngine` stores values in memory using a Go map, while `FileEngine` persists `SET`, `DELETE`, and `NOOP` records in a write-ahead log (WAL), flushes and synchronizes writes, and replays the WAL during recovery.
 
-Raft state persistence is implemented separately. On the implemented single-node recovery path, committed log entries can be replayed to reconstruct key-value state after restart. A dedicated persistent key-value engine and comprehensive durability integration remain future improvements.
+The server initializes `FileEngine` using `data/node-0/wal.log` and passes it to `KVStateMachine`. The state machine applies committed commands through the storage engine abstraction, while the file-based Raft persister separately persists Raft consensus state in `data/node-0/raft-state.bin`.
+
+
 
 ---
 
@@ -423,8 +505,9 @@ RaftKV/
 │       └── main.go
 │
 ├── data/
-│   └── node-0/
-│       └── raft-state.bin
+|   └── node-0
+│        ├── raft-state.bin
+│        └── wal.log
 │
 ├── docs/
 │   └── invariants.md
@@ -449,7 +532,9 @@ RaftKV/
 │   │
 │   └── storage/
 │       ├── engine.go
-│       └── mem_engine.go
+│       ├── mem_engine.go
+|       ├── file_engine.go
+│       └── file_engine_test.go
 │
 ├── proto/
 ├── go.mod
@@ -478,19 +563,22 @@ RaftKV/
 - [x] Leadership-loss handling during reads
 - [x] File-based persistence of Raft state
 - [x] Persisted-state validation during startup
-- [x] Basic committed-state reconstruction on the single-node startup path
+- [x] Recovery of committed state on supported startup paths
 - [x] Write request deduplication using client request IDs
 - [x] Rejection of conflicting request-ID reuse
+- [x] Deduplication tests across restart and leadership changes
 - [x] HTTP error handling for wrong-leader and conflicting-request responses
+- [x] WAL-backed file storage engine (FileEngine)
+- [x] WAL replay and incomplete-final-record recovery handling
 
 ### In Progress
-- [ ] Comprehensive crash-recovery validation
-- [ ] Restart and recovery testing across multiple nodes
-- [ ] Failure testing around interrupted persistence operations
-- [ ] Verification of request deduplication across leadership changes and recovery
+- [ ] Safe goroutine lifecycle management and graceful shutdown
+- [ ] Broader multi-node crash-recovery validation
+- [ ] Additional failure-injection testing around persistence and restart boundaries
+- [ ] End-to-end validation of recovery and durability across failure scenarios
+
 
 ### Planned
-- [ ] Dedicated persistent key-value storage engine
 - [ ] Snapshots and log compaction
 - [ ] Fault injection and chaos testing
 - [ ] Broader linearizability and correctness testing
@@ -521,30 +609,34 @@ Some of the current invariants include:
 - A node that loses leadership does not complete the read through the old leader path.
 
 
-Persistence and recovery invariants and their failure tests will be expanded as recovery work progresses.
+Persistence and recovery invariants are partially covered by the existing test suite, including persisted-state validation, restart recovery, and persistence-failure handling. Additional failure tests will expand coverage of multi-node recovery, interrupted writes, and crash-recovery scenarios.
 
 ---
 
 ## Testing
-RaftKV includes tests covering both normal operation and Raft safety properties.
-
-
 The test suite currently covers:
+
+
 - Leader election and voting rules
 - Election timeout behavior
 - Higher-term transitions and heartbeats
 - Log replication and conflict resolution
-- nextIndex and matchIndex updates
+- `nextIndex` and `matchIndex` updates
 - Majority commitment and commit-index safety
-- State-machine application ordering
-- Client request completion
+- State-machine application ordering and out-of-order message handling
+- Client request completion and application waiters
 - Replication failure paths
 - ReadProbe behavior and ReadIndex quorum confirmation
 - Linearizable-read fencing and leadership loss during reads
-- Repeated write request IDs
+- Repeated write request IDs and request deduplication
 - Rejection of conflicting request-ID reuse
+- Concurrent duplicate and distinct write requests
 - HTTP API behavior, including HTTP 409 for conflicting request IDs
-- Persisted-state validation and recovery behavior where covered by the current tests
+- Raft state persistence and persisted-state validation
+- Restart recovery and committed-entry replay
+- WAL recovery and incomplete-final-record handling
+- Persistence-failure handling and recovery retries
+- Deduplication across restart and leadership changes
 
 Run the Raft test suite with:
 ```bash
@@ -572,44 +664,55 @@ A passing test suite provides evidence for the scenarios tested; it does not by 
 
 ## Development Roadmap
 
-1. **Raft Consensus — Completed**
-   - Leader election and heartbeats
-   - Log replication and conflict resolution
-   - Commitment and ordered application
-   - Linearizable reads using ReadIndex
+### 1. Raft Consensus — Completed
+- Leader election and heartbeats
+- Log replication and conflict resolution
+- Majority-based commitment and ordered application
+- Linearizable reads using ReadIndex
+- Leadership and term-transition handling
 
-2. **Persistence and Recovery — Implementation underway**
-   - File-based persistence of Raft state
-   - Persisted-state validation
-   - Basic committed-state reconstruction
-   - Restart tests and multi-node recovery validation
-   - Testing interrupted writes and failure scenarios
+### 2. Persistence and Recovery — Core Implementation Completed
+- File-based persistence of Raft state (`currentTerm`, `votedFor`, and log)
+- Persisted-state validation during startup
+- WAL-backed key-value storage and recovery
+- WAL replay and incomplete-final-record recovery handling
+- Recovery of committed entries on supported startup paths
 
-3. **Storage**
-   - Dedicated persistent key-value storage engine
-   - Storage durability integration with consensus
+**Remaining work:**
+- Broader multi-node crash-recovery validation
+- Additional interrupted-write and failure-injection scenarios
 
-4. **Scalability & Compaction**
-   - Snapshots
-   - Log compaction
+### 3. Storage — Core Implementation Completed
+- In-memory key-value storage engine (`MemEngine`)
+- WAL-backed file storage engine (`FileEngine`)
+- Storage abstraction integrated with the state machine
+- Separate persistence mechanisms for Raft state and key-value operations
 
-5. **Correctness & Reliability**
-   - Fault injection
-   - Broader linearizability testing
-   - Failure and recovery testing
-   - Retry and deduplication verification across leadership changes
+**Remaining work:**
+- Further validation of end-to-end durability across crashes and restarts
 
-6. **Observability & Performance**
-   - Metrics
-   - Benchmarking
-   - Profiling
-   - Performance optimization
+### 4. Scalability and Compaction
+- Snapshot creation and restoration
+- Raft log compaction
+- Snapshot installation and synchronization with lagging followers
 
-7. **Production Hardening**
-   - Concurrency hardening
-   - Graceful shutdown
-   - Robust error handling
-   - Final integration testing
+### 5. Correctness and Reliability
+- Fault injection and chaos testing
+- Broader linearizability and correctness testing
+- Expanded multi-node failure and recovery testing
+- Additional validation of retries and deduplication across leadership changes
+
+### 6. Observability and Performance
+- Metrics and operational visibility
+- Throughput and latency benchmarks
+- Profiling and performance optimization
+
+### 7. Production Hardening
+- Safe goroutine lifecycle management
+- Graceful shutdown of Raft and HTTP server components
+- Robust error handling
+- Final integration and race-detector testing
+
 
 ---
 
@@ -634,12 +737,23 @@ RaftKV is being built from consensus and storage primitives upward, with correct
 ---
 
 ## Status
-RaftKV is an active distributed-systems project under development.
 
+RaftKV is an active distributed-systems project built from scratch in Go.
 
-The current implementation contains a functional Raft consensus core, a replicated key-value operation path, an HTTP API, file-based persistence of Raft state, basic recovery logic, request-ID deduplication, and a ReadIndex-based linearizable-read path. Committed commands are applied through `applyLoop()` and `ApplyMsg` processing, with `applyMessage()` directly invoking the in-memory engine; there is no separate state-machine component in the current architecture.
+The current implementation includes:
 
+- A functional Raft consensus core with leader election, heartbeats, log replication, conflict resolution, and majority-based commitment.
+- ReadIndex-based linearizable reads using quorum confirmation and application-index fencing.
+- An HTTP API supporting `PUT`, `GET`, and `DELETE`, with write-request deduplication and conflicting request-ID detection.
+- File-based Raft state persistence with startup validation.
+- A WAL-backed `FileEngine` that persists key-value operations and replays its WAL during recovery.
+- Ordered state-machine application, application waiters, and recovery handling for storage failures.
+- Automated tests covering consensus, replication, linearizable reads, request deduplication, persistence, recovery, and concurrency.
 
-The next major focus is comprehensive recovery validation, including multi-node restart and interrupted-persistence scenarios. A dedicated persistent KV engine, snapshots, broader failure testing, observability, and performance engineering follow on the roadmap..
+The existing Raft, server, and storage test suites have been reported as passing.
+
+**Next priorities** are safe goroutine lifecycle management and graceful shutdown, followed by snapshots and Raft log compaction. Broader multi-node fault testing, observability, benchmarking, and performance optimization remain future work.
+
+RaftKV is intended as a learning-oriented distributed-systems project, with an emphasis on consensus, storage durability, recovery, and correctness under failure.
 
 ---
