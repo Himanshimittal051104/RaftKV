@@ -6,7 +6,7 @@ RaftKV is a learning-oriented distributed key-value store designed to explore di
 
 The project implements Raft-based leader election, heartbeats, log replication, conflict resolution, majority-based commitment, ReadIndex-based linearizable reads, request deduplication, an HTTP API, file-based Raft state persistence, and a WAL-backed file storage engine with recovery support.
 
-**Development status: Core Raft consensus, ReadIndex-based linearizable reads, request deduplication, file-based Raft state persistence, and a WAL-backed key-value storage engine are implemented. The existing Raft, server, and storage test suites have been reported as passing. Safe shutdown, snapshots, log compaction, and broader fault testing remain on the roadmap.
+**Development status**: Core Raft consensus, ReadIndex-based linearizable reads, request deduplication, file-based Raft state persistence, and a WAL-backed key-value storage engine are implemented. The existing Raft, server, and storage test suites have been reported as passing. Safe shutdown, snapshots, log compaction, and broader fault testing remain on the roadmap.
 ---
 
 ## Features
