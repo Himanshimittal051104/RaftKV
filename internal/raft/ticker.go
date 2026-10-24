@@ -6,16 +6,55 @@ import (
 )
 
 // Start begins the election and heartbeat background goroutine.
-func (rn *RaftNode) StartBackground() {
-	go rn.runLoop()
-	go rn.applyLoop()
+func (rn *RaftNode) StartBackground() error {
+	rn.mu.Lock()
+
+	if rn.started {
+		rn.mu.Unlock()
+		return ErrAlreadyStarted
+	}
+
+	if !rn.hasValidPeers(rn.peers) {
+		rn.mu.Unlock()
+		return ErrInvalidPeers
+	}
+
+	select {
+	case <-rn.stopCh:
+		rn.stopped = true
+		rn.mu.Unlock()
+		return ErrNodeStopped
+	default:
+	}
+
+	rn.started = true
+	rn.wg.Add(2)
+	rn.mu.Unlock()
+
+	go func() {
+		defer rn.wg.Done()
+		rn.runLoop()
+	}()
+
+	go func() {
+		defer rn.wg.Done()
+		rn.applyLoop()
+	}()
+
+	return nil
 }
 
 // Stop cleanly terminates the node's loop.
 func (rn *RaftNode) Stop() {
-    rn.stopOnce.Do(func() {
-        close(rn.stopCh)
-    })
+	rn.stopOnce.Do(func() {
+		rn.mu.Lock()
+		rn.stopped = true
+		rn.mu.Unlock()
+
+		close(rn.stopCh)
+	})
+
+	rn.wg.Wait()
 }
 
 func (rn *RaftNode) runLoop() {
@@ -56,7 +95,6 @@ func (rn *RaftNode) startElection() {
 		newTerm,
 		newVotedFor,
 		rn.log,
-		rn.commitIndex,
 	); err != nil {
 		rn.mu.Unlock()
 		return
@@ -69,9 +107,9 @@ func (rn *RaftNode) startElection() {
 
 	term := rn.currentTerm
 	me := rn.me
+	peers := append([]*RaftNode(nil), rn.peers...)
 	lastLogIndex := len(rn.log) - 1
 	lastLogTerm := rn.log[lastLogIndex].Term
-	peers := rn.peers
 
 	rn.mu.Unlock()
 
@@ -80,12 +118,11 @@ func (rn *RaftNode) startElection() {
 	votesReceived := 1 // Vote for self
 
 	// A single-node cluster already has a majority.
-	if votesReceived > len(peers)/2 {
+	if votesReceived > rn.peersCount/2 {
 		rn.mu.Lock()
 
 		if rn.role == Candidate && rn.currentTerm == term {
 			println("Node", me, "BECAME LEADER for term", term)
-			rn.role = Leader
 
 			index := len(rn.log)
 			noop := LogEntry{
@@ -104,13 +141,11 @@ func (rn *RaftNode) startElection() {
 				rn.currentTerm,
 				rn.votedFor,
 				newLog,
-				index,
 			); err != nil {
-				rn.role = Follower
 				rn.mu.Unlock()
 				return
 			}
-
+			rn.role = Leader
 			rn.log = newLog
 			rn.rebuildRequestIndex()
 			rn.commitIndex = index
@@ -164,7 +199,6 @@ func (rn *RaftNode) startElection() {
 					reply.Term,
 					-1,
 					rn.log,
-					rn.commitIndex,
 				); err != nil {
 					// Do not publish the higher term if persistence fails.
 					return
@@ -191,7 +225,6 @@ func (rn *RaftNode) startElection() {
 
 				if hasQuorum && rn.role == Candidate {
 					println("Node", me, "BECAME LEADER for term", term)
-					rn.role = Leader
 
 					index := len(rn.log)
 					noop := LogEntry{
@@ -210,13 +243,10 @@ func (rn *RaftNode) startElection() {
 						rn.currentTerm,
 						rn.votedFor,
 						newLog,
-						rn.commitIndex,
 					); err != nil {
-						rn.role = Follower
-						rn.mu.Unlock()
 						return
 					}
-
+					rn.role = Leader
 					rn.log = newLog
 					rn.rebuildRequestIndex()
 					rn.matchIndex[rn.me] = index
@@ -245,7 +275,7 @@ func (rn *RaftNode) broadcastAppendEntries() {
 	}
 	term := rn.currentTerm
 	me := rn.me
-	peers := rn.peers
+	peers := append([]*RaftNode(nil), rn.peers...)
 	commitIndex := rn.commitIndex
 	rn.mu.Unlock()
 
@@ -261,12 +291,16 @@ func (rn *RaftNode) broadcastAppendEntries() {
 				rn.mu.Unlock()
 				return
 			}
-
-			prevLogIndex := sentNextIndex - 1
-			if prevLogIndex < 0 {
-				prevLogIndex = 0
+			if sentNextIndex < 1 {
+				sentNextIndex = 1
+			}
+			if sentNextIndex > len(rn.log) {
+				sentNextIndex = len(rn.log)
 			}
 
+			rn.nextIndex[peerID] = sentNextIndex
+
+			prevLogIndex := sentNextIndex - 1
 			prevLogTerm := rn.log[prevLogIndex].Term
 
 			var entries []LogEntry
@@ -296,7 +330,7 @@ func (rn *RaftNode) broadcastAppendEntries() {
 			}
 
 			if reply.Term > rn.currentTerm {
-				if err := rn.persistState(reply.Term, -1, rn.log, rn.commitIndex); err != nil {
+				if err := rn.persistState(reply.Term, -1, rn.log); err != nil {
 					// Persistence failed; don't publish the state change.
 					rn.mu.Unlock()
 					return

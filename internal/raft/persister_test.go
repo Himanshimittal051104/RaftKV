@@ -1,14 +1,16 @@
 package raft
 
 import (
+	"RaftKV/internal/apperrors"
 	"RaftKV/internal/storage"
 	"bytes"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
-	"os"
 )
 
 // type failingPersister struct{}
@@ -51,13 +53,14 @@ func (p *readFailingPersister) ReadRaftState() ([]byte, error) {
 
 func TestConstructorReturnsErrorWhenReadingPersistedStateFails(t *testing.T) {
 	persister := &readFailingPersister{}
-
-	node, err := NewRaftNodeWithPersister(
+	engine := storage.NewMemEngine()
+	statemachine := NewTestStateMachine(engine)
+	node, err := NewRaftNode(
 		0,
 		1,
 		make(chan ApplyMsg, 1),
-		nil,
 		persister,
+		statemachine,
 	)
 
 	if err == nil {
@@ -71,12 +74,13 @@ func TestConstructorReturnsErrorWhenReadingPersistedStateFails(t *testing.T) {
 
 func TestFollowerDoesNotAcknowledgeEntryWhenPersistenceFails(t *testing.T) {
 	persister := &failingPersister{}
-
-	follower, err := NewRaftNodeWithPersister(
+	engine := storage.NewMemEngine()
+	statemachine := NewTestStateMachine(engine)
+	follower, err := NewRaftNode(
 		1, 2,
 		make(chan ApplyMsg, 10),
-		nil,
 		persister,
+		statemachine,
 	)
 	if err != nil {
 		t.Fatalf("failed to initialize follower: %v", err)
@@ -185,7 +189,7 @@ func TestPersisterRoundTrip(t *testing.T) {
 	}
 
 	// Step 1: Encode the state.
-	encoded, err := encodeRaftState(2, 1, originalLog, 0)
+	encoded, err := encodeRaftState(2, 1, originalLog)
 	if err != nil {
 		t.Fatalf("encoding failed: %v", err)
 	}
@@ -208,7 +212,7 @@ func TestPersisterRoundTrip(t *testing.T) {
 	}
 
 	// Step 4: Decode the saved bytes.
-	term, vote, recoveredLog, commitIndex, err := decodeRaftState(saved)
+	term, vote, recoveredLog, err := decodeRaftState(saved)
 	if err != nil {
 		t.Fatalf("decoding saved state failed: %v", err)
 	}
@@ -219,10 +223,6 @@ func TestPersisterRoundTrip(t *testing.T) {
 	}
 	if vote != 1 {
 		t.Errorf("votedFor: got %d, want 1", vote)
-	}
-
-	if commitIndex != 0 {
-		t.Errorf("commitIndex = %d, want 0", commitIndex)
 	}
 
 	if !reflect.DeepEqual(originalLog, recoveredLog) {
@@ -247,7 +247,7 @@ func TestRaftNodeRestoresPersistedState(t *testing.T) {
 	}
 
 	// Simulate state saved by the first node.
-	encoded, err := encodeRaftState(2, 1, originalLog, 0)
+	encoded, err := encodeRaftState(2, 1, originalLog)
 	if err != nil {
 		t.Fatalf("encode state: %v", err)
 	}
@@ -255,14 +255,15 @@ func TestRaftNodeRestoresPersistedState(t *testing.T) {
 	if err := persister.SaveRaftState(encoded); err != nil {
 		t.Fatalf("save state: %v", err)
 	}
-
+	engine := storage.NewMemEngine()
+	statemachine := NewTestStateMachine(engine)
 	// Construct a new node using the same persister.
-	node, err := NewRaftNodeWithPersister(
+	node, err := NewRaftNode(
 		0,
 		1,
 		make(chan ApplyMsg),
-		nil,
 		persister,
+		statemachine,
 	)
 	if err != nil {
 		t.Fatalf("failed to initialize node: %v", err)
@@ -348,7 +349,7 @@ func TestFilePersisterRestoresRaftState(t *testing.T) {
 	}
 
 	// Encode and persist actual Raft state.
-	encoded, err := encodeRaftState(3, 1, originalLog, 0)
+	encoded, err := encodeRaftState(3, 1, originalLog)
 	if err != nil {
 		t.Fatalf("encode state: %v", err)
 	}
@@ -368,7 +369,7 @@ func TestFilePersisterRestoresRaftState(t *testing.T) {
 		t.Fatalf("read state: %v", err)
 	}
 
-	term, vote, recoveredLog, commitIndex, err := decodeRaftState(saved)
+	term, vote, recoveredLog, err := decodeRaftState(saved)
 	if err != nil {
 		t.Fatalf("decode state: %v", err)
 	}
@@ -380,9 +381,6 @@ func TestFilePersisterRestoresRaftState(t *testing.T) {
 		t.Errorf("votedFor = %d, want 1", vote)
 	}
 
-	if commitIndex != 0 {
-		t.Errorf("commitIndex = %d, want 0", commitIndex)
-	}
 	if !reflect.DeepEqual(recoveredLog, originalLog) {
 		t.Errorf("recovered log does not match original log")
 	}
@@ -409,7 +407,7 @@ func TestRaftNodeRecoversFromFilePersister(t *testing.T) {
 		},
 	}
 
-	encoded, err := encodeRaftState(4, 2, originalLog, 1)
+	encoded, err := encodeRaftState(4, 2, originalLog)
 	if err != nil {
 		t.Fatalf("encode state: %v", err)
 	}
@@ -423,13 +421,14 @@ func TestRaftNodeRecoversFromFilePersister(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recreate persister: %v", err)
 	}
-
-	node, err := NewRaftNodeWithPersister(
+	engine := storage.NewMemEngine()
+	statemachine := NewTestStateMachine(engine)
+	node, err := NewRaftNode(
 		0,
 		3,
 		make(chan ApplyMsg, 10),
-		nil,
 		p2,
+		statemachine,
 	)
 	if err != nil {
 		t.Fatalf("failed to initialize node: %v", err)
@@ -448,11 +447,6 @@ func TestRaftNodeRecoversFromFilePersister(t *testing.T) {
 		t.Errorf("votedFor = %d, want 2", node.votedFor)
 	}
 
-	if node.commitIndex != 0 {
-		t.Errorf("commitIndex = %d, want 0 for multi-node restart",
-			node.commitIndex)
-	}
-
 	if !reflect.DeepEqual(node.log, originalLog) {
 		t.Errorf("recovered log does not match original log")
 	}
@@ -461,17 +455,22 @@ func TestRaftNodeRecoversFromFilePersister(t *testing.T) {
 func TestPersistentNodeRecoversStateMachine(t *testing.T) {
 	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
 
-	// First node: write a key to the state machine.
-	engine1 := storage.NewMemEngine()
-	applyCh1 := make(chan ApplyMsg, 100)
+	persistor, err := NewFilePersister(stateFile)
+	if err != nil {
+		t.Fatalf("create file persistor: %v", err)
+	}
 
-	node1, err := NewPersistentRaftNode(
-		0, 1, applyCh1, engine1, stateFile,
+	// First node.
+	applyCh1 := make(chan ApplyMsg, 100)
+	engine1 := storage.NewMemEngine()
+	stateMachine1 := NewTestStateMachine(engine1)
+
+	node1, err := NewRaftNode(
+		0, 1, applyCh1, persistor, stateMachine1,
 	)
 	if err != nil {
 		t.Fatalf("create first node: %v", err)
 	}
-
 	node1.StartBackground()
 	defer node1.Stop()
 
@@ -485,41 +484,64 @@ func TestPersistentNodeRecoversStateMachine(t *testing.T) {
 		if isLeader {
 			break
 		}
+
 		if time.Now().After(deadline) {
 			t.Fatal("first node did not become leader")
 		}
+
 		time.Sleep(10 * time.Millisecond)
 	}
 
+	// Write and wait for the operation to succeed.
 	if _, err := node1.Put(1, 1, "language", "Go"); err != nil {
 		t.Fatalf("put language=Go: %v", err)
 	}
 
-	// Second node: same persisted file, but a fresh empty engine.
-	engine2 := storage.NewMemEngine()
-	applyCh2 := make(chan ApplyMsg, 100)
+	// Confirm the first state machine contains the value.
+	value, found, err := stateMachine1.Get([]byte("language"))
+	if err != nil {
+		t.Fatalf("get value from first state machine: %v", err)
+	}
+	if !found || string(value) != "Go" {
+		t.Fatalf("expected language=Go before recovery; found=%v, value=%q",
+			found, string(value))
+	}
 
-	node2, err := NewPersistentRaftNode(
-		0, 1, applyCh2, engine2, stateFile,
+	// Second node: same persisted Raft state, fresh empty engine.
+	applyCh2 := make(chan ApplyMsg, 100)
+	engine2 := storage.NewMemEngine()
+	stateMachine2 := NewTestStateMachine(engine2)
+
+	node2, err := NewRaftNode(
+		0, 1, applyCh2, persistor, stateMachine2,
 	)
 	if err != nil {
 		t.Fatalf("create recovered node: %v", err)
 	}
 	defer node2.Stop()
+	node2.StartBackground()
 
-	value, found, err := node2.Engine.Get([]byte("language"))
-	if err != nil {
-		t.Fatalf("get recovered value: %v", err)
-	}
-	if !found {
-		t.Fatal("expected language key to be recovered")
-	}
-	if string(value) != "Go" {
-		t.Fatalf("expected Go, got %q", string(value))
+	deadline = time.Now().Add(3 * time.Second)
+
+	for {
+		value, found, err = stateMachine2.Get([]byte("language"))
+		if err != nil {
+			t.Fatalf("get recovered value: %v", err)
+		}
+
+		if found && string(value) == "Go" {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatal("state machine did not recover language=Go")
+		}
+
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-func TestPersistentNodeDoesNotRecoverUncommittedEntries(t *testing.T) {
+func TestPersistentNodeRecoversAllEntriesInSingleNodeCluster(t *testing.T) {
 	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
 
 	log := []LogEntry{
@@ -544,8 +566,7 @@ func TestPersistentNodeDoesNotRecoverUncommittedEntries(t *testing.T) {
 		},
 	}
 
-	// Persist both entries, but mark only index 1 as committed.
-	state, err := encodeRaftState(1, -1, log, 1)
+	state, err := encodeRaftState(1, -1, log)
 	if err != nil {
 		t.Fatalf("encode state: %v", err)
 	}
@@ -558,36 +579,70 @@ func TestPersistentNodeDoesNotRecoverUncommittedEntries(t *testing.T) {
 		t.Fatalf("save state: %v", err)
 	}
 
-	engine := storage.NewMemEngine()
-	node, err := NewPersistentRaftNode(
-		0, 1, make(chan ApplyMsg, 10), engine, stateFile,
+	applyCh := make(chan ApplyMsg, 10)
+	stateMachine := NewTestStateMachine(storage.NewMemEngine())
+
+	node, err := NewRaftNode(
+		0, 1, applyCh, persister, stateMachine,
 	)
 	if err != nil {
 		t.Fatalf("recover node: %v", err)
 	}
 	defer node.Stop()
 
-	// The committed entry must be restored.
-	value, found, err := engine.Get([]byte("committed"))
-	if err != nil {
-		t.Fatalf("get committed key: %v", err)
-	}
-	if !found || string(value) != "yes" {
-		t.Fatalf("committed key = (%q, %v), want (%q, true)",
-			string(value), found, "yes")
+	// StartBackground should start applyLoop and the other background loops.
+	node.StartBackground()
+
+	// Wait until recovery has applied both entries through applyLoop.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		lastApplied, err := stateMachine.LastApplied()
+		if err != nil {
+			t.Fatalf("get last applied index: %v", err)
+		}
+
+		if lastApplied >= 2 {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"recovery did not apply both entries: lastApplied=%d",
+				lastApplied,
+			)
+		}
+
+		time.Sleep(10 * time.Millisecond)
 	}
 
-	// The uncommitted entry must not be applied.
-	_, found, err = engine.Get([]byte("uncommitted"))
-	if err != nil {
-		t.Fatalf("get uncommitted key: %v", err)
-	}
-	if found {
-		t.Fatal("uncommitted entry was incorrectly recovered")
+	tests := []struct {
+		key   string
+		value string
+	}{
+		{key: "committed", value: "yes"},
+		{key: "uncommitted", value: "no"},
 	}
 
-	if node.commitIndex != 1 {
-		t.Fatalf("commitIndex = %d, want 1", node.commitIndex)
+	for _, tt := range tests {
+		value, found, err := stateMachine.Get([]byte(tt.key))
+		if err != nil {
+			t.Fatalf("get key %q: %v", tt.key, err)
+		}
+
+		if !found || string(value) != tt.value {
+			t.Errorf(
+				"key %q = (%q, %v), want (%q, true)",
+				tt.key, string(value), found, tt.value,
+			)
+		}
+	}
+
+	node.mu.Lock()
+	commitIndex := node.commitIndex
+	node.mu.Unlock()
+
+	if commitIndex != 2 {
+		t.Fatalf("commitIndex = %d, want 2", commitIndex)
 	}
 }
 
@@ -625,8 +680,8 @@ func TestFollowerAppliesEntryAfterRestartAndLeaderCommit(t *testing.T) {
 		},
 	}
 
-	// Persist the follower's log, but no commit index.
-	state, err := encodeRaftState(1, -1, log, 0)
+	// Persist the follower's log with commitIndex = 0.
+	state, err := encodeRaftState(1, -1, log)
 	if err != nil {
 		t.Fatalf("encode state: %v", err)
 	}
@@ -640,31 +695,37 @@ func TestFollowerAppliesEntryAfterRestartAndLeaderCommit(t *testing.T) {
 	}
 
 	engine := storage.NewMemEngine()
+	stateMachine := NewTestStateMachine(engine)
 	applyCh := make(chan ApplyMsg, 10)
 
-	// Restart the follower using the persisted state.
-	follower, err := NewRaftNodeWithPersister(
-		1, 2, applyCh, engine, persister,
+	follower, err := NewRaftNode(
+		1, 2, applyCh, persister, stateMachine,
 	)
 	if err != nil {
 		t.Fatalf("failed to initialize follower: %v", err)
 	}
-	defer close(follower.stopCh)
+	defer follower.Stop()
 
-	// The entry exists in the log but is not yet committed.
-	if follower.commitIndex != 0 {
-		t.Fatalf("commitIndex = %d, want 0", follower.commitIndex)
+	// The log entry exists but has not yet been committed.
+	follower.mu.Lock()
+	initialCommitIndex := follower.commitIndex
+	follower.mu.Unlock()
+
+	if initialCommitIndex != 0 {
+		t.Fatalf("commitIndex = %d, want 0", initialCommitIndex)
 	}
 
-	// Simulate the leader informing the restarted follower
-	// that entry 1 is committed.
+	// Simulate the leader informing the restarted follower that
+	// entry 1 is committed.
 	args := AppendEntriesArgs{
 		Term:         1,
 		LeaderID:     0,
 		PrevLogIndex: 0,
 		PrevLogTerm:  0,
+		Entries:      nil,
 		LeaderCommit: 1,
 	}
+
 	var reply AppendEntriesReply
 	follower.AppendEntries(&args, &reply)
 
@@ -672,29 +733,41 @@ func TestFollowerAppliesEntryAfterRestartAndLeaderCommit(t *testing.T) {
 		t.Fatal("follower should accept valid AppendEntries")
 	}
 
-	// Process the ApplyMsg as the apply loop normally would.
+	// The committed entry should be queued for application.
 	select {
 	case msg := <-applyCh:
-		if err := follower.applyMessage(msg); err != nil {
+		if !msg.CommandValid {
+			t.Fatal("expected a valid command ApplyMsg")
+		}
+		if msg.CommandIndex != 1 {
+			t.Fatalf("CommandIndex = %d, want 1", msg.CommandIndex)
+		}
+
+		if err := follower.stateMachine.Apply(msg); err != nil {
 			t.Fatalf("apply committed entry: %v", err)
 		}
-	default:
-		t.Fatal("expected committed entry to be queued for application")
+
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for committed entry to be queued")
 	}
 
-	value, found, err := engine.Get([]byte("language"))
+	value, found, err := stateMachine.Get([]byte("language"))
 	if err != nil {
 		t.Fatalf("get recovered value: %v", err)
 	}
 	if !found || string(value) != "Go" {
-		t.Fatalf("value = (%q, %v), want (%q, true)",
-			string(value), found, "Go")
+		t.Fatalf(
+			"value = (%q, %v), want (%q, true)",
+			string(value), found, "Go",
+		)
 	}
 
 	follower.mu.Lock()
-	defer follower.mu.Unlock()
-	if follower.commitIndex != 1 {
-		t.Fatalf("commitIndex = %d, want 1", follower.commitIndex)
+	finalCommitIndex := follower.commitIndex
+	follower.mu.Unlock()
+
+	if finalCommitIndex != 1 {
+		t.Fatalf("commitIndex = %d, want 1", finalCommitIndex)
 	}
 }
 
@@ -705,12 +778,13 @@ func TestFollowerPersistsNewLogEntryBeforeAcknowledging(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create persister: %v", err)
 	}
-
-	follower, err := NewRaftNodeWithPersister(
+	engine := storage.NewMemEngine()
+	statemachine := NewTestStateMachine(engine)
+	follower, err := NewRaftNode(
 		1, 2,
 		make(chan ApplyMsg, 10),
-		nil,
 		persister,
+		statemachine,
 	)
 	if err != nil {
 		t.Fatalf("failed to initialize follower: %v", err)
@@ -744,11 +818,11 @@ func TestFollowerPersistsNewLogEntryBeforeAcknowledging(t *testing.T) {
 	}
 
 	// Simulate a restart by creating a new node from the same file.
-	restarted, err := NewRaftNodeWithPersister(
+	restarted, err := NewRaftNode(
 		1, 2,
 		make(chan ApplyMsg, 10),
-		nil,
 		persister,
+		statemachine,
 	)
 	if err != nil {
 		t.Fatalf("failed to initialize restarted node: %v", err)
@@ -817,7 +891,7 @@ func TestFollowerPersistsRepairedConflictAcrossRestart(t *testing.T) {
 		},
 	}
 
-	state, err := encodeRaftState(3, -1, oldLog, 0)
+	state, err := encodeRaftState(3, -1, oldLog)
 	if err != nil {
 		t.Fatalf("encode old state: %v", err)
 	}
@@ -825,8 +899,10 @@ func TestFollowerPersistsRepairedConflictAcrossRestart(t *testing.T) {
 		t.Fatalf("save old state: %v", err)
 	}
 
-	follower, err := NewRaftNodeWithPersister(
-		1, 2, make(chan ApplyMsg, 10), nil, persister,
+	engine := storage.NewMemEngine()
+	statemachine := NewTestStateMachine(engine)
+	follower, err := NewRaftNode(
+		1, 2, make(chan ApplyMsg, 10), persister, statemachine,
 	)
 	if err != nil {
 		t.Fatalf("failed to initialize follower: %v", err)
@@ -861,8 +937,8 @@ func TestFollowerPersistsRepairedConflictAcrossRestart(t *testing.T) {
 	}
 
 	// Simulate restart by loading the same state file into a new node.
-	restarted, err := NewRaftNodeWithPersister(
-		1, 2, make(chan ApplyMsg, 10), nil, persister,
+	restarted, err := NewRaftNode(
+		1, 2, make(chan ApplyMsg, 10), persister, statemachine,
 	)
 	if err != nil {
 		t.Fatalf("failed to initialize restarted node: %v", err)
@@ -889,9 +965,10 @@ func TestGrantedVoteSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create persister: %v", err)
 	}
-
-	follower, err := NewRaftNodeWithPersister(
-		0, 3, make(chan ApplyMsg, 10), nil, persister,
+	engine := storage.NewMemEngine()
+	statemachine := NewTestStateMachine(engine)
+	follower, err := NewRaftNode(
+		0, 3, make(chan ApplyMsg, 10), persister, statemachine,
 	)
 	if err != nil {
 		t.Fatalf("failed to initialize follower: %v", err)
@@ -913,8 +990,8 @@ func TestGrantedVoteSurvivesRestart(t *testing.T) {
 	}
 
 	// Reconstruct the follower using the same disk-backed state.
-	restarted, err := NewRaftNodeWithPersister(
-		0, 3, make(chan ApplyMsg, 10), nil, persister,
+	restarted, err := NewRaftNode(
+		0, 3, make(chan ApplyMsg, 10), persister, statemachine,
 	)
 	if err != nil {
 		t.Fatalf("failed to initialize restarted node: %v", err)
@@ -951,9 +1028,10 @@ func TestFollowerDoesNotGrantVoteWhenPersistenceFails(t *testing.T) {
 	persister := &failingPersister{
 		saveCalls: 0,
 	}
-
-	follower, err := NewRaftNodeWithPersister(
-		0, 3, make(chan ApplyMsg, 10), nil, persister,
+	engine := storage.NewMemEngine()
+	statemachine := NewTestStateMachine(engine)
+	follower, err := NewRaftNode(
+		0, 3, make(chan ApplyMsg, 10), persister, statemachine,
 	)
 	if err != nil {
 		t.Fatalf("failed to initialize follower: %v", err)
@@ -1010,7 +1088,7 @@ func TestPersistentNodeRecoversDeletedKey(t *testing.T) {
 	}
 
 	// Both entries are committed.
-	state, err := encodeRaftState(1, -1, log, 2)
+	state, err := encodeRaftState(1, -1, log)
 	if err != nil {
 		t.Fatalf("encode state: %v", err)
 	}
@@ -1024,8 +1102,9 @@ func TestPersistentNodeRecoversDeletedKey(t *testing.T) {
 	}
 
 	engine := storage.NewMemEngine()
-	node, err := NewPersistentRaftNode(
-		0, 1, make(chan ApplyMsg, 10), engine, stateFile,
+	statemachine := NewTestStateMachine(engine)
+	node, err := NewRaftNode(
+		0, 1, make(chan ApplyMsg, 10), persister, statemachine,
 	)
 	if err != nil {
 		t.Fatalf("recover persistent node: %v", err)
@@ -1043,7 +1122,7 @@ func TestPersistentNodeRecoversDeletedKey(t *testing.T) {
 
 type failingRecoveryEngine struct{}
 
-func (e *failingRecoveryEngine) Put(key, value []byte) error {
+func (e *failingRecoveryEngine) Put(index int, key, value []byte) error {
 	return fmt.Errorf("simulated Put failure")
 }
 
@@ -1051,7 +1130,19 @@ func (e *failingRecoveryEngine) Get(key []byte) ([]byte, bool, error) {
 	return nil, false, nil
 }
 
-func (e *failingRecoveryEngine) Delete(key []byte) error {
+func (e *failingRecoveryEngine) Delete(index int, key []byte) error {
+	return nil
+}
+
+func (e *failingRecoveryEngine) Noop(index int) error {
+	return nil
+}
+
+func (e *failingRecoveryEngine) LastApplied() (int, error) {
+	return 0, nil
+}
+
+func (e *failingRecoveryEngine) Open() error {
 	return nil
 }
 
@@ -1059,7 +1150,15 @@ func (e *failingRecoveryEngine) Close() error {
 	return nil
 }
 
-func TestRecoveryReturnsErrorWhenPutFails(t *testing.T) {
+func (e *failingRecoveryEngine) IsClosed() bool {
+	return false
+}
+
+func (e *failingRecoveryEngine) IsFailed() bool {
+	return false
+}
+
+func TestRecoveryPutFailureDoesNotAdvanceLastApplied(t *testing.T) {
 	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
 
 	log := []LogEntry{
@@ -1075,7 +1174,7 @@ func TestRecoveryReturnsErrorWhenPutFails(t *testing.T) {
 		},
 	}
 
-	state, err := encodeRaftState(1, -1, log, 1)
+	state, err := encodeRaftState(1, -1, log)
 	if err != nil {
 		t.Fatalf("encode state: %v", err)
 	}
@@ -1088,21 +1187,38 @@ func TestRecoveryReturnsErrorWhenPutFails(t *testing.T) {
 		t.Fatalf("save state: %v", err)
 	}
 
-	_, err = NewPersistentRaftNode(
-		0, 1,
-		make(chan ApplyMsg, 10),
-		&failingRecoveryEngine{},
-		stateFile,
-	)
+	engine := &failingRecoveryEngine{}
+	stateMachine := NewTestStateMachine(engine)
+	applyCh := make(chan ApplyMsg, 10)
 
-	if err == nil {
-		t.Fatal("expected recovery to fail when Engine.Put fails")
+	node, err := NewRaftNode(0, 1, applyCh, persister, stateMachine)
+	if err != nil {
+		t.Fatalf("create Raft node: %v", err)
+	}
+	defer node.Stop()
+
+	if err := node.StartBackground(); err != nil {
+		t.Fatalf("start background loops: %v", err)
+	}
+
+	// Allow applyLoop to attempt the recovered entry.
+	time.Sleep(100 * time.Millisecond)
+
+	lastApplied, err := stateMachine.LastApplied()
+	if err != nil {
+		t.Fatalf("get last applied: %v", err)
+	}
+
+	if lastApplied != 0 {
+		t.Fatalf("LastApplied() = %d, want 0 after failed Put", lastApplied)
 	}
 }
 
-type failingRecoveryDeleteEngine struct{}
+type failingRecoveryDeleteEngine struct {
+	deleteAttempted chan struct{}
+}
 
-func (e *failingRecoveryDeleteEngine) Put(key, value []byte) error {
+func (e *failingRecoveryDeleteEngine) Put(index int, key, value []byte) error {
 	return nil
 }
 
@@ -1110,15 +1226,39 @@ func (e *failingRecoveryDeleteEngine) Get(key []byte) ([]byte, bool, error) {
 	return nil, false, nil
 }
 
-func (e *failingRecoveryDeleteEngine) Delete(key []byte) error {
+func (e *failingRecoveryDeleteEngine) Delete(index int, key []byte) error {
+	select {
+	case e.deleteAttempted <- struct{}{}:
+	default:
+	}
 	return fmt.Errorf("simulated Delete failure")
+}
+
+func (e *failingRecoveryDeleteEngine) Noop(index int) error {
+	return nil
+}
+
+func (e *failingRecoveryDeleteEngine) LastApplied() (int, error) {
+	return 0, nil
+}
+
+func (e *failingRecoveryDeleteEngine) Open() error {
+	return nil
 }
 
 func (e *failingRecoveryDeleteEngine) Close() error {
 	return nil
 }
 
-func TestRecoveryReturnsErrorWhenDeleteFails(t *testing.T) {
+func (e *failingRecoveryDeleteEngine) IsClosed() bool {
+	return false
+}
+
+func (e *failingRecoveryDeleteEngine) IsFailed() bool {
+	return false
+}
+
+func TestRecoveryDeleteFailureDoesNotAdvanceLastApplied(t *testing.T) {
 	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
 
 	log := []LogEntry{
@@ -1133,7 +1273,7 @@ func TestRecoveryReturnsErrorWhenDeleteFails(t *testing.T) {
 		},
 	}
 
-	state, err := encodeRaftState(1, -1, log, 1)
+	state, err := encodeRaftState(1, -1, log)
 	if err != nil {
 		t.Fatalf("encode state: %v", err)
 	}
@@ -1146,22 +1286,46 @@ func TestRecoveryReturnsErrorWhenDeleteFails(t *testing.T) {
 		t.Fatalf("save state: %v", err)
 	}
 
-	_, err = NewPersistentRaftNode(
-		0, 1,
-		make(chan ApplyMsg, 10),
-		&failingRecoveryDeleteEngine{},
-		stateFile,
-	)
+	engine := &failingRecoveryDeleteEngine{
+		deleteAttempted: make(chan struct{}, 1),
+	}
+	stateMachine := NewTestStateMachine(engine)
+	applyCh := make(chan ApplyMsg, 10)
 
-	if err == nil {
-		t.Fatal("expected recovery to fail when Engine.Delete fails")
+	node, err := NewRaftNode(0, 1, applyCh, persister, stateMachine)
+	if err != nil {
+		t.Fatalf("create Raft node: %v", err)
+	}
+	defer node.Stop()
+
+	if err := node.StartBackground(); err != nil {
+		t.Fatalf("start background loops: %v", err)
+	}
+
+	select {
+	case <-engine.deleteAttempted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Delete attempt")
+	}
+
+	lastApplied, err := stateMachine.LastApplied()
+	if err != nil {
+		t.Fatalf("get last applied: %v", err)
+	}
+
+	if lastApplied != 0 {
+		t.Fatalf("LastApplied() = %d, want 0 after failed Delete", lastApplied)
 	}
 }
 
 type retryableRecoveryEngine struct {
-	data      map[string]string
-	putCount  int
-	failAtPut int
+	mu          sync.Mutex
+	data        map[string]string
+	lastApplied int
+	putCount    int
+	failAtPut   int
+	closed      bool
+	failed      bool
 }
 
 func newRetryableRecoveryEngine(failAtPut int) *retryableRecoveryEngine {
@@ -1171,29 +1335,103 @@ func newRetryableRecoveryEngine(failAtPut int) *retryableRecoveryEngine {
 	}
 }
 
-func (e *retryableRecoveryEngine) Put(key, value []byte) error {
-	e.putCount++
+func (e *retryableRecoveryEngine) Put(index int, key, value []byte) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
-	if e.putCount == e.failAtPut {
+	if e.closed {
+		return apperrors.ErrEngineClosed
+	}
+
+	e.putCount++
+	if e.failAtPut > 0 && e.putCount == e.failAtPut {
 		return fmt.Errorf("simulated temporary Put failure")
 	}
 
 	e.data[string(key)] = string(value)
+	e.lastApplied = index
 	return nil
 }
 
 func (e *retryableRecoveryEngine) Get(key []byte) ([]byte, bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.closed {
+		return nil, false, apperrors.ErrEngineClosed
+	}
+
 	value, found := e.data[string(key)]
 	return []byte(value), found, nil
 }
 
-func (e *retryableRecoveryEngine) Delete(key []byte) error {
+func (e *retryableRecoveryEngine) Delete(index int, key []byte) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.closed {
+		return apperrors.ErrEngineClosed
+	}
+
 	delete(e.data, string(key))
+	e.lastApplied = index
+	return nil
+}
+
+func (e *retryableRecoveryEngine) Noop(index int) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.closed {
+		return apperrors.ErrEngineClosed
+	}
+
+	e.lastApplied = index
+	return nil
+}
+
+func (e *retryableRecoveryEngine) LastApplied() (int, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.closed {
+		return 0, apperrors.ErrEngineClosed
+	}
+	return e.lastApplied, nil
+}
+
+func (e *retryableRecoveryEngine) Open() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.closed {
+		return apperrors.ErrEngineClosed
+	}
+
+	e.failed = false
 	return nil
 }
 
 func (e *retryableRecoveryEngine) Close() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.closed = true
 	return nil
+}
+
+func (e *retryableRecoveryEngine) IsClosed() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.closed
+}
+
+func (e *retryableRecoveryEngine) IsFailed() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.failed
 }
 
 func TestRecoveryRetryAfterPartialFailure(t *testing.T) {
@@ -1205,32 +1443,26 @@ func TestRecoveryRetryAfterPartialFailure(t *testing.T) {
 			Index: 1,
 			Term:  1,
 			Command: Command{
-				Op:    "SET",
-				Key:   "language",
-				Value: "Go",
+				Op: "SET", Key: "language", Value: "Go",
 			},
 		},
 		{
 			Index: 2,
 			Term:  1,
 			Command: Command{
-				Op:    "SET",
-				Key:   "city",
-				Value: "Delhi",
+				Op: "SET", Key: "city", Value: "Delhi",
 			},
 		},
 		{
 			Index: 3,
 			Term:  1,
 			Command: Command{
-				Op:    "SET",
-				Key:   "database",
-				Value: "RaftKV",
+				Op: "SET", Key: "database", Value: "RaftKV",
 			},
 		},
 	}
 
-	state, err := encodeRaftState(1, -1, log, 3)
+	state, err := encodeRaftState(1, -1, log)
 	if err != nil {
 		t.Fatalf("encode state: %v", err)
 	}
@@ -1243,41 +1475,55 @@ func TestRecoveryRetryAfterPartialFailure(t *testing.T) {
 		t.Fatalf("save state: %v", err)
 	}
 
+	// The second Put fails once; applyLoop should retry it.
 	engine := newRetryableRecoveryEngine(2)
+	stateMachine := NewTestStateMachine(engine)
 
-	// The second SET fails during recovery.
-	_, err = NewPersistentRaftNode(
+	node, err := NewRaftNode(
 		0,
 		1,
 		make(chan ApplyMsg, 10),
-		engine,
-		stateFile,
-	)
-	if err == nil {
-		t.Fatal("expected first recovery attempt to fail")
-	}
-
-	// The first entry should have been applied before the failure.
-	if value := engine.data["language"]; value != "Go" {
-		t.Fatalf("language = %q, want Go", value)
-	}
-
-	// Disable the simulated failure and retry with the same engine.
-	engine.failAtPut = 0
-
-	node, err := NewPersistentRaftNode(
-		0,
-		1,
-		make(chan ApplyMsg, 10),
-		engine,
-		stateFile,
+		persister,
+		stateMachine,
 	)
 	if err != nil {
-		t.Fatalf("second recovery attempt failed: %v", err)
+		t.Fatalf("create Raft node: %v", err)
+	}
+	defer node.Stop()
+
+	if err := node.StartBackground(); err != nil {
+		t.Fatalf("start background loops: %v", err)
 	}
 
-	if node.lastApplied != 3 {
-		t.Fatalf("lastApplied = %d, want 3", node.lastApplied)
+	// Wait for all recovered entries to be applied.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		lastApplied, err := stateMachine.LastApplied()
+		if err != nil {
+			t.Fatalf("get lastApplied: %v", err)
+		}
+
+		if lastApplied == 3 {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"timed out waiting for recovery: lastApplied = %d, want 3",
+				lastApplied,
+			)
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Confirm that the temporary failure happened and was retried.
+	engine.mu.Lock()
+	putCount := engine.putCount
+	engine.mu.Unlock()
+
+	if putCount < 4 {
+		t.Fatalf("putCount = %d, want at least 4 after retry", putCount)
 	}
 
 	expected := map[string]string{
@@ -1287,7 +1533,15 @@ func TestRecoveryRetryAfterPartialFailure(t *testing.T) {
 	}
 
 	for key, want := range expected {
-		if got := engine.data[key]; got != want {
+		got, found, err := stateMachine.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Get(%q): %v", key, err)
+		}
+		if !found {
+			t.Errorf("key %q not found", key)
+			continue
+		}
+		if string(got) != want {
 			t.Errorf("%s = %q, want %q", key, got, want)
 		}
 	}
@@ -1315,7 +1569,7 @@ func TestMultiNodeFollowerReplaysCommittedEntriesAfterRestart(t *testing.T) {
 		},
 	}
 
-	state, err := encodeRaftState(1, -1, log, 1)
+	state, err := encodeRaftState(1, -1, log)
 	if err != nil {
 		t.Fatalf("encode state: %v", err)
 	}
@@ -1324,12 +1578,11 @@ func TestMultiNodeFollowerReplaysCommittedEntriesAfterRestart(t *testing.T) {
 		t.Fatalf("persist state: %v", err)
 	}
 
-	engine := storage.NewMemEngine()
 	applyCh := make(chan ApplyMsg, 10)
-
+	statemachine := NewTestStateMachine(storage.NewMemEngine())
 	// Restart as a multi-node follower.
-	node, err := NewRaftNodeWithPersister(
-		1, 3, applyCh, engine, persister,
+	node, err := NewRaftNode(
+		1, 3, applyCh, persister, statemachine,
 	)
 	if err != nil {
 		t.Fatalf("failed to initialize restarted node: %v", err)
@@ -1360,7 +1613,7 @@ func TestMultiNodeFollowerReplaysCommittedEntriesAfterRestart(t *testing.T) {
 	// Wait for the follower to apply the committed entry.
 	deadline := time.After(time.Second)
 	for {
-		value, found, err := engine.Get([]byte("language"))
+		value, found, err := statemachine.Get([]byte("language"))
 		if err != nil {
 			t.Fatalf("engine Get: %v", err)
 		}
@@ -1386,12 +1639,12 @@ func TestConstructorReturnsErrorForCorruptPersistedState(t *testing.T) {
 		t.Fatalf("failed to save test state: %v", err)
 	}
 
-	node, err := NewRaftNodeWithPersister(
+	node, err := NewRaftNode(
 		0,
 		1,
 		make(chan ApplyMsg, 1),
-		nil,
 		persister,
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
 
 	if err == nil {
@@ -1421,12 +1674,12 @@ func TestFilePersisterConstructorRejectsCorruptState(t *testing.T) {
 		t.Fatalf("recreate persister: %v", err)
 	}
 
-	node, err := NewRaftNodeWithPersister(
+	node, err := NewRaftNode(
 		0,
 		1,
 		make(chan ApplyMsg, 1),
-		nil,
 		restartedPersister,
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
 
 	if err == nil {
@@ -1463,7 +1716,6 @@ func TestFilePersisterSaveFailsWhenDestinationIsDirectory(t *testing.T) {
 		t.Fatal("destination is no longer a directory")
 	}
 }
-
 
 type failNextSavePersister struct {
 	underlying Persister
@@ -1505,7 +1757,7 @@ func TestFollowerPreservesDiskStateWhenLogPersistenceFails(t *testing.T) {
 		},
 	}
 
-	oldState, err := encodeRaftState(1, -1, oldLog, 0)
+	oldState, err := encodeRaftState(1, -1, oldLog)
 	if err != nil {
 		t.Fatalf("encode old state: %v", err)
 	}
@@ -1520,12 +1772,12 @@ func TestFollowerPreservesDiskStateWhenLogPersistenceFails(t *testing.T) {
 		failNext:   true,
 	}
 
-	follower, err := NewRaftNodeWithPersister(
+	follower, err := NewRaftNode(
 		1,
 		2,
 		make(chan ApplyMsg, 10),
-		nil,
 		persister,
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
 	if err != nil {
 		t.Fatalf("initialize follower: %v", err)
@@ -1573,12 +1825,12 @@ func TestFollowerPreservesDiskStateWhenLogPersistenceFails(t *testing.T) {
 	follower.mu.Unlock()
 
 	// Simulate a restart by creating a fresh node from the same file.
-	restarted, err := NewRaftNodeWithPersister(
+	restarted, err := NewRaftNode(
 		1,
 		2,
 		make(chan ApplyMsg, 10),
-		nil,
 		filePersister,
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
 	if err != nil {
 		t.Fatalf("restart follower: %v", err)

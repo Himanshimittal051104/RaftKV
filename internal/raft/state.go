@@ -10,15 +10,13 @@ type persistentState struct {
 	CurrentTerm int
 	VotedFor    int
 	Log         []LogEntry
-	CommitIndex int
 }
 
-func encodeRaftState(currentTerm int, votedFor int, log []LogEntry, commitIndex int) ([]byte, error) {
+func encodeRaftState(currentTerm int, votedFor int, log []LogEntry) ([]byte, error) {
 	state := persistentState{
 		CurrentTerm: currentTerm,
 		VotedFor:    votedFor,
 		Log:         log,
-		CommitIndex: commitIndex,
 	}
 
 	var buffer bytes.Buffer //A bytes.Buffer is an in-memory object that can accumulate bytes. At this point, nothing has been written to disk. The buffer is simply a destination for the encoded data.
@@ -32,7 +30,7 @@ func encodeRaftState(currentTerm int, votedFor int, log []LogEntry, commitIndex 
 	return buffer.Bytes(), nil
 }
 
-func decodeRaftState(data []byte) (int, int, []LogEntry, int, error) {
+func decodeRaftState(data []byte) (int, int, []LogEntry, error) {
 	var state persistentState
 
 	decoder := gob.NewDecoder(bytes.NewReader(data))
@@ -40,13 +38,13 @@ func decodeRaftState(data []byte) (int, int, []LogEntry, int, error) {
 	//gob.NewDecoder(...) interprets the Gob-encoded representation.
 
 	if err := decoder.Decode(&state); err != nil { //The decoder reconstructs the structure's fields.
-		return 0, -1, nil, 0, err
+		return 0, -1, nil, err
 	}
 
 	if err := validatePersistentState(state); err != nil {
-		return 0, -1, nil, 0, err
+		return 0, -1, nil, err
 	}
-	return state.CurrentTerm, state.VotedFor, state.Log, state.CommitIndex, nil
+	return state.CurrentTerm, state.VotedFor, state.Log, nil
 }
 
 func validatePersistentState(state persistentState) error {
@@ -60,14 +58,6 @@ func validatePersistentState(state persistentState) error {
 
 	if len(state.Log) == 0 {
 		return fmt.Errorf("invalid log: missing dummy entry at index 0")
-	}
-
-	if state.CommitIndex < 0 || state.CommitIndex >= len(state.Log) {
-		return fmt.Errorf(
-			"invalid commit index %d for log length %d",
-			state.CommitIndex,
-			len(state.Log),
-		)
 	}
 
 	if state.Log[0].Index != 0 || state.Log[0].Term != 0 {

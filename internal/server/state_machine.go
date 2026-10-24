@@ -7,12 +7,12 @@ import (
 )
 
 type KVStateMachine struct {
-	engine storage.Engine
+	Engine storage.Engine
 }
 
-func NewKVStateMachine(engine storage.Engine) *KVStateMachine {
+func NewKVStateMachine(Engine storage.Engine) *KVStateMachine {
 	return &KVStateMachine{
-		engine: engine,
+		Engine: Engine,
 	}
 }
 
@@ -25,18 +25,13 @@ func (sm *KVStateMachine) Apply(msg raft.ApplyMsg) error {
 
 	switch cmd.Op {
 	case "NOOP":
-		return nil
+		return sm.Engine.Noop(msg.CommandIndex)
 
 	case "SET":
-		return sm.engine.Put(
-			[]byte(cmd.Key),
-			[]byte(cmd.Value),
-		)
+		return sm.Engine.Put(msg.CommandIndex, []byte(cmd.Key), []byte(cmd.Value))
 
 	case "DELETE":
-		return sm.engine.Delete(
-			[]byte(cmd.Key),
-		)
+		return sm.Engine.Delete(msg.CommandIndex, []byte(cmd.Key))
 
 	default:
 		return fmt.Errorf("unsupported operation %q", msg.Command.Op)
@@ -44,5 +39,19 @@ func (sm *KVStateMachine) Apply(msg raft.ApplyMsg) error {
 }
 
 func (sm *KVStateMachine) Get(key []byte) ([]byte, bool, error) {
-	return sm.engine.Get(key)
+	return sm.Engine.Get(key)
+}
+
+func (sm *KVStateMachine) LastApplied() (int, error) {
+	return sm.Engine.LastApplied()
+}
+
+func (sm *KVStateMachine) IsClosed() bool {
+	return sm.Engine.IsClosed()
+}
+func (sm *KVStateMachine) IsFailed() bool {
+	return sm.Engine.IsFailed()
+}
+func (sm *KVStateMachine) Open() error {
+	return sm.Engine.Open()
 }

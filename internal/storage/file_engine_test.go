@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"RaftKV/internal/apperrors"
 	"errors"
 	"os"
 	"path/filepath"
@@ -15,15 +16,15 @@ func TestFileEnginePersistsAndDeletes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := e.Put([]byte("name"), []byte("Himanshi")); err != nil {
+	if err := e.Put(1, []byte("name"), []byte("Himanshi")); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := e.Put([]byte("city"), []byte("Delhi")); err != nil {
+	if err := e.Put(2, []byte("city"), []byte("Delhi")); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := e.Delete([]byte("city")); err != nil {
+	if err := e.Delete(3, []byte("city")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -57,7 +58,7 @@ func TestFileEngineTruncatesIncompleteFinalRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := e.Put([]byte("a"), []byte("one")); err != nil {
+	if err := e.Put(1, []byte("a"), []byte("one")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -109,7 +110,7 @@ func TestFileEngineRejectsMalformedCompleteRecord(t *testing.T) {
 		t.Fatal("expected an error for malformed complete WAL record")
 	}
 
-	if !errors.Is(err, ErrInvalidWALRecord) {
+	if !errors.Is(err, apperrors.ErrInvalidRecord) {
 		t.Fatalf("expected ErrInvalidWALRecord, got %v", err)
 	}
 }
@@ -123,7 +124,7 @@ func TestFileEngineWritesAfterRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := engine.Put([]byte("first"), []byte("one")); err != nil {
+	if err := engine.Put(1, []byte("first"), []byte("one")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -138,7 +139,7 @@ func TestFileEngineWritesAfterRecovery(t *testing.T) {
 	}
 	defer engine.Close()
 
-	if err := engine.Put([]byte("second"), []byte("two")); err != nil {
+	if err := engine.Put(2, []byte("second"), []byte("two")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -168,15 +169,15 @@ func TestFileEngineRecoversLatestValue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := engine.Put([]byte("name"), []byte("first")); err != nil {
+	if err := engine.Put(1, []byte("name"), []byte("first")); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := engine.Put([]byte("name"), []byte("second")); err != nil {
+	if err := engine.Put(2, []byte("name"), []byte("second")); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := engine.Put([]byte("name"), []byte("latest")); err != nil {
+	if err := engine.Put(3, []byte("name"), []byte("latest")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -218,20 +219,20 @@ func TestFileEngineRejectsOperationsAfterClose(t *testing.T) {
 	}
 
 	// PUT must fail.
-	err = engine.Put([]byte("key"), []byte("value"))
-	if !errors.Is(err, ErrFileEngineClosed) {
+	err = engine.Put(1, []byte("key"), []byte("value"))
+	if !errors.Is(err, apperrors.ErrEngineClosed) {
 		t.Fatalf("expected ErrFileEngineClosed from Put, got %v", err)
 	}
 
 	// GET must fail.
 	_, _, err = engine.Get([]byte("key"))
-	if !errors.Is(err, ErrFileEngineClosed) {
+	if !errors.Is(err, apperrors.ErrEngineClosed) {
 		t.Fatalf("expected ErrFileEngineClosed from Get, got %v", err)
 	}
 
 	// DELETE must fail.
-	err = engine.Delete([]byte("key"))
-	if !errors.Is(err, ErrFileEngineClosed) {
+	err = engine.Delete(2, []byte("key"))
+	if !errors.Is(err, apperrors.ErrEngineClosed) {
 		t.Fatalf("expected ErrFileEngineClosed from Delete, got %v", err)
 	}
 }

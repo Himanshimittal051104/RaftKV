@@ -18,11 +18,26 @@ func TestKVServerNetworkAPI(t *testing.T) {
 	testServers := make([]*httptest.Server, n)
 	applyChs := make([]chan raft.ApplyMsg, n)
 	engines := make([]storage.Engine, n)
+	stateMachines := make([]raft.StateMachine, n)
+	persisters := make([]raft.Persister, n)
 
 	for i := 0; i < n; i++ {
 		engines[i] = storage.NewMemEngine()
+		stateMachines[i] = NewKVStateMachine(engines[i])
 		applyChs[i] = make(chan raft.ApplyMsg, 100)
-		nodes[i] = raft.NewRaftNode(i, n, applyChs[i], engines[i])
+		persisters[i] = raft.NewMemPersister()
+
+		var err error
+		nodes[i], err = raft.NewRaftNode(
+			i,
+			n,
+			applyChs[i],
+			persisters[i],
+			stateMachines[i],
+		)
+		if err != nil {
+			t.Fatalf("failed to create Raft node %d: %v", i, err)
+		}
 	}
 
 	for i := 0; i < n; i++ {
@@ -39,110 +54,180 @@ func TestKVServerNetworkAPI(t *testing.T) {
 		}
 	}()
 
-	// Wait for leader election and discover leader via network requests
+	// Wait for leader election and discover the leader through HTTP.
 	t.Log("Waiting for cluster leader election over test network...")
-	var leaderIdx = -1
-	start := time.Now()
-	for time.Since(start) < 3*time.Second {
+
+	leaderIdx := -1
+	deadline := time.Now().Add(3 * time.Second)
+
+	for time.Now().Before(deadline) {
 		for i := 0; i < n; i++ {
-			body, _ := json.Marshal(WriteRequest{ClientID: 1, SeqNumber: 1, Key: "ping", Value: "pong"}) //converts that struct into JSON bytes.
-			resp, err := http.Post(testServers[i].URL+"/kv", "application/json", bytes.NewBuffer(body))
-			if err == nil {
-				if resp.StatusCode == http.StatusOK {
-					leaderIdx = i
-					resp.Body.Close()
-					break
-				}
-				resp.Body.Close()
+			body, err := json.Marshal(WriteRequest{
+				ClientID:  1,
+				SeqNumber: 1,
+				Key:       "ping",
+				Value:     "pong",
+			})
+			if err != nil {
+				t.Fatalf("failed to marshal leader probe: %v", err)
+			}
+
+			resp, err := http.Post(
+				testServers[i].URL+"/kv",
+				"application/json",
+				bytes.NewReader(body),
+			)
+			if err != nil {
+				continue
+			}
+
+			status := resp.StatusCode
+			resp.Body.Close()
+
+			if status == http.StatusOK {
+				leaderIdx = i
+				break
 			}
 		}
+
 		if leaderIdx != -1 {
 			break
 		}
+
 		time.Sleep(50 * time.Millisecond)
 	}
 
 	if leaderIdx == -1 {
-		t.Fatalf("Failed to identify leader server via network")
+		t.Fatal("failed to identify leader server via network")
 	}
+
 	t.Logf("Leader HTTP server identified at node %d", leaderIdx)
 
+	// Test 1: A follower must reject writes with HTTP 503.
 	followerIdx := (leaderIdx + 1) % n
 
-	// Test 1: Follower returns StatusServiceUnavailable (Wrong Leader)
-	body, err := json.Marshal(WriteRequest{ClientID: 2, SeqNumber: 1, Key: "hello", Value: "world"})
+	body, err := json.Marshal(WriteRequest{
+		ClientID:  2,
+		SeqNumber: 1,
+		Key:       "hello",
+		Value:     "world",
+	})
 	if err != nil {
-		t.Fatalf("Failed to marshal request: %v", err)
+		t.Fatalf("failed to marshal follower request: %v", err)
 	}
-	resp, err := http.Post(testServers[followerIdx].URL+"/kv", "application/json", bytes.NewBuffer(body))
-	// err is network error, resp is HTTP response. If the follower is not reachable, err will be non-nil. If the follower is reachable but returns an error status, err will be nil and resp.StatusCode will indicate the error.
-	if err != nil {
-		t.Fatalf("Failed to send request to follower: %v", err)
-	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("Expected status 503 Service Unavailable on follower, got %d", resp.StatusCode)
-	}
-	t.Log("Follower network endpoint correctly rejected write with 503")
-
-	// Test 2: Successful PUT on Leader Server
-	putBody, err := json.Marshal(WriteRequest{ClientID: 3, SeqNumber: 1, Key: "framework", Value: "RaftKV"})
+	resp, err := http.Post(
+		testServers[followerIdx].URL+"/kv",
+		"application/json",
+		bytes.NewReader(body),
+	)
 	if err != nil {
-		t.Fatalf("Failed to marshal PUT request: %v", err)
+		t.Fatalf("failed to send request to follower: %v", err)
 	}
-	resp, err = http.Post(testServers[leaderIdx].URL+"/kv", "application/json", bytes.NewBuffer(putBody))
-	if err != nil || resp.StatusCode != http.StatusOK {
-		t.Fatalf("Failed PUT on leader server: %v, status: %v", err, resp.StatusCode)
-	}
+
+	status := resp.StatusCode
 	resp.Body.Close()
+
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("expected HTTP 503 on follower, got %d", status)
+	}
+
+	t.Log("Follower correctly rejected write with HTTP 503")
+
+	// Test 2: Write through the leader.
+	putBody, err := json.Marshal(WriteRequest{
+		ClientID:  3,
+		SeqNumber: 1,
+		Key:       "framework",
+		Value:     "RaftKV",
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal PUT request: %v", err)
+	}
+
+	resp, err = http.Post(
+		testServers[leaderIdx].URL+"/kv",
+		"application/json",
+		bytes.NewReader(putBody),
+	)
+	if err != nil {
+		t.Fatalf("failed PUT request: %v", err)
+	}
+
+	status = resp.StatusCode
+	resp.Body.Close()
+
+	if status != http.StatusOK {
+		t.Fatalf("expected HTTP 200 for PUT, got %d", status)
+	}
+
 	t.Log("HTTP PUT successful on leader server")
 
-	// Allow replication time
-	time.Sleep(100 * time.Millisecond)
-
-	// Test 3: Successful GET on Leader Server
-	getBody, err := json.Marshal(WriteRequest{ClientID: 3, SeqNumber: 2, Key: "framework"})
+	// Test 3: GET the value through the leader.
+	// Use the same client ID and the next sequence number.
+	getBody, err := json.Marshal(WriteRequest{
+		ClientID:  3,
+		SeqNumber: 2,
+		Key:       "framework",
+	})
 	if err != nil {
-		t.Fatalf("Failed to marshal GET request: %v", err)
+		t.Fatalf("failed to marshal GET request: %v", err)
 	}
 
-	getReq, err := http.NewRequest(http.MethodGet, testServers[leaderIdx].URL+"/kv", bytes.NewBuffer(getBody))
+	getReq, err := http.NewRequest(
+		http.MethodGet,
+		testServers[leaderIdx].URL+"/kv",
+		bytes.NewReader(getBody),
+	)
 	if err != nil {
-		t.Fatalf("Failed to create GET request: %v", err)
+		t.Fatalf("failed to create GET request: %v", err)
 	}
 	getReq.Header.Set("Content-Type", "application/json")
 
 	getResp, err := http.DefaultClient.Do(getReq)
 	if err != nil {
-		t.Fatalf("Failed GET on leader server: %v", err)
+		t.Fatalf("failed GET request: %v", err)
 	}
 	defer getResp.Body.Close()
 
 	if getResp.StatusCode != http.StatusOK {
-		t.Fatalf("Expected status 200, got %d", getResp.StatusCode)
+		t.Fatalf("expected HTTP 200 for GET, got %d", getResp.StatusCode)
 	}
 
 	var getResult Response
 	if err := json.NewDecoder(getResp.Body).Decode(&getResult); err != nil {
-		t.Fatalf("Failed to decode GET response: %v", err)
+		t.Fatalf("failed to decode GET response: %v", err)
 	}
 
 	if !getResult.Found || getResult.Value != "RaftKV" {
 		t.Fatalf(
-			"Expected value 'RaftKV', got found=%v, value='%s'",
+			"expected value %q, got found=%v, value=%q",
+			"RaftKV",
 			getResult.Found,
 			getResult.Value,
 		)
 	}
 
-	t.Logf("HTTP GET verified successfully: 'framework' = '%s'", getResult.Value)
+	t.Logf("HTTP GET verified: framework = %q", getResult.Value)
 }
 
 func TestKVServerRejectsConflictingRequestID(t *testing.T) {
 	applyCh := make(chan raft.ApplyMsg, 10)
 	engine := storage.NewMemEngine()
-	node := raft.NewRaftNode(0, 1, applyCh, engine)
+	stateMachine := NewKVStateMachine(engine)
+	persister := raft.NewMemPersister()
+
+	node, err := raft.NewRaftNode(
+		0,
+		1,
+		applyCh,
+		persister,
+		stateMachine,
+	)
+	if err != nil {
+		t.Fatalf("failed to create Raft node: %v", err)
+	}
+
 	node.StartBackground()
 
 	server := httptest.NewServer(NewKVServer(node))
@@ -157,20 +242,20 @@ func TestKVServerRejectsConflictingRequestID(t *testing.T) {
 		Value:     "RaftKV",
 	})
 	if err != nil {
-		t.Fatalf("Failed to marshal first request: %v", err)
+		t.Fatalf("failed to marshal first request: %v", err)
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
 	var firstResp *http.Response
 
 	for time.Now().Before(deadline) {
-		resp, err := http.Post(
+		resp, requestErr := http.Post(
 			server.URL+"/kv",
 			"application/json",
-			bytes.NewBuffer(firstBody),
+			bytes.NewReader(firstBody),
 		)
 
-		if err == nil {
+		if requestErr == nil {
 			if resp.StatusCode == http.StatusOK {
 				firstResp = resp
 				break
@@ -182,11 +267,11 @@ func TestKVServerRejectsConflictingRequestID(t *testing.T) {
 	}
 
 	if firstResp == nil {
-		t.Fatal("First request did not succeed before the deadline")
+		t.Fatal("first request did not succeed before the deadline")
 	}
 	firstResp.Body.Close()
 
-	// Second request: same ID, different value.
+	// Second request: same request ID, but a different value.
 	secondBody, err := json.Marshal(WriteRequest{
 		ClientID:  10,
 		SeqNumber: 1,
@@ -194,34 +279,36 @@ func TestKVServerRejectsConflictingRequestID(t *testing.T) {
 		Value:     "DifferentValue",
 	})
 	if err != nil {
-		t.Fatalf("Failed to marshal conflicting request: %v", err)
+		t.Fatalf("failed to marshal conflicting request: %v", err)
 	}
 
 	secondResp, err := http.Post(
 		server.URL+"/kv",
 		"application/json",
-		bytes.NewBuffer(secondBody),
+		bytes.NewReader(secondBody),
 	)
 	if err != nil {
-		t.Fatalf("Failed to send conflicting request: %v", err)
+		t.Fatalf("failed to send conflicting request: %v", err)
 	}
 	defer secondResp.Body.Close()
 
 	if secondResp.StatusCode != http.StatusConflict {
 		t.Fatalf(
-			"Expected conflicting request status 409, got %d",
+			"expected conflicting request status 409, got %d",
 			secondResp.StatusCode,
 		)
 	}
 
 	// Ensure the original value remains unchanged.
-	value, found, err := engine.Get([]byte("framework"))
+	value, found, err := stateMachine.Get([]byte("framework"))
 	if err != nil {
-		t.Fatalf("Failed to read stored value: %v", err)
+		t.Fatalf("failed to read stored value: %v", err)
 	}
+
 	if !found || string(value) != "RaftKV" {
 		t.Fatalf(
-			"Expected original value 'RaftKV', got found=%v, value=%q",
+			"expected original value %q, got found=%v, value=%q",
+			"RaftKV",
 			found,
 			string(value),
 		)
@@ -229,4 +316,3 @@ func TestKVServerRejectsConflictingRequestID(t *testing.T) {
 
 	t.Log("Conflicting request ID correctly returned HTTP 409")
 }
-

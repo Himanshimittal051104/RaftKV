@@ -22,7 +22,6 @@ func (rn *RaftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) 
 			newTerm,
 			newVotedFor,
 			rn.log,
-			rn.commitIndex,
 		); err != nil {
 			reply.Term = rn.currentTerm
 			return
@@ -31,7 +30,7 @@ func (rn *RaftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) 
 		rn.currentTerm = newTerm
 		rn.role = Follower
 		rn.votedFor = newVotedFor
-
+		rn.resetElectionTimeout()
 	}
 
 	reply.Term = rn.currentTerm
@@ -57,7 +56,6 @@ func (rn *RaftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) 
 			rn.currentTerm,
 			args.CandidateID,
 			rn.log,
-			rn.commitIndex,
 		); err != nil {
 			return
 		}
@@ -88,7 +86,7 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 
 	// 2. Persist a higher term before updating in-memory state.
 	if args.Term > rn.currentTerm {
-		if err := rn.persistState(args.Term, -1, rn.log, rn.commitIndex); err != nil {
+		if err := rn.persistState(args.Term, -1, rn.log); err != nil {
 			reply.Term = rn.currentTerm
 			rn.mu.Unlock()
 			return
@@ -152,7 +150,6 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 			rn.currentTerm,
 			rn.votedFor,
 			newLog,
-			rn.commitIndex,
 		); err != nil {
 			reply.Term = rn.currentTerm
 			rn.mu.Unlock()
@@ -207,7 +204,7 @@ func (rn *RaftNode) ReadProbe(args *ReadProbeArgs, reply *ReadProbeReply) {
 	}
 
 	if args.Term > rn.currentTerm {
-		if err := rn.persistState(args.Term, -1, rn.log, rn.commitIndex); err != nil {
+		if err := rn.persistState(args.Term, -1, rn.log); err != nil {
 			reply.Term = rn.currentTerm
 			return
 		}
@@ -219,6 +216,5 @@ func (rn *RaftNode) ReadProbe(args *ReadProbeArgs, reply *ReadProbeReply) {
 	// We received a valid current-term probe from the leader.
 	rn.role = Follower
 	rn.lastResetTime = time.Now()
-
 	reply.Term = rn.currentTerm
 }

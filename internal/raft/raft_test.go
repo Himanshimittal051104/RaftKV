@@ -3,24 +3,40 @@ package raft
 import (
 	"RaftKV/internal/storage"
 	"errors"
-	"path/filepath"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
-	"sync"
-	"fmt"
 )
 
 func TestBroadcastAppendEntriesCommitsMajority(t *testing.T) {
-	applyCh := make(chan ApplyMsg, 10)
-
 	nodes := make([]*RaftNode, 3)
+
 	for i := 0; i < 3; i++ {
-		nodes[i] = NewRaftNode(i, 3, applyCh, storage.NewMemEngine())
+		persister := NewMemPersister()
+		engine := storage.NewMemEngine()
+		statemachine := NewTestStateMachine(engine)
+
+		node, err := NewRaftNode(
+			i,
+			3,
+			make(chan ApplyMsg, 10),
+			persister,
+			statemachine,
+		)
+		if err != nil {
+			t.Fatalf("failed to create node %d: %v", i, err)
+		}
+
+		nodes[i] = node
+		defer node.Stop()
 	}
 
 	// Connect all nodes.
 	for i := 0; i < 3; i++ {
-		nodes[i].SetPeers(nodes)
+		if err := nodes[i].SetPeers(nodes); err != nil {
+			t.Fatalf("failed to set peers for node %d: %v", i, err)
+		}
 	}
 
 	leader := nodes[0]
@@ -30,55 +46,57 @@ func TestBroadcastAppendEntriesCommitsMajority(t *testing.T) {
 	leader.role = Leader
 	leader.currentTerm = 1
 	leader.nextIndex[0] = len(leader.log)
-	leader.matchIndex[0] = 0
+	leader.matchIndex[0] = len(leader.log) - 1
 	leader.mu.Unlock()
 
-	// Leader appends a command.
 	index, term, err := leader.Start(Command{
 		Op:    "SET",
 		Key:   "x",
 		Value: "100",
 	})
-
 	if err != nil {
-		t.Fatal("leader rejected command")
+		t.Fatalf("leader rejected command: %v", err)
 	}
 
 	if index != 1 {
 		t.Fatalf("expected index 1, got %d", index)
 	}
-
 	if term != 1 {
 		t.Fatalf("expected term 1, got %d", term)
 	}
 
-	// In a real leader, nextIndex for followers starts at len(log).
+	// nextIndex is the next index to send, not the last index replicated.
 	leader.mu.Lock()
 	leader.nextIndex[1] = index
 	leader.nextIndex[2] = index
 	leader.mu.Unlock()
 
-	// Exercise the actual replication path.
 	leader.broadcastAppendEntries()
 
-	// Wait for replication + majority commit.
-	deadline := time.Now().Add(1 * time.Second)
-
+	// Wait for majority commitment: leader plus at least one follower.
+	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		leader.mu.Lock()
-		committed := leader.commitIndex >= index
+		commitIndex := leader.commitIndex
 		match1 := leader.matchIndex[1]
 		match2 := leader.matchIndex[2]
 		leader.mu.Unlock()
 
-		if committed && match1 >= index && match2 >= index {
+		replicatedFollowers := 0
+		if match1 >= index {
+			replicatedFollowers++
+		}
+		if match2 >= index {
+			replicatedFollowers++
+		}
+
+		if commitIndex >= index && replicatedFollowers >= 1 {
 			break
 		}
 
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	// Verify leader committed the entry.
 	leader.mu.Lock()
 	commitIndex := leader.commitIndex
 	match1 := leader.matchIndex[1]
@@ -86,61 +104,53 @@ func TestBroadcastAppendEntriesCommitsMajority(t *testing.T) {
 	leader.mu.Unlock()
 
 	if commitIndex < index {
-		t.Fatalf(
-			"expected leader to commit index %d, got %d",
-			index,
-			commitIndex,
-		)
+		t.Fatalf("expected commit index >= %d, got %d", index, commitIndex)
 	}
 
-	if match1 < index {
-		t.Fatalf("follower 1 was not replicated: matchIndex=%d", match1)
+	if match1 < index && match2 < index {
+		t.Fatalf("entry was not replicated to either follower: matchIndex[1]=%d, matchIndex[2]=%d", match1, match2)
 	}
 
-	if match2 < index {
-		t.Fatalf("follower 2 was not replicated: matchIndex=%d", match2)
-	}
-
-	// Verify followers actually contain the replicated entry.
+	// Verify every follower that acknowledged replication has the entry.
 	for i := 1; i < 3; i++ {
-		nodes[i].mu.Lock()
+		if nodes[0].matchIndex[i] < index {
+			continue
+		}
 
+		nodes[i].mu.Lock()
 		if len(nodes[i].log) <= index {
 			nodes[i].mu.Unlock()
 			t.Fatalf("follower %d log too short", i)
 		}
-
 		entry := nodes[i].log[index]
 		nodes[i].mu.Unlock()
 
 		if entry.Term != term {
-			t.Fatalf(
-				"follower %d: expected term %d, got %d",
-				i,
-				term,
-				entry.Term,
-			)
+			t.Errorf("follower %d: term = %d, want %d", i, entry.Term, term)
 		}
-
 		if entry.Command.Key != "x" || entry.Command.Value != "100" {
-			t.Fatalf(
-				"follower %d: unexpected command %+v",
-				i,
-				entry.Command,
-			)
+			t.Errorf("follower %d: unexpected command %+v", i, entry.Command)
 		}
 	}
 }
 
 func TestApplyCommittedEntry(t *testing.T) {
 	applyCh := make(chan ApplyMsg, 10)
+	persister := NewMemPersister()
+	engine := storage.NewMemEngine()
+	statemachine := NewTestStateMachine(engine)
 
-	node := NewRaftNode(
+	node, err := NewRaftNode(
 		0,
 		1,
 		applyCh,
-		storage.NewMemEngine(),
+		persister,
+		statemachine,
 	)
+	if err != nil {
+		t.Fatalf("failed to create Raft node: %v", err)
+	}
+	defer node.Stop()
 
 	node.mu.Lock()
 
@@ -158,10 +168,14 @@ func TestApplyCommittedEntry(t *testing.T) {
 
 	msgs := node.collectCommittedEntries()
 
+	lastApplied, err := node.stateMachine.LastApplied()
+	if err != nil {
+		t.Fatalf("failed to fetch lastApplied: %v", err)
+	}
+	lastQueued := node.lastQueued
+
 	node.mu.Unlock()
 
-	// collectCommittedEntries should return the
-	// messages that need to be delivered.
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 ApplyMsg, got %d", len(msgs))
 	}
@@ -171,77 +185,65 @@ func TestApplyCommittedEntry(t *testing.T) {
 	if !msg.CommandValid {
 		t.Fatal("expected valid command")
 	}
-
 	if msg.CommandIndex != 1 {
-		t.Fatalf(
-			"expected command index 1, got %d",
-			msg.CommandIndex,
-		)
+		t.Fatalf("expected command index 1, got %d", msg.CommandIndex)
 	}
-
 	if msg.CommandTerm != 1 {
-		t.Fatalf(
-			"expected command term 1, got %d",
-			msg.CommandTerm,
-		)
+		t.Fatalf("expected command term 1, got %d", msg.CommandTerm)
 	}
-
 	if msg.Command.Op != "SET" {
-		t.Fatalf(
-			"expected SET command, got %s",
-			msg.Command.Op,
-		)
+		t.Fatalf("expected SET command, got %s", msg.Command.Op)
 	}
-
 	if msg.Command.Key != "name" {
-		t.Fatalf(
-			"expected key name, got %s",
-			msg.Command.Key,
-		)
+		t.Fatalf("expected key name, got %s", msg.Command.Key)
 	}
-
 	if msg.Command.Value != "Himanshi" {
-		t.Fatalf(
-			"expected value Himanshi, got %s",
-			msg.Command.Value,
-		)
+		t.Fatalf("expected value Himanshi, got %s", msg.Command.Value)
 	}
-
-	node.mu.Lock()
-	lastApplied := node.lastApplied
-	lastQueued := node.lastQueued
-	node.mu.Unlock()
 
 	if lastApplied != 0 {
-		t.Fatalf(
-			"expected lastApplied=0 before application, got %d",
-			lastApplied,
-		)
+		t.Fatalf("expected lastApplied=0 before application, got %d", lastApplied)
 	}
-
 	if lastQueued != 1 {
-		t.Fatalf(
-			"expected lastQueued=1, got %d",
-			lastQueued,
-		)
+		t.Fatalf("expected lastQueued=1, got %d", lastQueued)
 	}
 }
 
 func TestAppendEntriesReplicatesEntry(t *testing.T) {
-	leader := NewRaftNode(0, 2, make(chan ApplyMsg, 10), storage.NewMemEngine())
-	follower := NewRaftNode(1, 2, make(chan ApplyMsg, 10), storage.NewMemEngine())
+	leader, err := NewRaftNode(
+		0,
+		2,
+		make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
+	)
+	if err != nil {
+		t.Fatalf("failed to create leader: %v", err)
+	}
+	defer leader.Stop()
+
+	follower, err := NewRaftNode(
+		1,
+		2,
+		make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
+	)
+	if err != nil {
+		t.Fatalf("failed to create follower: %v", err)
+	}
+	defer follower.Stop()
 
 	// Set up a 2-node cluster.
 	peers := []*RaftNode{leader, follower}
 	leader.SetPeers(peers)
 	follower.SetPeers(peers)
 
-	// Make the leader a leader in term 1.
+	// Make the leader a leader in term 1 and append a command.
 	leader.mu.Lock()
 	leader.role = Leader
 	leader.currentTerm = 1
 
-	// Leader has the command in its log.
 	leader.log = append(leader.log, LogEntry{
 		Term: 1,
 		Command: Command{
@@ -266,20 +268,22 @@ func TestAppendEntriesReplicatesEntry(t *testing.T) {
 
 	var reply AppendEntriesReply
 
-	// Send replication RPC directly to follower.
+	// Send replication RPC directly to the follower.
 	follower.AppendEntries(&args, &reply)
 
 	if !reply.Success {
 		t.Fatal("follower should accept valid AppendEntries")
 	}
 
-	// Verify follower received the entry.
+	// Verify that the follower received the entry.
 	follower.mu.Lock()
 	defer follower.mu.Unlock()
 
 	if len(follower.log) != 2 {
-		t.Fatalf("expected follower log length 2, got %d",
-			len(follower.log))
+		t.Fatalf(
+			"expected follower log length 2, got %d",
+			len(follower.log),
+		)
 	}
 
 	entry := follower.log[1]
@@ -291,14 +295,15 @@ func TestAppendEntriesReplicatesEntry(t *testing.T) {
 	if entry.Command.Op != "SET" ||
 		entry.Command.Key != "x" ||
 		entry.Command.Value != "10" {
-		t.Fatalf("replicated command incorrect: %+v",
-			entry.Command)
+		t.Fatalf("replicated command incorrect: %+v", entry.Command)
 	}
 
 	// Replication alone must not commit the entry.
 	if follower.commitIndex != 0 {
-		t.Fatalf("entry should not be committed yet; commitIndex=%d",
-			follower.commitIndex)
+		t.Fatalf(
+			"entry should not be committed yet; commitIndex=%d",
+			follower.commitIndex,
+		)
 	}
 }
 
@@ -307,12 +312,31 @@ func TestLeaderCommitsAfterMajorityReplication(t *testing.T) {
 	applyCh1 := make(chan ApplyMsg, 10)
 	applyCh2 := make(chan ApplyMsg, 10)
 
-	leader := NewRaftNode(0, 3, applyCh0, storage.NewMemEngine())
-	follower1 := NewRaftNode(1, 3, applyCh1, storage.NewMemEngine())
-	follower2 := NewRaftNode(2, 3, applyCh2, storage.NewMemEngine())
+	leader, err := NewRaftNode(
+		0, 3, applyCh0, NewMemPersister(), NewTestStateMachine(storage.NewMemEngine()),
+	)
+	if err != nil {
+		t.Fatalf("failed to create leader: %v", err)
+	}
+	defer leader.Stop()
+
+	follower1, err := NewRaftNode(
+		1, 3, applyCh1, NewMemPersister(), NewTestStateMachine(storage.NewMemEngine()),
+	)
+	if err != nil {
+		t.Fatalf("failed to create follower1: %v", err)
+	}
+	defer follower1.Stop()
+
+	follower2, err := NewRaftNode(
+		2, 3, applyCh2, NewMemPersister(), NewTestStateMachine(storage.NewMemEngine()),
+	)
+	if err != nil {
+		t.Fatalf("failed to create follower2: %v", err)
+	}
+	defer follower2.Stop()
 
 	peers := []*RaftNode{leader, follower1, follower2}
-
 	leader.SetPeers(peers)
 	follower1.SetPeers(peers)
 	follower2.SetPeers(peers)
@@ -329,95 +353,102 @@ func TestLeaderCommitsAfterMajorityReplication(t *testing.T) {
 		Key:   "x",
 		Value: "10",
 	})
-
 	if err != nil {
-		t.Fatal("leader should accept command")
+		t.Fatalf("leader should accept command: %v", err)
 	}
 
 	if index != 1 {
 		t.Fatalf("expected index 1, got %d", index)
 	}
-
 	if term != 1 {
 		t.Fatalf("expected term 1, got %d", term)
 	}
 
-	// Verify it is initially uncommitted.
 	leader.mu.Lock()
+
 	if leader.commitIndex != 0 {
+		got := leader.commitIndex
 		leader.mu.Unlock()
-		t.Fatalf("entry should initially be uncommitted, commitIndex=%d",
-			leader.commitIndex)
+		t.Fatalf("entry should initially be uncommitted, commitIndex=%d", got)
 	}
 
-	// Prepare AppendEntries for follower 1.
 	args := AppendEntriesArgs{
 		Term:         leader.currentTerm,
 		LeaderID:     leader.me,
 		PrevLogIndex: 0,
 		PrevLogTerm:  leader.log[0].Term,
-		Entries:      []LogEntry{leader.log[1]},
+		Entries:      []LogEntry{leader.log[index]},
 		LeaderCommit: 0,
 	}
 	leader.mu.Unlock()
 
+	// Replicate the entry to one follower.
 	var reply AppendEntriesReply
-
-	// Replicate to one follower.
 	follower1.AppendEntries(&args, &reply)
 
 	if !reply.Success {
 		t.Fatal("follower should accept AppendEntries")
 	}
 
-	// Simulate the leader learning that follower 1 replicated the entry.
+	// Record the successful replication on the leader.
 	leader.mu.Lock()
-
 	leader.matchIndex[1] = index
 	leader.nextIndex[1] = index + 1
 
-	// This is the same majority rule used by the leader.
-	count := 1 // leader itself
-
+	// A 3-node cluster needs 2 replicas, including the leader.
+	replicated := 1
 	for i := range leader.peers {
 		if i != leader.me && leader.matchIndex[i] >= index {
-			count++
+			replicated++
 		}
 	}
 
-	if count > len(leader.peers)/2 {
+	if replicated > len(leader.peers)/2 {
 		leader.commitIndex = index
 	}
 
+	gotCommitIndex := leader.commitIndex
 	leader.mu.Unlock()
 
-	// In a 3-node cluster, leader + one follower = majority.
-	leader.mu.Lock()
-	defer leader.mu.Unlock()
-
-	if leader.commitIndex != index {
+	if gotCommitIndex != index {
 		t.Fatalf(
 			"expected commitIndex=%d after majority replication, got %d",
 			index,
-			leader.commitIndex,
+			gotCommitIndex,
 		)
 	}
 }
 
 func TestClientAPIAndLeaderRedirection(t *testing.T) {
-	// Set up a 3-node cluster with separate engines and apply channels.
 	n := 3
+
 	nodes := make([]*RaftNode, n)
 	engines := make([]storage.Engine, n)
+	stateMachines := make([]StateMachine, n)
 	applyChs := make([]chan ApplyMsg, n)
+	persisters := make([]Persister, n)
 
+	// Create three nodes with separate engines and persisters.
 	for i := 0; i < n; i++ {
 		engines[i] = storage.NewMemEngine()
+		stateMachines[i] = NewTestStateMachine(engines[i])
 		applyChs[i] = make(chan ApplyMsg, 100)
-		nodes[i] = NewRaftNode(i, n, applyChs[i], engines[i])
+		persisters[i] = NewMemPersister()
+
+		var err error
+		nodes[i], err = NewRaftNode(
+			i,
+			n,
+			applyChs[i],
+			persisters[i],
+			stateMachines[i],
+		)
+		if err != nil {
+			t.Fatalf("failed to create node %d: %v", i, err)
+		}
 	}
 
-	// Connect peers and start their background loops.
+	// Connect peers and start background loops.
 	for i := 0; i < n; i++ {
 		nodes[i].SetPeers(nodes)
 		nodes[i].StartBackground()
@@ -457,7 +488,7 @@ func TestClientAPIAndLeaderRedirection(t *testing.T) {
 	}
 
 	if leader == nil {
-		t.Fatal("Failed to elect a leader within timeout")
+		t.Fatal("failed to elect a leader within timeout")
 	}
 
 	t.Logf("Leader found: Node %d", leaderID)
@@ -468,7 +499,7 @@ func TestClientAPIAndLeaderRedirection(t *testing.T) {
 
 	_, err := follower.Put(1, 1, "test_key", "test_val")
 	if !errors.Is(err, ErrWrongLeader) {
-		t.Fatalf("Expected ErrWrongLeader on follower Put, got: %v", err)
+		t.Fatalf("expected ErrWrongLeader on follower Put, got: %v", err)
 	}
 
 	t.Log("Follower correctly rejected Put with ErrWrongLeader")
@@ -476,7 +507,7 @@ func TestClientAPIAndLeaderRedirection(t *testing.T) {
 	// Test 2: Write a value through the leader.
 	success, err := leader.Put(1, 2, "city", "Delhi")
 	if !success || err != nil {
-		t.Fatalf("Failed to Put on leader: %v", err)
+		t.Fatalf("failed to Put on leader: success=%v, err=%v", success, err)
 	}
 
 	t.Log("Put command submitted successfully to leader")
@@ -485,36 +516,47 @@ func TestClientAPIAndLeaderRedirection(t *testing.T) {
 	val, found, err := leader.Get(1, 3, "city")
 	if err != nil || !found || val != "Delhi" {
 		t.Fatalf(
-			"Failed to Get correct value: val=%s, found=%v, err=%v",
+			"failed to Get correct value: val=%s, found=%v, err=%v",
 			val, found, err,
 		)
 	}
 
-	t.Logf("Get verified on leader: 'city' = '%s'", val)
+	t.Logf("Get verified on leader: city = %q", val)
 
 	// Test 4: Delete the value through the leader.
 	success, err = leader.Delete(1, 4, "city")
 	if !success || err != nil {
-		t.Fatalf("Failed to Delete on leader: %v", err)
+		t.Fatalf(
+			"failed to Delete: success=%v, err=%v",
+			success, err,
+		)
 	}
 
 	t.Log("Delete command submitted successfully")
 
-	// Verify the deletion.
+	// Verify deletion.
 	_, found, err = leader.Get(1, 5, "city")
 	if err != nil {
 		t.Fatalf("Get after Delete failed: %v", err)
 	}
 	if found {
-		t.Fatalf("Expected key 'city' to be deleted, but found=%v", found)
+		t.Fatal("expected key 'city' to be deleted")
 	}
 
-	t.Log("Success! Client API, operations (Put/Get/Delete), and leader redirection verified.")
+	t.Log("Client API and leader redirection tests passed")
 }
 
 func TestStartRejectedByFollower(t *testing.T) {
 	engine := storage.NewMemEngine()
-	node := NewRaftNode(0, 1, make(chan ApplyMsg, 10), engine)
+	stateMachine := NewTestStateMachine(engine)
+	applyCh := make(chan ApplyMsg, 10)
+	persister := NewMemPersister()
+
+	node, err := NewRaftNode(0, 1, applyCh, persister, stateMachine)
+	if err != nil {
+		t.Fatalf("failed to create Raft node: %v", err)
+	}
+	defer node.Stop()
 
 	index, term, err := node.Start(Command{
 		Op:    "SET",
@@ -527,14 +569,22 @@ func TestStartRejectedByFollower(t *testing.T) {
 	}
 
 	if index != -1 || term != -1 {
-		t.Fatalf("expected (-1, -1, \"not a leader\"), got (%d, %d, %v)",
+		t.Fatalf("expected (-1, -1), got (%d, %d, %v)",
 			index, term, err)
 	}
 }
 
 func TestStartLeaderAppendsEntry(t *testing.T) {
 	engine := storage.NewMemEngine()
-	node := NewRaftNode(0, 1, make(chan ApplyMsg, 10), engine)
+	stateMachine := NewTestStateMachine(engine)
+	applyCh := make(chan ApplyMsg, 10)
+	persister := NewMemPersister()
+
+	node, err := NewRaftNode(0, 1, applyCh, persister, stateMachine)
+	if err != nil {
+		t.Fatalf("failed to create Raft node: %v", err)
+	}
+	defer node.Stop()
 
 	node.mu.Lock()
 	node.role = Leader
@@ -551,9 +601,8 @@ func TestStartLeaderAppendsEntry(t *testing.T) {
 	}
 
 	index, term, err := node.Start(cmd)
-
 	if err != nil {
-		t.Fatal("leader should accept Start()")
+		t.Fatalf("leader should accept Start(): %v", err)
 	}
 
 	if index != 1 {
@@ -586,7 +635,15 @@ func TestStartLeaderAppendsEntry(t *testing.T) {
 
 func TestStartDoesNotCommit(t *testing.T) {
 	engine := storage.NewMemEngine()
-	node := NewRaftNode(0, 1, make(chan ApplyMsg, 10), engine)
+	stateMachine := NewTestStateMachine(engine)
+	applyCh := make(chan ApplyMsg, 10)
+	persister := NewMemPersister()
+
+	node, err := NewRaftNode(0, 2, applyCh, persister, stateMachine)
+	if err != nil {
+		t.Fatalf("failed to create Raft node: %v", err)
+	}
+	defer node.Stop()
 
 	node.mu.Lock()
 	node.role = Leader
@@ -596,33 +653,53 @@ func TestStartDoesNotCommit(t *testing.T) {
 	node.matchIndex = make([]int, 1)
 	node.mu.Unlock()
 
-	_, _, err := node.Start(Command{
+	_, _, err = node.Start(Command{
 		Op:    "SET",
 		Key:   "x",
 		Value: "10",
 	})
-
 	if err != nil {
-		t.Fatal("leader should accept command")
+		t.Fatalf("leader should accept command: %v", err)
 	}
 
 	node.mu.Lock()
-	defer node.mu.Unlock()
+	commitIndex := node.commitIndex
+	node.mu.Unlock()
 
-	if node.commitIndex != 0 {
-		t.Fatalf("Start() must not commit an entry; commitIndex=%d",
-			node.commitIndex)
+	if commitIndex != 0 {
+		t.Fatalf("Start() must not commit an entry; commitIndex=%d", commitIndex)
 	}
 
-	if node.lastApplied != 0 {
-		t.Fatalf("Start() must not apply an entry; lastApplied=%d",
-			node.lastApplied)
+	lastApplied, err := stateMachine.LastApplied()
+	if err != nil {
+		t.Fatalf("failed to get last applied index: %v", err)
+	}
+
+	if lastApplied != 0 {
+		t.Fatalf("Start() must not apply an entry; lastApplied=%d", lastApplied)
 	}
 }
 
 func TestAppendEntriesRepairsConflict(t *testing.T) {
-	leader := NewRaftNode(0, 2, make(chan ApplyMsg, 10), storage.NewMemEngine())
-	follower := NewRaftNode(1, 2, make(chan ApplyMsg, 10), storage.NewMemEngine())
+	leaderEngine := storage.NewMemEngine()
+	leaderSM := NewTestStateMachine(leaderEngine)
+	leader, err := NewRaftNode(
+		0, 2, make(chan ApplyMsg, 10), NewMemPersister(), leaderSM,
+	)
+	if err != nil {
+		t.Fatalf("failed to create leader: %v", err)
+	}
+	defer leader.Stop()
+
+	followerEngine := storage.NewMemEngine()
+	followerSM := NewTestStateMachine(followerEngine)
+	follower, err := NewRaftNode(
+		1, 2, make(chan ApplyMsg, 10), NewMemPersister(), followerSM,
+	)
+	if err != nil {
+		t.Fatalf("failed to create follower: %v", err)
+	}
+	defer follower.Stop()
 
 	peers := []*RaftNode{leader, follower}
 	leader.SetPeers(peers)
@@ -654,8 +731,8 @@ func TestAppendEntriesRepairsConflict(t *testing.T) {
 	)
 	leader.mu.Unlock()
 
-	// Follower has a conflicting entry at index 2.
-	// [dummy, A(term=1), X(term=2)]
+	// Follower has a conflicting entry at index 2:
+	// [dummy, A(term=1), X(term=3)]
 	follower.mu.Lock()
 	follower.currentTerm = 2
 
@@ -680,14 +757,16 @@ func TestAppendEntriesRepairsConflict(t *testing.T) {
 	follower.mu.Unlock()
 
 	// Leader sends its entry at index 2.
+	leader.mu.Lock()
+	entryToSend := leader.log[2]
+	leader.mu.Unlock()
+
 	args := AppendEntriesArgs{
 		Term:         2,
 		LeaderID:     0,
 		PrevLogIndex: 1,
 		PrevLogTerm:  1,
-		Entries: []LogEntry{
-			leader.log[2],
-		},
+		Entries:      []LogEntry{entryToSend},
 		LeaderCommit: 0,
 	}
 
@@ -723,24 +802,42 @@ func TestCommittedEntryCannotBeOverwrittenByOutdatedCandidate(t *testing.T) {
 	applyCh1 := make(chan ApplyMsg, 10)
 	applyCh2 := make(chan ApplyMsg, 10)
 
-	node0 := NewRaftNode(0, 3, applyCh0, storage.NewMemEngine())
-	node1 := NewRaftNode(1, 3, applyCh1, storage.NewMemEngine())
-	node2 := NewRaftNode(2, 3, applyCh2, storage.NewMemEngine())
+	node0, err := NewRaftNode(
+		0, 3, applyCh0, NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
+	)
+	if err != nil {
+		t.Fatalf("failed to create node0: %v", err)
+	}
+	defer node0.Stop()
+
+	node1, err := NewRaftNode(
+		1, 3, applyCh1, NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
+	)
+	if err != nil {
+		t.Fatalf("failed to create node1: %v", err)
+	}
+	defer node1.Stop()
+
+	node2, err := NewRaftNode(
+		2, 3, applyCh2, NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
+	)
+	if err != nil {
+		t.Fatalf("failed to create node2: %v", err)
+	}
+	defer node2.Stop()
 
 	nodes := []*RaftNode{node0, node1, node2}
-
-	for i := range nodes {
-		nodes[i].SetPeers(nodes)
+	for _, node := range nodes {
+		node.SetPeers(nodes)
 	}
 
-	// 1. Node 0 is the leader in term 1.
-
+	// Node 0 is the leader in term 1.
 	node0.mu.Lock()
 	node0.role = Leader
 	node0.currentTerm = 1
-
-	// Leader log:
-	// [dummy, SET x=100]
 	node0.log = append(node0.log, LogEntry{
 		Term: 1,
 		Command: Command{
@@ -749,25 +846,15 @@ func TestCommittedEntryCannotBeOverwrittenByOutdatedCandidate(t *testing.T) {
 			Value: "100",
 		},
 	})
-
-	// Leader has replicated the entry to node 1.
 	node0.matchIndex[0] = 1
 	node0.matchIndex[1] = 1
 	node0.matchIndex[2] = 0
-
-	// Entry is committed on a majority:
-	// node0 + node1 = 2/3.
 	node0.commitIndex = 1
 	node0.mu.Unlock()
 
-	// ------------------------------------------------------------
-	// 2. Node 1 has the committed entry.
-	// Node 2 does NOT have it.
-	// ------------------------------------------------------------
-
+	// Node 1 has the committed entry.
 	node1.mu.Lock()
 	node1.currentTerm = 1
-
 	node1.log = append(node1.log, LogEntry{
 		Term: 1,
 		Command: Command{
@@ -776,22 +863,15 @@ func TestCommittedEntryCannotBeOverwrittenByOutdatedCandidate(t *testing.T) {
 			Value: "100",
 		},
 	})
-
 	node1.commitIndex = 1
 	node1.mu.Unlock()
 
+	// Node 2 has only the dummy entry.
 	node2.mu.Lock()
 	node2.currentTerm = 1
-	// node2 intentionally remains with only the dummy entry.
 	node2.mu.Unlock()
 
-	// ------------------------------------------------------------
-	// 3. Old leader node 0 fails.
-	//
-	// Node 2 starts a new election in term 2.
-	// It does NOT contain the committed entry.
-	// ------------------------------------------------------------
-
+	// Node 2 requests a vote in term 2, but its log is outdated.
 	request := RequestVoteArgs{
 		Term:         2,
 		CandidateID:  2,
@@ -800,39 +880,23 @@ func TestCommittedEntryCannotBeOverwrittenByOutdatedCandidate(t *testing.T) {
 	}
 
 	var reply RequestVoteReply
-
 	node1.RequestVote(&request, &reply)
 
-	// ------------------------------------------------------------
-	// 4. Node 1 must reject node 2's vote request because
-	// node 2's log is behind the committed entry.
-	// ------------------------------------------------------------
-
 	if reply.VoteGranted {
-		t.Fatal(
-			"outdated candidate should not receive vote from " +
-				"a node containing the committed entry",
-		)
+		t.Fatal("outdated candidate should not receive a vote")
 	}
 
-	// Node 1 should still update its term to 2.
 	if reply.Term != 2 {
-		t.Fatalf(
-			"expected node 1 to update to term 2, got term %d",
-			reply.Term,
-		)
+		t.Fatalf("expected node 1 to update to term 2, got %d", reply.Term)
 	}
 
-	// ------------------------------------------------------------
-	// 5. Verify the committed entry still exists on node 1.
-	// ------------------------------------------------------------
-
+	// Verify the committed entry remains intact.
 	node1.mu.Lock()
 	defer node1.mu.Unlock()
 
 	if node1.commitIndex != 1 {
 		t.Fatalf(
-			"committed entry was lost: expected commitIndex=1, got %d",
+			"expected commitIndex=1, got %d",
 			node1.commitIndex,
 		)
 	}
@@ -844,18 +908,11 @@ func TestCommittedEntryCannotBeOverwrittenByOutdatedCandidate(t *testing.T) {
 	entry := node1.log[1]
 
 	if entry.Term != 1 {
-		t.Fatalf(
-			"expected committed entry term 1, got %d",
-			entry.Term,
-		)
+		t.Fatalf("expected entry term 1, got %d", entry.Term)
 	}
 
-	if entry.Command.Key != "x" ||
-		entry.Command.Value != "100" {
-		t.Fatalf(
-			"committed entry was changed: %+v",
-			entry.Command,
-		)
+	if entry.Command.Key != "x" || entry.Command.Value != "100" {
+		t.Fatalf("committed entry was changed: %+v", entry.Command)
 	}
 }
 
@@ -864,39 +921,56 @@ func TestLeaderDoesNotCommitWithoutMajority(t *testing.T) {
 	applyCh1 := make(chan ApplyMsg, 10)
 	applyCh2 := make(chan ApplyMsg, 10)
 
-	node0 := NewRaftNode(0, 3, applyCh0, storage.NewMemEngine())
-	node1 := NewRaftNode(1, 3, applyCh1, storage.NewMemEngine())
-	node2 := NewRaftNode(2, 3, applyCh2, storage.NewMemEngine())
+	node0, err := NewRaftNode(
+		0, 3, applyCh0, NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
+	)
+	if err != nil {
+		t.Fatalf("failed to create node0: %v", err)
+	}
+	defer node0.Stop()
+
+	node1, err := NewRaftNode(
+		1, 3, applyCh1, NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
+	)
+	if err != nil {
+		t.Fatalf("failed to create node1: %v", err)
+	}
+	defer node1.Stop()
+
+	node2, err := NewRaftNode(
+		2, 3, applyCh2, NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
+	)
+	if err != nil {
+		t.Fatalf("failed to create node2: %v", err)
+	}
+	defer node2.Stop()
 
 	nodes := []*RaftNode{node0, node1, node2}
-
-	for i := range nodes {
-		nodes[i].SetPeers(nodes)
+	for _, node := range nodes {
+		node.SetPeers(nodes)
 	}
 
-	// Node 0 is the leader in term 1.
 	node0.mu.Lock()
 	node0.role = Leader
 	node0.currentTerm = 1
 	node0.mu.Unlock()
 
-	// Append a new entry.
 	index, _, err := node0.Start(Command{
 		Op:    "SET",
 		Key:   "x",
 		Value: "100",
 	})
-
-	if err!=nil {
-		t.Fatal("leader should accept command")
+	if err != nil {
+		t.Fatalf("leader should accept command: %v", err)
 	}
 
 	if index != 1 {
 		t.Fatalf("expected entry at index 1, got %d", index)
 	}
 
-	// Only the leader has the entry.
-	// matchIndex[1] and matchIndex[2] remain 0.
 	node0.mu.Lock()
 	commitIndex := node0.commitIndex
 	match1 := node0.matchIndex[1]
@@ -906,12 +980,10 @@ func TestLeaderDoesNotCommitWithoutMajority(t *testing.T) {
 	if match1 >= index || match2 >= index {
 		t.Fatalf(
 			"entry unexpectedly replicated: matchIndex[1]=%d, matchIndex[2]=%d",
-			match1,
-			match2,
+			match1, match2,
 		)
 	}
 
-	// In a 3-node cluster, one node alone is NOT a majority.
 	if commitIndex != 0 {
 		t.Fatalf(
 			"leader committed without majority: commitIndex=%d",
@@ -925,23 +997,42 @@ func TestLeaderDoesNotCommitOldTermEntry(t *testing.T) {
 	applyCh1 := make(chan ApplyMsg, 10)
 	applyCh2 := make(chan ApplyMsg, 10)
 
-	node0 := NewRaftNode(0, 3, applyCh0, storage.NewMemEngine())
-	node1 := NewRaftNode(1, 3, applyCh1, storage.NewMemEngine())
-	node2 := NewRaftNode(2, 3, applyCh2, storage.NewMemEngine())
+	node0, err := NewRaftNode(
+		0, 3, applyCh0, NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
+	)
+	if err != nil {
+		t.Fatalf("failed to create node0: %v", err)
+	}
+	defer node0.Stop()
+
+	node1, err := NewRaftNode(
+		1, 3, applyCh1, NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
+	)
+	if err != nil {
+		t.Fatalf("failed to create node1: %v", err)
+	}
+	defer node1.Stop()
+
+	node2, err := NewRaftNode(
+		2, 3, applyCh2, NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
+	)
+	if err != nil {
+		t.Fatalf("failed to create node2: %v", err)
+	}
+	defer node2.Stop()
 
 	nodes := []*RaftNode{node0, node1, node2}
-
-	for i := range nodes {
-		nodes[i].SetPeers(nodes)
+	for _, node := range nodes {
+		node.SetPeers(nodes)
 	}
 
-	// Node 0 is the leader in term 2.
 	node0.mu.Lock()
 	node0.role = Leader
 	node0.currentTerm = 2
 
-	// Log:
-	// [dummy, old-term entry]
 	node0.log = append(node0.log, LogEntry{
 		Term: 1,
 		Command: Command{
@@ -951,40 +1042,37 @@ func TestLeaderDoesNotCommitOldTermEntry(t *testing.T) {
 		},
 	})
 
-	// The old-term entry is replicated on a majority:
-	// node0 + node1 = 2/3.
+	// The old-term entry is replicated on a majority.
 	node0.matchIndex[0] = 1
 	node0.matchIndex[1] = 1
 	node0.matchIndex[2] = 0
-
 	node0.commitIndex = 0
 	node0.mu.Unlock()
 
 	// Simulate the leader's commit calculation.
 	node0.mu.Lock()
 
-	for N := len(node0.log) - 1; N > node0.commitIndex; N-- {
-		if node0.log[N].Term == node0.currentTerm {
-			count := 1
+	for n := len(node0.log) - 1; n > node0.commitIndex; n-- {
+		if node0.log[n].Term != node0.currentTerm {
+			continue
+		}
 
-			for j := range nodes {
-				if j != node0.me && node0.matchIndex[j] >= N {
-					count++
-				}
+		count := 0
+		for j := range nodes {
+			if node0.matchIndex[j] >= n {
+				count++
 			}
+		}
 
-			if count > len(nodes)/2 {
-				node0.commitIndex = N
-				break
-			}
+		if count > len(nodes)/2 {
+			node0.commitIndex = n
+			break
 		}
 	}
 
 	commitIndex := node0.commitIndex
 	node0.mu.Unlock()
 
-	// The entry is from term 1, while the leader is in term 2.
-	// Therefore it must NOT be committed by this calculation.
 	if commitIndex != 0 {
 		t.Fatalf(
 			"old-term entry was incorrectly committed: commitIndex=%d",
@@ -994,12 +1082,17 @@ func TestLeaderDoesNotCommitOldTermEntry(t *testing.T) {
 }
 
 func TestCommitIndexNeverDecreases(t *testing.T) {
-	node := NewRaftNode(
+	node, err := NewRaftNode(
 		0,
 		3,
 		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create node: %v", err)
+	}
+	defer node.Stop()
 
 	node.mu.Lock()
 
@@ -1025,200 +1118,164 @@ func TestCommitIndexNeverDecreases(t *testing.T) {
 		},
 	)
 
-	// Simulate that index 2 is already committed.
 	node.commitIndex = 2
-
 	before := node.commitIndex
 
 	// Simulate a later commit calculation.
-	// No candidate N is allowed to be <= commitIndex.
-	for N := len(node.log) - 1; N > node.commitIndex; N-- {
-		if node.log[N].Term == node.currentTerm {
-			node.commitIndex = N
+	for n := len(node.log) - 1; n > node.commitIndex; n-- {
+		if node.log[n].Term == node.currentTerm {
+			node.commitIndex = n
 			break
 		}
 	}
 
 	after := node.commitIndex
-
 	node.mu.Unlock()
 
 	if after < before {
 		t.Fatalf(
 			"commitIndex moved backwards: before=%d, after=%d",
-			before,
-			after,
+			before, after,
 		)
 	}
 
 	if after != 2 {
-		t.Fatalf(
-			"expected commitIndex to remain 2, got %d",
-			after,
-		)
+		t.Fatalf("expected commitIndex to remain 2, got %d", after)
 	}
 }
 
 func TestLastAppliedNeverExceedsCommitIndex(t *testing.T) {
-	node := NewRaftNode(
-		0,
-		1,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	stateMachine := NewTestStateMachine(storage.NewMemEngine())
+
+	node, err := NewRaftNode(
+		0, 1, make(chan ApplyMsg, 10),
+		NewMemPersister(), stateMachine,
 	)
+	if err != nil {
+		t.Fatalf("failed to create Raft node: %v", err)
+	}
+	defer node.Stop()
 
 	node.mu.Lock()
-
 	node.log = append(node.log,
 		LogEntry{
 			Term: 1,
 			Command: Command{
-				Op:    "SET",
-				Key:   "x",
-				Value: "100",
+				Op: "SET", Key: "x", Value: "100",
 			},
 		},
 		LogEntry{
 			Term: 1,
 			Command: Command{
-				Op:    "SET",
-				Key:   "y",
-				Value: "200",
+				Op: "SET", Key: "y", Value: "200",
 			},
 		},
 	)
 
-	// Only the first entry is committed.
 	node.commitIndex = 1
-	node.lastApplied = 0
-
 	msgs := node.collectCommittedEntries()
 
-	// Verify only the committed entry was collected.
 	if len(msgs) != 1 {
 		node.mu.Unlock()
-		t.Fatalf(
-			"expected 1 ApplyMsg, got %d",
-			len(msgs),
-		)
+		t.Fatalf("expected 1 ApplyMsg, got %d", len(msgs))
 	}
 
-	if node.lastApplied > node.commitIndex {
-		node.mu.Unlock()
+	commitIndex := node.commitIndex
+	lastQueued := node.lastQueued
+	node.mu.Unlock()
+
+	lastApplied, err := stateMachine.LastApplied()
+	if err != nil {
+		t.Fatalf("failed to get last applied index: %v", err)
+	}
+
+	if lastApplied > commitIndex {
 		t.Fatalf(
 			"lastApplied exceeded commitIndex: lastApplied=%d, commitIndex=%d",
-			node.lastApplied,
-			node.commitIndex,
+			lastApplied, commitIndex,
 		)
 	}
 
-	if node.lastApplied != 0 {
-		node.mu.Unlock()
-		t.Fatalf(
-			"expected lastApplied=0 before application, got %d",
-			node.lastApplied,
-		)
+	if lastApplied != 0 {
+		t.Fatalf("expected lastApplied=0 before application, got %d", lastApplied)
 	}
 
-	if node.lastQueued != 1 {
-		node.mu.Unlock()
-		t.Fatalf(
-			"expected lastQueued=1, got %d",
-			node.lastQueued,
-		)
+	if lastQueued != 1 {
+		t.Fatalf("expected lastQueued=1, got %d", lastQueued)
 	}
-
-	node.mu.Unlock()
 }
 
 func TestLastAppliedNeverDecreases(t *testing.T) {
-	node := NewRaftNode(
-		0,
-		1,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	stateMachine := NewTestStateMachine(storage.NewMemEngine())
+
+	node, err := NewRaftNode(
+		0, 1, make(chan ApplyMsg, 10),
+		NewMemPersister(), stateMachine,
 	)
+	if err != nil {
+		t.Fatalf("failed to create Raft node: %v", err)
+	}
+	defer node.Stop()
 
 	node.mu.Lock()
-
 	node.log = append(node.log,
 		LogEntry{
-			Index: 1,
-			Term:  1,
+			Term: 1,
 			Command: Command{
-				Op:    "SET",
-				Key:   "x",
-				Value: "100",
+				Op: "SET", Key: "x", Value: "100",
 			},
 		},
 		LogEntry{
-			Index: 2,
-			Term:  1,
+			Term: 1,
 			Command: Command{
-				Op:    "SET",
-				Key:   "y",
-				Value: "200",
+				Op: "SET", Key: "y", Value: "200",
 			},
 		},
 	)
 
 	node.commitIndex = 2
 
-	// Collecting entries queues them; it does not apply them.
 	msgs := node.collectCommittedEntries()
-
 	if len(msgs) != 2 {
 		node.mu.Unlock()
 		t.Fatalf("expected 2 ApplyMsgs, got %d", len(msgs))
 	}
 
-	if node.lastApplied != 0 {
-		node.mu.Unlock()
-		t.Fatalf(
-			"expected lastApplied=0 before application, got %d",
-			node.lastApplied,
-		)
-	}
-
-	if node.lastQueued != 2 {
-		node.mu.Unlock()
-		t.Fatalf(
-			"expected lastQueued=2, got %d",
-			node.lastQueued,
-		)
-	}
+	lastQueued := node.lastQueued
 
 	// Collecting again must not queue the same entries twice.
 	msgs = node.collectCommittedEntries()
+	node.mu.Unlock()
 
 	if len(msgs) != 0 {
-		node.mu.Unlock()
 		t.Fatalf("expected no new ApplyMsgs, got %d", len(msgs))
 	}
 
-	if node.lastApplied != 0 {
-		node.mu.Unlock()
-		t.Fatalf(
-			"lastApplied changed before application: %d",
-			node.lastApplied,
-		)
+	lastApplied, err := stateMachine.LastApplied()
+	if err != nil {
+		t.Fatalf("failed to get last applied index: %v", err)
 	}
 
-	node.mu.Unlock()
+	if lastApplied != 0 {
+		t.Fatalf("expected lastApplied=0 before application, got %d", lastApplied)
+	}
+
+	if lastQueued != 2 {
+		t.Fatalf("expected lastQueued=2, got %d", lastQueued)
+	}
 }
 
 func TestWaitForApplyBlocksUntilApplied(t *testing.T) {
-	node := NewRaftNode(
-		0,
-		1,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
-	)
+	stateMachine := NewTestStateMachine(storage.NewMemEngine())
 
-	// The command at index 1 has not been applied yet.
-	node.mu.Lock()
-	node.lastApplied = 0
-	node.mu.Unlock()
+	node, err := NewRaftNode(
+		0, 1, make(chan ApplyMsg, 10),
+		NewMemPersister(), stateMachine,
+	)
+	if err != nil {
+		t.Fatalf("failed to create Raft node: %v", err)
+	}
+	defer node.Stop()
 
 	done := make(chan error, 1)
 
@@ -1226,81 +1283,87 @@ func TestWaitForApplyBlocksUntilApplied(t *testing.T) {
 		done <- node.waitForApply(1)
 	}()
 
-	// It must NOT return before index 1 is applied.
+	// It must not return before index 1 is applied.
 	select {
 	case err := <-done:
-		t.Fatalf(
-			"waitForApply returned before command was applied: %v",
-			err,
-		)
-
+		t.Fatalf("waitForApply returned before application: %v", err)
 	case <-time.After(100 * time.Millisecond):
 		// Expected: still waiting.
 	}
 
-	// Now simulate the state machine applying index 1.
+	// Simulate successful application.
 	node.notifyApplied(1, nil)
 
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf(
-				"expected successful application, got: %v",
-				err,
-			)
+			t.Fatalf("expected successful application, got: %v", err)
 		}
-
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("waitForApply did not return after notifyApplied")
 	}
 }
 
 func TestWaitForApplyTimeout(t *testing.T) {
-	node := NewRaftNode(
-		0,
-		1,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	stateMachine := NewTestStateMachine(storage.NewMemEngine())
+
+	node, err := NewRaftNode(
+		0, 1, make(chan ApplyMsg, 10),
+		NewMemPersister(), stateMachine,
 	)
+	if err != nil {
+		t.Fatalf("failed to create Raft node: %v", err)
+	}
+	defer node.Stop()
 
 	start := time.Now()
 
-	err := node.waitForApply(1)
+	err = node.waitForApply(1)
 
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, ErrTimeout) {
-		t.Fatalf(
-			"expected ErrTimeout, got %v",
-			err,
-		)
+		t.Fatalf("expected ErrTimeout, got %v", err)
 	}
 
 	if elapsed < 2*time.Second {
-		t.Fatalf(
-			"waitForApply returned too early: elapsed=%v",
-			elapsed,
-		)
+		t.Fatalf("waitForApply returned too early: elapsed=%v", elapsed)
 	}
 
+	// The timed-out result may remain registered because it can be
+	// shared by multiple goroutines waiting for the same index.
 	node.mu.Lock()
-	_, exists := node.applyWaiters[1]
+	result, exists := node.applyWaiters[1]
 	node.mu.Unlock()
 
-	if exists {
-		t.Fatal(
-			"timed-out waiter was not removed from applyWaiters",
-		)
+	if !exists {
+		t.Fatal("expected shared ApplyResult to remain registered until notification")
+	}
+
+	if result == nil {
+		t.Fatal("expected a non-nil ApplyResult")
+	}
+
+	select {
+	case <-result.Done:
+		t.Fatal("expected Done to remain open because index 1 was not applied")
+	default:
+		// Expected: no application notification has occurred.
 	}
 }
 
 func TestNotifyAppliedReleasesWaiter(t *testing.T) {
-	node := NewRaftNode(
+	node, err := NewRaftNode(
 		0,
 		1,
 		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create Raft node: %v", err)
+	}
+	defer node.Stop()
 
 	done := make(chan error, 1)
 
@@ -1327,7 +1390,6 @@ func TestNotifyAppliedReleasesWaiter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("expected nil error, got %v", err)
 		}
-
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("waitForApply did not return after notifyApplied")
 	}
@@ -1344,25 +1406,37 @@ func TestNotifyAppliedReleasesWaiter(t *testing.T) {
 
 func TestCommittedCommandReleasesClient(t *testing.T) {
 	applyChs := make([]chan ApplyMsg, 3)
-	engines := make([]storage.Engine, 3)
+	stateMachines := make([]StateMachine, 3)
 	nodes := make([]*RaftNode, 3)
 
-	// Create 3 nodes.
+	// Create 3 nodes with their own state machines.
 	for i := 0; i < 3; i++ {
 		applyChs[i] = make(chan ApplyMsg, 10)
-		engines[i] = storage.NewMemEngine()
+		engine := storage.NewMemEngine()
+		stateMachines[i] = NewTestStateMachine(engine)
 
-		nodes[i] = NewRaftNode(
+		node, err := NewRaftNode(
 			i,
 			3,
 			applyChs[i],
-			engines[i],
+			NewMemPersister(),
+			stateMachines[i],
 		)
+		if err != nil {
+			t.Fatalf("failed to create node %d: %v", i, err)
+		}
+		nodes[i] = node
 	}
 
+	defer func() {
+		for _, node := range nodes {
+			node.Stop()
+		}
+	}()
+
 	// Connect peers.
-	for i := 0; i < 3; i++ {
-		nodes[i].SetPeers(nodes)
+	for _, node := range nodes {
+		node.SetPeers(nodes)
 	}
 
 	// State-machine consumers.
@@ -1373,21 +1447,7 @@ func TestCommittedCommandReleasesClient(t *testing.T) {
 					continue
 				}
 
-				var err error
-
-				switch msg.Command.Op {
-				case "SET":
-					err = engines[i].Put(
-						[]byte(msg.Command.Key),
-						[]byte(msg.Command.Value),
-					)
-
-				case "DELETE":
-					err = engines[i].Delete(
-						[]byte(msg.Command.Key),
-					)
-				}
-
+				err := stateMachines[i].Apply(msg)
 				nodes[i].notifyApplied(msg.CommandIndex, err)
 			}
 		}(i)
@@ -1399,13 +1459,12 @@ func TestCommittedCommandReleasesClient(t *testing.T) {
 	leader.mu.Lock()
 	leader.role = Leader
 	leader.currentTerm = 1
-
 	leader.nextIndex[0] = len(leader.log)
 	leader.matchIndex[0] = 0
 	leader.mu.Unlock()
 
-	// Submit the client request in a goroutine because Put()
-	// should block until the command is committed and applied.
+	// Submit the client request asynchronously because Put()
+	// waits for the command to be applied.
 	done := make(chan error, 1)
 
 	go func() {
@@ -1415,18 +1474,15 @@ func TestCommittedCommandReleasesClient(t *testing.T) {
 
 	// Wait until the command appears in the leader's log.
 	var index int
-
-	deadline := time.Now().Add(1 * time.Second)
+	deadline := time.Now().Add(time.Second)
 
 	for time.Now().Before(deadline) {
 		leader.mu.Lock()
-
 		if len(leader.log) > 1 {
 			index = len(leader.log) - 1
 			leader.mu.Unlock()
 			break
 		}
-
 		leader.mu.Unlock()
 
 		time.Sleep(5 * time.Millisecond)
@@ -1438,39 +1494,32 @@ func TestCommittedCommandReleasesClient(t *testing.T) {
 
 	// Replicate the command to follower 1.
 	leader.mu.Lock()
-
 	args := AppendEntriesArgs{
 		Term:         leader.currentTerm,
 		LeaderID:     leader.me,
 		PrevLogIndex: index - 1,
 		PrevLogTerm:  leader.log[index-1].Term,
-		Entries: []LogEntry{
-			leader.log[index],
-		},
+		Entries:      []LogEntry{leader.log[index]},
 		LeaderCommit: 0,
 	}
-
 	leader.mu.Unlock()
 
 	var reply AppendEntriesReply
-
 	nodes[1].AppendEntries(&args, &reply)
 
 	if !reply.Success {
 		t.Fatal("follower should accept AppendEntries")
 	}
 
-	// Tell the leader that follower 1 replicated the entry.
+	// Record successful replication to follower 1.
 	leader.mu.Lock()
-
 	leader.matchIndex[1] = index
 	leader.nextIndex[1] = index + 1
 
-	// Leader + follower 1 = majority.
-	count := 1
-
+	// Leader + follower 1 form a majority.
+	count := 0
 	for i := range leader.peers {
-		if i != leader.me && leader.matchIndex[i] >= index {
+		if leader.matchIndex[i] >= index {
 			count++
 		}
 	}
@@ -1479,63 +1528,62 @@ func TestCommittedCommandReleasesClient(t *testing.T) {
 		leader.commitIndex = index
 	}
 
-	// Collect the newly committed entry.
 	msgs := leader.collectCommittedEntries()
-
 	leader.mu.Unlock()
 
-	// Deliver the committed entry to the state machine.
+	// Deliver the committed entry to the leader's state machine.
 	for _, msg := range msgs {
-		leader.applyCh <- msg
+		applyChs[0] <- msg
 	}
 
-	// Put() should now return successfully.
+	// Put() should return after successful application.
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatalf("Put() returned error: %v", err)
 		}
-
-	case <-time.After(1 * time.Second):
+	case <-time.After(time.Second):
 		t.Fatal("Put() did not return after command was committed and applied")
 	}
 
-	// Finally verify that the state machine actually contains the value.
-	value, found, err := engines[0].Get([]byte("city"))
-
+	value, found, err := stateMachines[0].Get([]byte("city"))
 	if err != nil {
 		t.Fatalf("failed to read state machine: %v", err)
 	}
-
 	if !found {
 		t.Fatal("expected committed key to exist in state machine")
 	}
-
 	if string(value) != "Delhi" {
-		t.Fatalf(
-			"expected value Delhi, got %s",
-			string(value),
-		)
+		t.Fatalf("expected value Delhi, got %s", string(value))
 	}
 }
 
 func TestLeaderStepsDownOnHigherTermAppendEntriesReply(t *testing.T) {
-	leader := NewRaftNode(
+	leader, err := NewRaftNode(
 		0,
 		2,
 		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create leader: %v", err)
+	}
+	defer leader.Stop()
 
-	follower := NewRaftNode(
+	follower, err := NewRaftNode(
 		1,
 		2,
 		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create follower: %v", err)
+	}
+	defer follower.Stop()
 
 	peers := []*RaftNode{leader, follower}
-
 	leader.SetPeers(peers)
 	follower.SetPeers(peers)
 
@@ -1555,7 +1603,6 @@ func TestLeaderStepsDownOnHigherTermAppendEntriesReply(t *testing.T) {
 
 	leader.nextIndex[1] = 1
 	leader.matchIndex[0] = 1
-
 	leader.mu.Unlock()
 
 	// Follower is already in a newer term.
@@ -1563,20 +1610,18 @@ func TestLeaderStepsDownOnHigherTermAppendEntriesReply(t *testing.T) {
 	follower.currentTerm = 2
 	follower.mu.Unlock()
 
-	// This will cause the follower to reject the old-term
-	// AppendEntries and return its higher term.
+	// The follower should reject the old-term AppendEntries
+	// and return its higher term.
 	leader.broadcastAppendEntries()
 
-	// Wait for the RPC goroutine to process the reply.
-	deadline := time.Now().Add(1 * time.Second)
+	// Wait for the reply-processing goroutine.
+	deadline := time.Now().Add(time.Second)
 
 	for time.Now().Before(deadline) {
 		leader.mu.Lock()
-
 		role := leader.role
 		term := leader.currentTerm
 		commitIndex := leader.commitIndex
-
 		leader.mu.Unlock()
 
 		if role == Follower && term == 2 {
@@ -1586,7 +1631,6 @@ func TestLeaderStepsDownOnHigherTermAppendEntriesReply(t *testing.T) {
 					commitIndex,
 				)
 			}
-
 			return
 		}
 
@@ -1597,106 +1641,96 @@ func TestLeaderStepsDownOnHigherTermAppendEntriesReply(t *testing.T) {
 }
 
 func TestHeartbeatPreventsStaleElection(t *testing.T) {
-	leader := NewRaftNode(
-		0,
-		2,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	leader, err := NewRaftNode(
+		0, 2, make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create leader: %v", err)
+	}
+	defer leader.Stop()
 
-	follower := NewRaftNode(
-		1,
-		2,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	follower, err := NewRaftNode(
+		1, 2, make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create follower: %v", err)
+	}
+	defer follower.Stop()
 
 	peers := []*RaftNode{leader, follower}
-
 	leader.SetPeers(peers)
 	follower.SetPeers(peers)
 
-	// Leader is in term 1.
 	leader.mu.Lock()
 	leader.role = Leader
 	leader.currentTerm = 1
 	leader.mu.Unlock()
 
-	// Follower is also in term 1.
 	follower.mu.Lock()
 	follower.currentTerm = 1
 	follower.role = Follower
-
-	// Make the follower appear to be close to timing out.
 	follower.electionTimeout = 200 * time.Millisecond
 	follower.lastResetTime = time.Now().Add(-190 * time.Millisecond)
-
+	prevLogTerm := follower.log[0].Term
 	follower.mu.Unlock()
 
-	// Send a valid heartbeat from the leader.
 	args := AppendEntriesArgs{
 		Term:         1,
 		LeaderID:     0,
 		PrevLogIndex: 0,
-		PrevLogTerm:  follower.log[0].Term,
+		PrevLogTerm:  prevLogTerm,
 		Entries:      nil,
 		LeaderCommit: 0,
 	}
 
 	var reply AppendEntriesReply
-
 	follower.AppendEntries(&args, &reply)
 
 	if !reply.Success {
 		t.Fatal("follower should accept valid heartbeat")
 	}
 
-	// Verify that the heartbeat reset the election timer.
 	follower.mu.Lock()
-
 	elapsed := time.Since(follower.lastResetTime)
+	timeout := follower.electionTimeout
 	role := follower.role
-
 	follower.mu.Unlock()
 
 	if role != Follower {
-		t.Fatalf(
-			"follower changed role after valid heartbeat: %v",
-			role,
-		)
+		t.Fatalf("follower changed role after heartbeat: %v", role)
 	}
 
-	if elapsed >= follower.electionTimeout {
+	if elapsed >= timeout {
 		t.Fatalf(
 			"heartbeat did not reset election timer: elapsed=%v timeout=%v",
-			elapsed,
-			follower.electionTimeout,
+			elapsed, timeout,
 		)
 	}
 }
 
 func TestStaleRequestVoteDoesNotResetElectionTimer(t *testing.T) {
-	node := NewRaftNode(
-		0,
-		2,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	node, err := NewRaftNode(
+		0, 2, make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create node: %v", err)
+	}
+	defer node.Stop()
 
 	node.mu.Lock()
-
 	node.currentTerm = 3
 	node.role = Follower
 	node.electionTimeout = 200 * time.Millisecond
-
-	// Make the timer appear close to expiring.
 	node.lastResetTime = time.Now().Add(-190 * time.Millisecond)
-
 	before := node.lastResetTime
-
 	node.mu.Unlock()
 
-	// Candidate is behind the follower's current term.
 	args := RequestVoteArgs{
 		Term:         2,
 		CandidateID:  1,
@@ -1705,65 +1739,51 @@ func TestStaleRequestVoteDoesNotResetElectionTimer(t *testing.T) {
 	}
 
 	var reply RequestVoteReply
-
 	node.RequestVote(&args, &reply)
 
 	node.mu.Lock()
-
 	after := node.lastResetTime
 	role := node.role
 	term := node.currentTerm
-
 	node.mu.Unlock()
 
-	// The stale request must be rejected.
 	if reply.VoteGranted {
 		t.Fatal("stale RequestVote should not be granted")
 	}
 
-	// The node must remain in its current term.
 	if term != 3 {
-		t.Fatalf(
-			"currentTerm changed after stale RequestVote: got %d",
-			term,
-		)
+		t.Fatalf("currentTerm changed after stale RequestVote: got %d", term)
 	}
 
-	// The node must remain a follower.
 	if role != Follower {
-		t.Fatalf(
-			"role changed after stale RequestVote: got %v",
-			role,
-		)
+		t.Fatalf("role changed after stale RequestVote: got %v", role)
 	}
 
-	// Most importantly, the stale request must NOT reset the timer.
 	if !after.Equal(before) {
 		t.Fatalf(
-			"stale RequestVote incorrectly reset election timer: before=%v after=%v",
-			before,
-			after,
+			"stale RequestVote reset election timer: before=%v after=%v",
+			before, after,
 		)
 	}
 }
 
 func TestHigherTermRequestVoteUpdatesTermAndStepsDown(t *testing.T) {
-	node := NewRaftNode(
-		0,
-		2,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	node, err := NewRaftNode(
+		0, 2, make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create node: %v", err)
+	}
+	defer node.Stop()
 
 	node.mu.Lock()
-
 	node.currentTerm = 3
 	node.role = Candidate
 	node.votedFor = 0
-
 	node.mu.Unlock()
 
-	// Candidate is requesting a vote from a higher term.
 	args := RequestVoteArgs{
 		Term:         4,
 		CandidateID:  1,
@@ -1772,62 +1792,45 @@ func TestHigherTermRequestVoteUpdatesTermAndStepsDown(t *testing.T) {
 	}
 
 	var reply RequestVoteReply
-
 	node.RequestVote(&args, &reply)
 
 	node.mu.Lock()
-
 	term := node.currentTerm
 	role := node.role
 	votedFor := node.votedFor
-
 	node.mu.Unlock()
 
-	// The node must move to the higher term.
 	if term != 4 {
-		t.Fatalf(
-			"expected currentTerm=4, got %d",
-			term,
-		)
+		t.Fatalf("expected currentTerm=4, got %d", term)
 	}
 
-	// A node receiving a higher-term RPC must become a follower.
 	if role != Follower {
-		t.Fatalf(
-			"expected node to become Follower, got %v",
-			role,
-		)
+		t.Fatalf("expected Follower, got %v", role)
 	}
 
-	// The previous vote from term 3 must no longer apply.
 	if votedFor != 1 {
-		t.Fatalf(
-			"expected vote for candidate 1, got %d",
-			votedFor,
-		)
+		t.Fatalf("expected vote for candidate 1, got %d", votedFor)
 	}
 
-	// Candidate's log is up-to-date, so the vote should be granted.
 	if !reply.VoteGranted {
 		t.Fatal("expected vote to be granted in the higher term")
 	}
 
-	// Reply must contain the node's updated term.
 	if reply.Term != 4 {
-		t.Fatalf(
-			"expected reply term=4, got %d",
-			reply.Term,
-		)
+		t.Fatalf("expected reply term=4, got %d", reply.Term)
 	}
 }
 
 func TestNodeVotesForOnlyOneCandidatePerTerm(t *testing.T) {
-	node := NewRaftNode(
-		0,
-		3,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	node, err := NewRaftNode(
+		0, 3, make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create node: %v", err)
+	}
+	defer node.Stop()
 
 	node.mu.Lock()
 	node.currentTerm = 5
@@ -1835,7 +1838,6 @@ func TestNodeVotesForOnlyOneCandidatePerTerm(t *testing.T) {
 	node.votedFor = -1
 	node.mu.Unlock()
 
-	// Candidate 1 requests a vote in term 5.
 	firstRequest := RequestVoteArgs{
 		Term:         5,
 		CandidateID:  1,
@@ -1850,7 +1852,6 @@ func TestNodeVotesForOnlyOneCandidatePerTerm(t *testing.T) {
 		t.Fatal("expected first candidate to receive the vote")
 	}
 
-	// Candidate 2 requests a vote in the SAME term.
 	secondRequest := RequestVoteArgs{
 		Term:         5,
 		CandidateID:  2,
@@ -1862,7 +1863,7 @@ func TestNodeVotesForOnlyOneCandidatePerTerm(t *testing.T) {
 	node.RequestVote(&secondRequest, &secondReply)
 
 	if secondReply.VoteGranted {
-		t.Fatal("node granted votes to two different candidates in the same term")
+		t.Fatal("node granted votes to two candidates in the same term")
 	}
 
 	node.mu.Lock()
@@ -1871,39 +1872,40 @@ func TestNodeVotesForOnlyOneCandidatePerTerm(t *testing.T) {
 	node.mu.Unlock()
 
 	if votedFor != 1 {
-		t.Fatalf(
-			"expected node to remember vote for candidate 1, got %d",
-			votedFor,
-		)
+		t.Fatalf("expected vote for candidate 1, got %d", votedFor)
 	}
 
 	if currentTerm != 5 {
-		t.Fatalf(
-			"currentTerm changed unexpectedly: got %d",
-			currentTerm,
-		)
+		t.Fatalf("currentTerm changed unexpectedly: got %d", currentTerm)
 	}
 }
 
 func TestCandidateBecomesLeaderAfterMajorityVotes(t *testing.T) {
 	nodes := make([]*RaftNode, 3)
 
-	for i := 0; i < 3; i++ {
-		nodes[i] = NewRaftNode(
-			i,
-			3,
-			make(chan ApplyMsg, 10),
-			storage.NewMemEngine(),
-		)
-	}
-
 	for i := range nodes {
-		nodes[i].SetPeers(nodes)
+		node, err := NewRaftNode(
+			i, 3, make(chan ApplyMsg, 10),
+			NewMemPersister(),
+			NewTestStateMachine(storage.NewMemEngine()),
+		)
+		if err != nil {
+			t.Fatalf("failed to create node %d: %v", i, err)
+		}
+		nodes[i] = node
+	}
+	defer func() {
+		for _, node := range nodes {
+			node.Stop()
+		}
+	}()
+
+	for _, node := range nodes {
+		node.SetPeers(nodes)
 	}
 
 	candidate := nodes[0]
 
-	// Candidate starts election in term 1.
 	candidate.mu.Lock()
 	candidate.role = Candidate
 	candidate.currentTerm = 1
@@ -1914,13 +1916,10 @@ func TestCandidateBecomesLeaderAfterMajorityVotes(t *testing.T) {
 	me := candidate.me
 	lastLogIndex := len(candidate.log) - 1
 	lastLogTerm := candidate.log[lastLogIndex].Term
-
 	candidate.mu.Unlock()
 
-	// Candidate already has its own vote.
-	votesReceived := 1
+	votesReceived := 1 // Candidate's own vote.
 
-	// Ask node 1 for a vote.
 	args := RequestVoteArgs{
 		Term:         term,
 		CandidateID:  me,
@@ -1937,13 +1936,11 @@ func TestCandidateBecomesLeaderAfterMajorityVotes(t *testing.T) {
 
 	votesReceived++
 
-	// In a 3-node cluster, 2 votes are a majority.
 	if votesReceived <= len(nodes)/2 {
 		t.Fatal("expected majority after receiving second vote")
 	}
 
-	// Simulate the same transition performed by startElection()
-	// once it observes the majority.
+	// Simulate the transition after a majority is received.
 	candidate.mu.Lock()
 
 	if candidate.role == Candidate &&
@@ -1959,97 +1956,74 @@ func TestCandidateBecomesLeaderAfterMajorityVotes(t *testing.T) {
 	}
 
 	role := candidate.role
-
 	candidate.mu.Unlock()
 
 	if role != Leader {
-		t.Fatalf(
-			"candidate should become leader after majority, got %v",
-			role,
-		)
+		t.Fatalf("candidate should become leader after majority, got %v", role)
 	}
 }
 
 func TestLeaderDecrementsNextIndexAndRepairsFollower(t *testing.T) {
-	leader := NewRaftNode(
-		0, 2,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	leader, err := NewRaftNode(
+		0, 2, make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create leader: %v", err)
+	}
+	defer leader.Stop()
 
-	follower := NewRaftNode(
-		1, 2,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	follower, err := NewRaftNode(
+		1, 2, make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create follower: %v", err)
+	}
+	defer follower.Stop()
 
 	peers := []*RaftNode{leader, follower}
 	leader.SetPeers(peers)
 	follower.SetPeers(peers)
 
-	// Leader:
-	// [dummy, A(term=1), B(term=2)]
+	// Leader: [dummy, A(term=1), B(term=2)]
 	leader.mu.Lock()
 	leader.role = Leader
 	leader.currentTerm = 2
-
 	leader.log = append(leader.log,
 		LogEntry{
-			Term: 1,
-			Command: Command{
-				Op:    "SET",
-				Key:   "x",
-				Value: "A",
-			},
+			Term:    1,
+			Command: Command{Op: "SET", Key: "x", Value: "A"},
 		},
 		LogEntry{
-			Term: 2,
-			Command: Command{
-				Op:    "SET",
-				Key:   "x",
-				Value: "B",
-			},
+			Term:    2,
+			Command: Command{Op: "SET", Key: "x", Value: "B"},
 		},
 	)
-
 	leader.nextIndex[1] = 3
 	leader.matchIndex[0] = 2
 	leader.mu.Unlock()
 
-	// Follower:
-	// [dummy, A(term=1), X(term=1)]
+	// Follower: [dummy, A(term=1), X(term=1)]
 	follower.mu.Lock()
 	follower.currentTerm = 2
-
 	follower.log = append(follower.log,
 		LogEntry{
-			Term: 1,
-			Command: Command{
-				Op:    "SET",
-				Key:   "x",
-				Value: "A",
-			},
+			Term:    1,
+			Command: Command{Op: "SET", Key: "x", Value: "A"},
 		},
 		LogEntry{
-			Term: 1,
-			Command: Command{
-				Op:    "SET",
-				Key:   "x",
-				Value: "X",
-			},
+			Term:    1,
+			Command: Command{Op: "SET", Key: "x", Value: "X"},
 		},
 	)
 	follower.mu.Unlock()
 
-	// First attempt should fail:
-	// prevLogIndex = 2
-	// leader term at index 2 = 2
-	// follower term at index 2 = 1
 	leader.broadcastAppendEntries()
 
-	// Wait for the failed RPC to decrement nextIndex.
-	deadline := time.Now().Add(1 * time.Second)
-
+	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		leader.mu.Lock()
 		nextIndex := leader.nextIndex[1]
@@ -2058,41 +2032,31 @@ func TestLeaderDecrementsNextIndexAndRepairsFollower(t *testing.T) {
 		if nextIndex == 2 {
 			break
 		}
-
 		time.Sleep(10 * time.Millisecond)
 	}
 
 	leader.mu.Lock()
-
-	if leader.nextIndex[1] != 2 {
-		t.Fatalf(
-			"expected nextIndex[1] to decrease to 2, got %d",
-			leader.nextIndex[1],
-		)
-	}
-
+	nextIndex := leader.nextIndex[1]
 	leader.mu.Unlock()
 
-	// Retry using the decremented nextIndex.
+	if nextIndex != 2 {
+		t.Fatalf("expected nextIndex[1] to decrease to 2, got %d", nextIndex)
+	}
+
+	// Retry with the decremented nextIndex.
 	leader.broadcastAppendEntries()
 
-	// Wait for follower to be repaired.
-	deadline = time.Now().Add(1 * time.Second)
-
+	deadline = time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		follower.mu.Lock()
-
-		repaired :=
-			len(follower.log) == 3 &&
-				follower.log[2].Term == 2 &&
-				follower.log[2].Command.Value == "B"
-
+		repaired := len(follower.log) == 3 &&
+			follower.log[2].Term == 2 &&
+			follower.log[2].Command.Value == "B"
 		follower.mu.Unlock()
 
 		if repaired {
 			break
 		}
-
 		time.Sleep(10 * time.Millisecond)
 	}
 
@@ -2100,80 +2064,65 @@ func TestLeaderDecrementsNextIndexAndRepairsFollower(t *testing.T) {
 	defer follower.mu.Unlock()
 
 	if len(follower.log) != 3 {
-		t.Fatalf(
-			"expected follower log length 3, got %d",
-			len(follower.log),
-		)
+		t.Fatalf("expected follower log length 3, got %d", len(follower.log))
 	}
-
 	if follower.log[2].Term != 2 {
-		t.Fatalf(
-			"expected index 2 term 2, got %d",
-			follower.log[2].Term,
-		)
+		t.Fatalf("expected index 2 term 2, got %d", follower.log[2].Term)
 	}
-
 	if follower.log[2].Command.Value != "B" {
-		t.Fatalf(
-			"expected index 2 value B, got %q",
-			follower.log[2].Command.Value,
-		)
+		t.Fatalf("expected index 2 value B, got %q", follower.log[2].Command.Value)
 	}
 }
 
 func TestLeaderUpdatesMatchAndNextIndexAfterReplication(t *testing.T) {
-	leader := NewRaftNode(
-		0, 2,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	leader, err := NewRaftNode(
+		0, 2, make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create leader: %v", err)
+	}
+	defer leader.Stop()
 
-	follower := NewRaftNode(
-		1, 2,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	follower, err := NewRaftNode(
+		1, 2, make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create follower: %v", err)
+	}
+	defer follower.Stop()
 
 	peers := []*RaftNode{leader, follower}
 	leader.SetPeers(peers)
 	follower.SetPeers(peers)
 
-	// Leader:
-	// [dummy, A(term=1)]
+	// Leader: [dummy, A(term=1)]
 	leader.mu.Lock()
 	leader.role = Leader
 	leader.currentTerm = 1
-
 	leader.log = append(leader.log, LogEntry{
-		Term: 1,
-		Command: Command{
-			Op:    "SET",
-			Key:   "x",
-			Value: "10",
-		},
+		Term:    1,
+		Command: Command{Op: "SET", Key: "x", Value: "10"},
 	})
-
 	leader.nextIndex[1] = 1
 	leader.matchIndex[0] = 1
 	leader.mu.Unlock()
 
 	leader.broadcastAppendEntries()
 
-	// Wait for replication to finish.
-	deadline := time.Now().Add(1 * time.Second)
-
+	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		leader.mu.Lock()
-
 		matchIndex := leader.matchIndex[1]
 		nextIndex := leader.nextIndex[1]
-
 		leader.mu.Unlock()
 
 		if matchIndex == 1 && nextIndex == 2 {
 			break
 		}
-
 		time.Sleep(10 * time.Millisecond)
 	}
 
@@ -2181,61 +2130,53 @@ func TestLeaderUpdatesMatchAndNextIndexAfterReplication(t *testing.T) {
 	defer leader.mu.Unlock()
 
 	if leader.matchIndex[1] != 1 {
-		t.Fatalf(
-			"expected matchIndex[1] = 1, got %d",
-			leader.matchIndex[1],
-		)
+		t.Fatalf("expected matchIndex[1] = 1, got %d", leader.matchIndex[1])
 	}
-
 	if leader.nextIndex[1] != 2 {
-		t.Fatalf(
-			"expected nextIndex[1] = 2, got %d",
-			leader.nextIndex[1],
-		)
+		t.Fatalf("expected nextIndex[1] = 2, got %d", leader.nextIndex[1])
 	}
 }
 
 func TestFollowerAdvancesCommitIndexFromLeaderCommit(t *testing.T) {
-	leader := NewRaftNode(
-		0, 2,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	leader, err := NewRaftNode(
+		0, 2, make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create leader: %v", err)
+	}
+	defer leader.Stop()
 
-	follower := NewRaftNode(
-		1, 2,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	followerSM := NewTestStateMachine(storage.NewMemEngine())
+	followerApplyCh := make(chan ApplyMsg, 10)
+
+	follower, err := NewRaftNode(
+		1, 2, followerApplyCh,
+		NewMemPersister(), followerSM,
 	)
+	if err != nil {
+		t.Fatalf("failed to create follower: %v", err)
+	}
+	defer follower.Stop()
 
 	peers := []*RaftNode{leader, follower}
 	leader.SetPeers(peers)
 	follower.SetPeers(peers)
 
-	// Both nodes have the same committed entry.
 	leader.mu.Lock()
 	leader.currentTerm = 1
-
 	leader.log = append(leader.log, LogEntry{
-		Term: 1,
-		Command: Command{
-			Op:    "SET",
-			Key:   "x",
-			Value: "10",
-		},
+		Term:    1,
+		Command: Command{Op: "SET", Key: "x", Value: "10"},
 	})
 	leader.mu.Unlock()
 
 	follower.mu.Lock()
 	follower.currentTerm = 1
-
 	follower.log = append(follower.log, LogEntry{
-		Term: 1,
-		Command: Command{
-			Op:    "SET",
-			Key:   "x",
-			Value: "10",
-		},
+		Term:    1,
+		Command: Command{Op: "SET", Key: "x", Value: "10"},
 	})
 	follower.mu.Unlock()
 
@@ -2249,65 +2190,60 @@ func TestFollowerAdvancesCommitIndexFromLeaderCommit(t *testing.T) {
 	}
 
 	var reply AppendEntriesReply
-
 	follower.AppendEntries(&args, &reply)
 
 	if !reply.Success {
 		t.Fatal("follower should accept valid AppendEntries")
 	}
-	msg := <-follower.applyCh
-	if err := follower.applyMessage(msg); err != nil {
-		t.Fatalf("apply committed entry: %v", err)
-	}
-	follower.mu.Lock()
-	defer follower.mu.Unlock()
 
-	if follower.commitIndex != 1 {
-		t.Fatalf(
-			"expected follower commitIndex = 1, got %d",
-			follower.commitIndex,
-		)
+	// Apply the committed message through the StateMachine interface.
+	select {
+	case msg := <-followerApplyCh:
+		if err := followerSM.Apply(msg); err != nil {
+			t.Fatalf("apply committed entry: %v", err)
+		}
+		follower.notifyApplied(msg.CommandIndex, nil)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for committed ApplyMsg")
 	}
-	value, found, err := follower.Engine.Get([]byte("x"))
+
+	follower.mu.Lock()
+	commitIndex := follower.commitIndex
+	follower.mu.Unlock()
+
+	if commitIndex != 1 {
+		t.Fatalf("expected follower commitIndex = 1, got %d", commitIndex)
+	}
+
+	value, found, err := followerSM.Get([]byte("x"))
 	if err != nil {
 		t.Fatalf("get committed value: %v", err)
 	}
 	if !found || string(value) != "10" {
-		t.Fatalf(
-			"follower state = (%q, %v), want (%q, true)",
-			string(value), found, "10",
-		)
+		t.Fatalf("follower state = (%q, %v), want (%q, true)",
+			string(value), found, "10")
 	}
 }
 
 func TestFollowerDoesNotCommitBeyondItsLog(t *testing.T) {
-	leader := NewRaftNode(
-		0, 2,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
-	)
+	followerSM := NewTestStateMachine(storage.NewMemEngine())
 
-	follower := NewRaftNode(
-		1, 2,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	follower, err := NewRaftNode(
+		1, 2, make(chan ApplyMsg, 10),
+		NewMemPersister(), followerSM,
 	)
-
-	peers := []*RaftNode{leader, follower}
-	leader.SetPeers(peers)
-	follower.SetPeers(peers)
+	if err != nil {
+		t.Fatalf("failed to create follower: %v", err)
+	}
+	defer follower.Stop()
 
 	follower.mu.Lock()
 	follower.currentTerm = 1
 
-	// Follower has only one real entry.
+	// Follower has one real entry at index 1.
 	follower.log = append(follower.log, LogEntry{
-		Term: 1,
-		Command: Command{
-			Op:    "SET",
-			Key:   "x",
-			Value: "10",
-		},
+		Term:    1,
+		Command: Command{Op: "SET", Key: "x", Value: "10"},
 	})
 	follower.mu.Unlock()
 
@@ -2317,51 +2253,89 @@ func TestFollowerDoesNotCommitBeyondItsLog(t *testing.T) {
 		PrevLogIndex: 0,
 		PrevLogTerm:  0,
 		Entries:      nil,
-
-		// Leader claims that index 5 is committed,
-		// but follower only has index 1.
 		LeaderCommit: 5,
 	}
 
 	var reply AppendEntriesReply
-
 	follower.AppendEntries(&args, &reply)
 
 	if !reply.Success {
-		t.Fatal("follower should accept heartbeat")
+		t.Fatal("follower should accept valid heartbeat")
 	}
 
 	follower.mu.Lock()
 	defer follower.mu.Unlock()
 
-	if follower.commitIndex != 1 {
-		t.Fatalf(
-			"expected commitIndex = 1, got %d",
-			follower.commitIndex,
-		)
+	expectedCommitIndex := len(follower.log) - 1
+	if follower.commitIndex != expectedCommitIndex {
+		t.Fatalf("expected commitIndex = %d, got %d",
+			expectedCommitIndex, follower.commitIndex)
 	}
 
 	if follower.commitIndex >= len(follower.log) {
-		t.Fatalf(
-			"commitIndex %d exceeds last log index %d",
-			follower.commitIndex,
-			len(follower.log)-1,
-		)
+		t.Fatalf("commitIndex %d exceeds last log index %d",
+			follower.commitIndex, len(follower.log)-1)
+	}
+}
+
+func TestFollowerAcceptsHeartbeatWhenLeaderCommitExceedsLog(t *testing.T) {
+	follower, err := NewRaftNode(
+		1, 2, make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
+	)
+	if err != nil {
+		t.Fatalf("failed to create follower: %v", err)
+	}
+	defer follower.Stop()
+
+	follower.mu.Lock()
+	follower.currentTerm = 1
+	follower.role = Follower
+	follower.mu.Unlock()
+
+	args := AppendEntriesArgs{
+		Term:         1,
+		LeaderID:     0,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		Entries:      nil,
+		LeaderCommit: 5,
+	}
+
+	var reply AppendEntriesReply
+	follower.AppendEntries(&args, &reply)
+
+	if !reply.Success {
+		t.Fatal("follower should accept a valid heartbeat")
+	}
+
+	follower.mu.Lock()
+	commitIndex := follower.commitIndex
+	lastLogIndex := len(follower.log) - 1
+	follower.mu.Unlock()
+
+	if commitIndex > lastLogIndex {
+		t.Fatalf("commitIndex %d exceeds last log index %d",
+			commitIndex, lastLogIndex)
 	}
 }
 
 func TestReadProbeCurrentTerm(t *testing.T) {
-	node := NewRaftNode(
-		0,
-		1,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	node, err := NewRaftNode(
+		0, 1, make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create node: %v", err)
+	}
+	defer node.Stop()
 
 	node.mu.Lock()
 	node.currentTerm = 5
 	node.role = Follower
-	node.lastResetTime = time.Now().Add(-1 * time.Second)
+	node.lastResetTime = time.Now().Add(-time.Second)
 	oldReset := node.lastResetTime
 	node.mu.Unlock()
 
@@ -2379,23 +2353,24 @@ func TestReadProbeCurrentTerm(t *testing.T) {
 	if reply.Term != 5 {
 		t.Fatalf("expected reply term 5, got %d", reply.Term)
 	}
-
 	if node.role != Follower {
 		t.Fatalf("expected follower, got %v", node.role)
 	}
-
 	if !node.lastResetTime.After(oldReset) {
-		t.Fatalf("expected election timer to reset")
+		t.Fatal("expected election timer to reset")
 	}
 }
 
 func TestReadProbeHigherTerm(t *testing.T) {
-	node := NewRaftNode(
-		0,
-		1,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	node, err := NewRaftNode(
+		0, 1, make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create node: %v", err)
+	}
+	defer node.Stop()
 
 	node.mu.Lock()
 	node.currentTerm = 3
@@ -2417,27 +2392,27 @@ func TestReadProbeHigherTerm(t *testing.T) {
 	if node.currentTerm != 5 {
 		t.Fatalf("expected term 5, got %d", node.currentTerm)
 	}
-
 	if node.role != Follower {
 		t.Fatalf("expected follower, got %v", node.role)
 	}
-
 	if node.votedFor != -1 {
-		t.Fatalf("expected votedFor to be reset, got %d", node.votedFor)
+		t.Fatalf("expected votedFor to reset to -1, got %d", node.votedFor)
 	}
-
 	if reply.Term != 5 {
 		t.Fatalf("expected reply term 5, got %d", reply.Term)
 	}
 }
 
 func TestReadProbeStaleTerm(t *testing.T) {
-	node := NewRaftNode(
-		0,
-		1,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	node, err := NewRaftNode(
+		0, 1, make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create node: %v", err)
+	}
+	defer node.Stop()
 
 	node.mu.Lock()
 	node.currentTerm = 5
@@ -2461,11 +2436,9 @@ func TestReadProbeStaleTerm(t *testing.T) {
 	if reply.Term != 5 {
 		t.Fatalf("expected reply term 5, got %d", reply.Term)
 	}
-
 	if node.currentTerm != 5 {
 		t.Fatalf("expected term to remain 5, got %d", node.currentTerm)
 	}
-
 	if !node.lastResetTime.Equal(before) {
 		t.Fatal("stale probe should not reset election timer")
 	}
@@ -2473,55 +2446,70 @@ func TestReadProbeStaleTerm(t *testing.T) {
 
 func TestReadIndexMajority(t *testing.T) {
 	nodes := make([]*RaftNode, 3)
-	for i := 0; i < 3; i++ {
-		nodes[i] = NewRaftNode(
-			i,
-			3,
-			make(chan ApplyMsg, 10),
-			storage.NewMemEngine(),
+
+	for i := range nodes {
+		node, err := NewRaftNode(
+			i, 3, make(chan ApplyMsg, 10),
+			NewMemPersister(),
+			NewTestStateMachine(storage.NewMemEngine()),
 		)
+		if err != nil {
+			t.Fatalf("failed to create node %d: %v", i, err)
+		}
+		nodes[i] = node
 	}
+	defer func() {
+		for _, node := range nodes {
+			node.Stop()
+		}
+	}()
 
 	for i := range nodes {
 		nodes[i].SetPeers(nodes)
 	}
 
-	nodes[0].mu.Lock()
-	nodes[0].role = Leader
-	nodes[0].currentTerm = 5
+	leader := nodes[0]
+
+	leader.mu.Lock()
+	leader.role = Leader
+	leader.currentTerm = 5
+
 	// Build a log containing a committed NOOP from the current term.
-	nodes[0].log = make([]LogEntry, 8)
-	nodes[0].log[7] = LogEntry{
+	leader.log = make([]LogEntry, 8)
+	leader.log[7] = LogEntry{
 		Index: 7,
 		Term:  5,
 		Command: Command{
 			Op: "NOOP",
 		},
 	}
-	nodes[0].commitIndex = 7
-	nodes[0].mu.Unlock()
+	leader.commitIndex = 7
+	leader.mu.Unlock()
 
-	readIndex, err := nodes[0].readIndex()
+	readIndex, err := leader.readIndex()
 	if err != nil {
 		t.Fatalf("readIndex failed: %v", err)
 	}
-
 	if readIndex != 7 {
 		t.Fatalf("expected readIndex 7, got %d", readIndex)
 	}
 }
 
 func TestReadIndexSingleNode(t *testing.T) {
-	node := NewRaftNode(
-		0,
-		1,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	node, err := NewRaftNode(
+		0, 1, make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create node: %v", err)
+	}
+	defer node.Stop()
 
 	node.mu.Lock()
 	node.role = Leader
 	node.currentTerm = 3
+
 	node.log = node.log[:1]
 	node.log = append(node.log,
 		LogEntry{
@@ -2543,7 +2531,6 @@ func TestReadIndexSingleNode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readIndex failed: %v", err)
 	}
-
 	if readIndex != 5 {
 		t.Fatalf("expected readIndex 5, got %d", readIndex)
 	}
@@ -2552,14 +2539,22 @@ func TestReadIndexSingleNode(t *testing.T) {
 func TestReadIndexHigherTermStepsDown(t *testing.T) {
 	nodes := make([]*RaftNode, 2)
 
-	for i := 0; i < 2; i++ {
-		nodes[i] = NewRaftNode(
-			i,
-			2,
-			make(chan ApplyMsg, 10),
-			storage.NewMemEngine(),
+	for i := range nodes {
+		node, err := NewRaftNode(
+			i, 2, make(chan ApplyMsg, 10),
+			NewMemPersister(),
+			NewTestStateMachine(storage.NewMemEngine()),
 		)
+		if err != nil {
+			t.Fatalf("failed to create node %d: %v", i, err)
+		}
+		nodes[i] = node
 	}
+	defer func() {
+		for _, node := range nodes {
+			node.Stop()
+		}
+	}()
 
 	for i := range nodes {
 		nodes[i].SetPeers(nodes)
@@ -2576,7 +2571,6 @@ func TestReadIndexHigherTermStepsDown(t *testing.T) {
 	nodes[1].mu.Unlock()
 
 	_, err := nodes[0].readIndex()
-
 	if err != ErrWrongLeader {
 		t.Fatalf("expected ErrWrongLeader, got %v", err)
 	}
@@ -2587,19 +2581,22 @@ func TestReadIndexHigherTermStepsDown(t *testing.T) {
 	if nodes[0].currentTerm != 6 {
 		t.Fatalf("expected term 6, got %d", nodes[0].currentTerm)
 	}
-
 	if nodes[0].role != Follower {
 		t.Fatalf("expected follower, got %v", nodes[0].role)
 	}
 }
 
 func TestGetWaitsForReadIndexToApply(t *testing.T) {
-	node := NewRaftNode(
-		0,
-		1,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	statemachine := NewTestStateMachine(storage.NewMemEngine())
+
+	node, err := NewRaftNode(
+		0, 1, make(chan ApplyMsg, 10),
+		NewMemPersister(), statemachine,
 	)
+	if err != nil {
+		t.Fatalf("failed to create node: %v", err)
+	}
+	defer node.Stop()
 
 	node.mu.Lock()
 	node.role = Leader
@@ -2616,14 +2613,16 @@ func TestGetWaitsForReadIndexToApply(t *testing.T) {
 		LogEntry{
 			Index: 2,
 			Term:  1,
+			Command: Command{
+				Op:    "SET",
+				Key:   "Country",
+				Value: "Index",
+			},
 		},
 	)
 	node.commitIndex = 2
-	node.lastApplied = 0
 	node.mu.Unlock()
 
-	// Put the value directly into the engine only after the
-	// read-index application point is reached.
 	done := make(chan struct{})
 
 	go func() {
@@ -2631,55 +2630,88 @@ func TestGetWaitsForReadIndexToApply(t *testing.T) {
 		close(done)
 	}()
 
-	// Give Get() enough time to reach waitForApply().
+	// Wait until Get has had an opportunity to block.
 	time.Sleep(50 * time.Millisecond)
 
 	select {
 	case <-done:
-		t.Fatal("Get returned before read index was applied")
+		t.Fatal("Get returned before the read index was applied")
 	default:
 	}
 
-	// Simulate application of index 1.
-	node.mu.Lock()
-	node.lastApplied = 2
-	node.mu.Unlock()
+	// Simulate application reaching index 2.
+	lastApplied, err := statemachine.LastApplied()
+	if err != nil {
+		t.Fatalf("failed to read last applied index: %v", err)
+	}
+
+	if lastApplied < 2 {
+		// Apply the entries in order so the state machine can advance.
+		if err := statemachine.Apply(ApplyMsg{
+			CommandValid: true,
+			CommandIndex: 1,
+			Command: Command{
+				Op: "NOOP",
+			},
+		}); err != nil {
+			t.Fatalf("failed to apply entry 1: %v", err)
+		}
+
+		if err := statemachine.Apply(ApplyMsg{
+			CommandValid: true,
+			CommandIndex: 2,
+			Command: Command{
+				Op:    "SET",
+				Key:   "Country",
+				Value: "Index",
+			},
+		}); err != nil {
+			t.Fatalf("failed to apply entry 2: %v", err)
+		}
+	}
 
 	node.notifyApplied(2, nil)
 
 	select {
 	case <-done:
-		// Expected.
-	case <-time.After(1 * time.Second):
-		t.Fatal("Get did not return after read index was applied")
+	case <-time.After(time.Second):
+		t.Fatal("Get did not return after the read index was applied")
 	}
 }
 
 func TestGetWaitsForReadIndexApplication(t *testing.T) {
 	nodes := make([]*RaftNode, 3)
-	engines := make([]storage.Engine, 3)
+	stateMachines := make([]StateMachine, 3)
 
-	for i := 0; i < 3; i++ {
-		engines[i] = storage.NewMemEngine()
+	for i := range nodes {
+		stateMachines[i] = NewTestStateMachine(storage.NewMemEngine())
 
-		nodes[i] = NewRaftNode(
-			i,
-			3,
-			make(chan ApplyMsg, 10),
-			engines[i],
+		node, err := NewRaftNode(
+			i, 3, make(chan ApplyMsg, 10),
+			NewMemPersister(), stateMachines[i],
 		)
+		if err != nil {
+			t.Fatalf("failed to create node %d: %v", i, err)
+		}
+		nodes[i] = node
 	}
+	defer func() {
+		for _, node := range nodes {
+			node.Stop()
+		}
+	}()
 
 	for i := range nodes {
 		nodes[i].SetPeers(nodes)
 	}
 
 	leader := nodes[0]
+	leaderSM := stateMachines[0]
 
 	leader.mu.Lock()
 	leader.role = Leader
 	leader.currentTerm = 1
-	// Create the committed log entry that Get() will fence on.
+
 	leader.log = leader.log[:1]
 	leader.log = append(leader.log,
 		LogEntry{
@@ -2699,24 +2731,23 @@ func TestGetWaitsForReadIndexApplication(t *testing.T) {
 			},
 		},
 	)
-
 	leader.commitIndex = 2
-	leader.lastApplied = 0
 	leader.mu.Unlock()
 
 	done := make(chan struct{})
+
 	var (
-		value string
-		found bool
-		err   error
+		value  string
+		found  bool
+		getErr error
 	)
 
 	go func() {
-		value, found, err = leader.Get(1, 1, "x")
+		value, found, getErr = leader.Get(1, 1, "x")
 		close(done)
 	}()
 
-	// Give Get() time to perform ReadIndex and reach waitForApply().
+	// Give Get time to perform ReadIndex and wait for application.
 	time.Sleep(50 * time.Millisecond)
 
 	select {
@@ -2725,221 +2756,237 @@ func TestGetWaitsForReadIndexApplication(t *testing.T) {
 	default:
 	}
 
-	// Simulate the state machine applying index 1.
-	if err := engines[0].Put([]byte("x"), []byte("value")); err != nil {
-		t.Fatalf("failed to apply value: %v", err)
+	// Apply entries in order through the StateMachine interface.
+	if err := leaderSM.Apply(ApplyMsg{
+		CommandValid: true,
+		CommandIndex: 1,
+		Command: Command{
+			Op: "NOOP",
+		},
+	}); err != nil {
+		t.Fatalf("failed to apply entry 1: %v", err)
 	}
 
-	leader.mu.Lock()
-	leader.lastApplied = 2
-	leader.mu.Unlock()
+	if err := leaderSM.Apply(ApplyMsg{
+		CommandValid: true,
+		CommandIndex: 2,
+		Command: Command{
+			Op:    "SET",
+			Key:   "x",
+			Value: "value",
+		},
+	}); err != nil {
+		t.Fatalf("failed to apply entry 2: %v", err)
+	}
 
 	leader.notifyApplied(2, nil)
 
 	select {
 	case <-done:
-	case <-time.After(1 * time.Second):
-		t.Fatal("Get did not return after read index was applied")
+	case <-time.After(time.Second):
+		t.Fatal("Get did not return after the read index was applied")
 	}
 
-	if err != nil {
-		t.Fatalf("Get returned error: %v", err)
+	if getErr != nil {
+		t.Fatalf("Get returned error: %v", getErr)
 	}
-
 	if !found {
 		t.Fatal("expected key to be found")
 	}
-
 	if value != "value" {
-		t.Fatalf("expected value 'value', got %q", value)
+		t.Fatalf("expected value %q, got %q", "value", value)
 	}
 }
 
 func TestGetFailsIfLeadershipLostBeforeRead(t *testing.T) {
-	node := NewRaftNode(
-		0,
-		1,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	sm := NewTestStateMachine(storage.NewMemEngine())
+
+	node, err := NewRaftNode(
+		0, 1, make(chan ApplyMsg, 10),
+		NewMemPersister(), sm,
 	)
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	defer node.Stop()
 
 	node.mu.Lock()
 	node.role = Leader
 	node.currentTerm = 1
-
 	node.log = node.log[:1]
 	node.log = append(node.log,
 		LogEntry{
-			Index: 1,
-			Term:  1,
-			Command: Command{
-				Op: "NOOP",
-			},
+			Index:   1,
+			Term:    1,
+			Command: Command{Op: "NOOP"},
 		},
 		LogEntry{
 			Index: 2,
 			Term:  1,
 			Command: Command{
-				Op:    "SET",
-				Key:   "x",
-				Value: "value",
+				Op: "SET", Key: "x", Value: "value",
 			},
 		},
 	)
-
 	node.commitIndex = 2
-	node.lastApplied = 0
 	node.mu.Unlock()
 
 	done := make(chan struct{})
-	var err error
+	var getErr error
 
 	go func() {
-		_, _, err = node.Get(1, 1, "x")
+		_, _, getErr = node.Get(1, 1, "x")
 		close(done)
 	}()
 
-	// Give Get enough time to reach waitForApply.
-	time.Sleep(50 * time.Millisecond)
+	// Wait until Get has registered its apply waiter.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		node.mu.Lock()
+		registered := len(node.applyWaiters) > 0
+		node.mu.Unlock()
 
-	// Simulate losing leadership while waiting.
+		if registered {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
 	node.mu.Lock()
+	registered := len(node.applyWaiters) > 0
 	node.role = Follower
 	node.mu.Unlock()
 
-	// Simulate the read index becoming applied.
-	node.mu.Lock()
-	node.lastApplied = 2
-	node.mu.Unlock()
+	if !registered {
+		t.Fatal("Get did not register an apply waiter")
+	}
 
+	// Simulate the read index being applied after leadership is lost.
 	node.notifyApplied(2, nil)
 
 	select {
 	case <-done:
-	case <-time.After(1 * time.Second):
-		t.Fatal("Get did not return")
+	case <-time.After(time.Second):
+		t.Fatal("Get did not return after application notification")
 	}
 
-	if err != ErrWrongLeader {
-		t.Fatalf("expected ErrWrongLeader, got %v", err)
+	if getErr != ErrWrongLeader {
+		t.Fatalf("expected ErrWrongLeader, got %v", getErr)
 	}
 }
 
 func TestApplyLoopHandlesOutOfOrderMessages(t *testing.T) {
 	applyCh := make(chan ApplyMsg, 10)
-	engine := storage.NewMemEngine()
+	sm := NewTestStateMachine(storage.NewMemEngine())
 
-	node := NewRaftNode(0, 1, applyCh, engine)
+	node, err := NewRaftNode(
+		0, 1, applyCh,
+		NewMemPersister(), sm,
+	)
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	defer node.Stop()
 
 	node.mu.Lock()
 	node.commitIndex = 3
 	node.mu.Unlock()
 
 	go node.applyLoop()
-	defer node.Stop()
 
 	applyCh <- ApplyMsg{
 		CommandValid: true,
 		CommandIndex: 1,
 		CommandTerm:  1,
 		Command: Command{
-			Op:    "SET",
-			Key:   "one",
-			Value: "1",
+			Op: "SET", Key: "one", Value: "1",
 		},
 	}
-	// Index 3 arrives before index 2.
 	applyCh <- ApplyMsg{
 		CommandValid: true,
 		CommandIndex: 3,
 		CommandTerm:  1,
 		Command: Command{
-			Op:    "SET",
-			Key:   "three",
-			Value: "3",
+			Op: "SET", Key: "three", Value: "3",
 		},
 	}
-
 	applyCh <- ApplyMsg{
 		CommandValid: true,
 		CommandIndex: 2,
 		CommandTerm:  1,
 		Command: Command{
-			Op:    "SET",
-			Key:   "two",
-			Value: "2",
+			Op: "SET", Key: "two", Value: "2",
 		},
 	}
 
-	// Wait for both entries to be applied in order.
 	deadline := time.Now().Add(time.Second)
-
 	for time.Now().Before(deadline) {
-		node.mu.Lock()
-		lastApplied := node.lastApplied
-		node.mu.Unlock()
-
+		lastApplied, err := sm.LastApplied()
+		if err != nil {
+			t.Fatalf("read last applied: %v", err)
+		}
 		if lastApplied == 3 {
 			break
 		}
-
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	node.mu.Lock()
-	lastApplied := node.lastApplied
-	node.mu.Unlock()
-
+	lastApplied, err := sm.LastApplied()
+	if err != nil {
+		t.Fatalf("read last applied: %v", err)
+	}
 	if lastApplied != 3 {
-		t.Fatalf(
-			"expected lastApplied=3, got %d",
-			lastApplied,
-		)
+		t.Fatalf("expected LastApplied() = 3, got %d", lastApplied)
 	}
 
-	// Verify both commands reached the state machine.
 	for _, tc := range []struct {
 		key   string
 		value string
 	}{
+		{key: "one", value: "1"},
 		{key: "two", value: "2"},
 		{key: "three", value: "3"},
 	} {
-		value, found, err := engine.Get([]byte(tc.key))
+		value, found, err := sm.Get([]byte(tc.key))
 		if err != nil {
-			t.Fatalf("Get(%q) failed: %v", tc.key, err)
+			t.Fatalf("Get(%q): %v", tc.key, err)
 		}
-
 		if !found || string(value) != tc.value {
 			t.Fatalf(
 				"Get(%q) = %q, found=%v; want %q",
-				tc.key,
-				string(value),
-				found,
-				tc.value,
+				tc.key, string(value), found, tc.value,
 			)
 		}
 	}
 }
 
 func TestNewLeaderAppendsCurrentTermNoop(t *testing.T) {
-	applyCh := make(chan ApplyMsg, 20)
-
 	nodes := make([]*RaftNode, 3)
-	for i := 0; i < 3; i++ {
-		nodes[i] = NewRaftNode(
-			i,
-			3,
-			applyCh,
-			storage.NewMemEngine(),
-		)
-	}
 
-	for i := 0; i < 3; i++ {
-		nodes[i].SetPeers(nodes)
+	for i := range nodes {
+		node, err := NewRaftNode(
+			i, 3, make(chan ApplyMsg, 20),
+			NewMemPersister(),
+			NewTestStateMachine(storage.NewMemEngine()),
+		)
+		if err != nil {
+			t.Fatalf("create node %d: %v", i, err)
+		}
+		nodes[i] = node
+	}
+	defer func() {
+		for _, node := range nodes {
+			node.Stop()
+		}
+	}()
+
+	for _, node := range nodes {
+		node.SetPeers(nodes)
+		node.StartBackground()
 	}
 
 	candidate := nodes[0]
+
 	candidate.mu.Lock()
 	candidate.currentTerm = 0
 	candidate.role = Follower
@@ -2949,8 +2996,7 @@ func TestNewLeaderAppendsCurrentTermNoop(t *testing.T) {
 
 	candidate.startElection()
 
-	// Wait for election to complete.
-	deadline := time.Now().Add(1 * time.Second)
+	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		candidate.mu.Lock()
 		becameLeader := candidate.role == Leader
@@ -2959,7 +3005,6 @@ func TestNewLeaderAppendsCurrentTermNoop(t *testing.T) {
 		if becameLeader {
 			break
 		}
-
 		time.Sleep(5 * time.Millisecond)
 	}
 
@@ -2980,22 +3025,14 @@ func TestNewLeaderAppendsCurrentTermNoop(t *testing.T) {
 	candidate.mu.Unlock()
 
 	if entry.Term != term {
-		t.Fatalf(
-			"no-op term = %d, current term = %d",
-			entry.Term,
-			term,
-		)
+		t.Fatalf("no-op term = %d, current term = %d", entry.Term, term)
 	}
-
 	if entry.Command.Op != "NOOP" {
-		t.Fatalf(
-			"expected last entry to be NOOP, got %q",
-			entry.Command.Op,
-		)
+		t.Fatalf("expected last entry to be NOOP, got %q", entry.Command.Op)
 	}
 
-	// Wait for the no-op to be committed.
-	deadline = time.Now().Add(1 * time.Second)
+	// Wait for the no-op to be committed by the majority.
+	deadline = time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		candidate.mu.Lock()
 		committed := candidate.commitIndex >= lastIndex
@@ -3004,7 +3041,6 @@ func TestNewLeaderAppendsCurrentTermNoop(t *testing.T) {
 		if committed {
 			return
 		}
-
 		time.Sleep(5 * time.Millisecond)
 	}
 
@@ -3014,23 +3050,25 @@ func TestNewLeaderAppendsCurrentTermNoop(t *testing.T) {
 
 	t.Fatalf(
 		"expected no-op at index %d to be committed, commitIndex=%d",
-		lastIndex,
-		commitIndex,
+		lastIndex, commitIndex,
 	)
 }
 
 func TestGetFailsIfTermChangesBeforeRead(t *testing.T) {
-	node := NewRaftNode(
-		0,
-		1,
-		make(chan ApplyMsg, 10),
-		storage.NewMemEngine(),
+	sm := NewTestStateMachine(storage.NewMemEngine())
+
+	node, err := NewRaftNode(
+		0, 1, make(chan ApplyMsg, 10),
+		NewMemPersister(), sm,
 	)
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	defer node.Stop()
 
 	node.mu.Lock()
 	node.role = Leader
 	node.currentTerm = 1
-
 	node.log = node.log[:1]
 	node.log = append(node.log,
 		LogEntry{
@@ -3042,140 +3080,160 @@ func TestGetFailsIfTermChangesBeforeRead(t *testing.T) {
 			Index: 2,
 			Term:  1,
 			Command: Command{
-				Op:    "SET",
-				Key:   "x",
-				Value: "value",
+				Op: "SET", Key: "x", Value: "value",
 			},
 		},
 	)
-
 	node.commitIndex = 2
-	node.lastApplied = 0
 	node.mu.Unlock()
 
 	done := make(chan struct{})
-	var err error
+	var getErr error
 
 	go func() {
-		_, _, err = node.Get(1, 1, "x")
+		_, _, getErr = node.Get(1, 1, "x")
 		close(done)
 	}()
 
-	// Allow Get to reach waitForApply.
-	time.Sleep(50 * time.Millisecond)
+	// Wait for Get to register its waiter.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		node.mu.Lock()
+		registered := len(node.applyWaiters) > 0
+		node.mu.Unlock()
 
-	// Simulate a new leadership term before the read completes.
+		if registered {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
 	node.mu.Lock()
+	registered := len(node.applyWaiters) > 0
 	node.currentTerm = 2
 	node.role = Leader
-	node.lastApplied = 2
 	node.mu.Unlock()
+
+	if !registered {
+		t.Fatal("Get did not register an apply waiter")
+	}
 
 	node.notifyApplied(2, nil)
 
 	select {
 	case <-done:
-	case <-time.After(1 * time.Second):
+	case <-time.After(time.Second):
 		t.Fatal("Get did not return")
 	}
 
-	if err != ErrWrongLeader {
-		t.Fatalf("expected ErrWrongLeader, got %v", err)
+	if getErr != ErrWrongLeader {
+		t.Fatalf("expected ErrWrongLeader, got %v", getErr)
 	}
 }
 
 func TestReadIndexReturnsWhenFollowerDoesNotRespond(t *testing.T) {
 	nodes := make([]*RaftNode, 3)
 
-	for i := 0; i < 3; i++ {
-		nodes[i] = NewRaftNode(
-			i,
-			3,
-			make(chan ApplyMsg, 10),
-			storage.NewMemEngine(),
-		)
-	}
-
 	for i := range nodes {
-		nodes[i].SetPeers(nodes)
+		node, err := NewRaftNode(
+			i, 3, make(chan ApplyMsg, 10),
+			NewMemPersister(),
+			NewTestStateMachine(storage.NewMemEngine()),
+		)
+		if err != nil {
+			t.Fatalf("create node %d: %v", i, err)
+		}
+		nodes[i] = node
+	}
+	defer func() {
+		for _, node := range nodes {
+			node.Stop()
+		}
+	}()
+
+	for _, node := range nodes {
+		node.SetPeers(nodes)
 	}
 
-	// Configure node 0 as leader with a committed current-term NOOP.
-	nodes[0].mu.Lock()
-	nodes[0].role = Leader
-	nodes[0].currentTerm = 5
-	nodes[0].log = make([]LogEntry, 2)
-	nodes[0].log[1] = LogEntry{
-		Index: 1,
-		Term:  5,
-		Command: Command{
-			Op: "NOOP",
-		},
+	leader := nodes[0]
+	leader.mu.Lock()
+	leader.role = Leader
+	leader.currentTerm = 5
+	leader.log = make([]LogEntry, 2)
+	leader.log[1] = LogEntry{
+		Index:   1,
+		Term:    5,
+		Command: Command{Op: "NOOP"},
 	}
-	nodes[0].commitIndex = 1
-	nodes[0].mu.Unlock()
+	leader.commitIndex = 1
+	leader.mu.Unlock()
 
-	// Hold node 2's mutex so its ReadProbe cannot complete.
+	// Block node 2's ReadProbe handler.
 	nodes[2].mu.Lock()
 	defer nodes[2].mu.Unlock()
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := nodes[0].readIndex()
+		_, err := leader.readIndex()
 		done <- err
 	}()
 
 	select {
 	case err := <-done:
-		// Node 1 can provide the second acknowledgement needed
-		// for a majority in this three-node cluster.
+		// The leader's own acknowledgement and node 1's
+		// acknowledgement form a majority of three.
 		if err != nil {
-			t.Fatalf("readIndex failed despite receiving a majority: %v", err)
+			t.Fatalf("readIndex failed despite a majority: %v", err)
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("readIndex did not return after reaching a majority")
 	}
-}	
+}
 
 func TestReadIndexFailsWhenMajorityUnavailable(t *testing.T) {
 	nodes := make([]*RaftNode, 3)
 
-	for i := 0; i < 3; i++ {
-		nodes[i] = NewRaftNode(
-			i,
-			3,
-			make(chan ApplyMsg, 10),
-			storage.NewMemEngine(),
-		)
-	}
-
 	for i := range nodes {
-		nodes[i].SetPeers(nodes)
+		node, err := NewRaftNode(
+			i, 3, make(chan ApplyMsg, 10),
+			NewMemPersister(),
+			NewTestStateMachine(storage.NewMemEngine()),
+		)
+		if err != nil {
+			t.Fatalf("create node %d: %v", i, err)
+		}
+		nodes[i] = node
+	}
+	defer func() {
+		for _, node := range nodes {
+			node.Stop()
+		}
+	}()
+
+	for _, node := range nodes {
+		node.SetPeers(nodes)
 	}
 
-	// Configure node 0 as leader with a committed current-term NOOP.
-	nodes[0].mu.Lock()
-	nodes[0].role = Leader
-	nodes[0].currentTerm = 5
-	nodes[0].log = make([]LogEntry, 2)
-	nodes[0].log[1] = LogEntry{
-		Index: 1,
-		Term:  5,
-		Command: Command{
-			Op: "NOOP",
-		},
+	leader := nodes[0]
+	leader.mu.Lock()
+	leader.role = Leader
+	leader.currentTerm = 5
+	leader.log = make([]LogEntry, 2)
+	leader.log[1] = LogEntry{
+		Index:   1,
+		Term:    5,
+		Command: Command{Op: "NOOP"},
 	}
-	nodes[0].commitIndex = 1
-	nodes[0].mu.Unlock()
+	leader.commitIndex = 1
+	leader.mu.Unlock()
 
-	// Block both followers so neither can acknowledge the probe.
+	// Block both follower handlers.
 	nodes[1].mu.Lock()
 	nodes[2].mu.Lock()
 
 	done := make(chan error, 1)
-
 	go func() {
-		_, err := nodes[0].readIndex()
+		_, err := leader.readIndex()
 		done <- err
 	}()
 
@@ -3184,7 +3242,7 @@ func TestReadIndexFailsWhenMajorityUnavailable(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected readIndex to fail without a majority")
 		}
-	case <-time.After(1 * time.Second):
+	case <-time.After(time.Second):
 		t.Fatal("readIndex did not return when a majority was unavailable")
 	}
 
@@ -3193,34 +3251,34 @@ func TestReadIndexFailsWhenMajorityUnavailable(t *testing.T) {
 }
 
 func TestThreeNodeClusterRecoversCommittedValueAfterRestart(t *testing.T) {
-	dir := t.TempDir()
-
-	statePaths := []string{
-		filepath.Join(dir, "node0.state"),
-		filepath.Join(dir, "node1.state"),
-		filepath.Join(dir, "node2.state"),
-	}
-
 	const n = 3
 
-	startCluster := func() ([]*RaftNode, []*storage.MemEngine, []chan ApplyMsg) {
+	// Keep the same persisters across reconstruction.
+	persisters := make([]Persister, n)
+	for i := range persisters {
+		persisters[i] = NewMemPersister()
+	}
+
+	startCluster := func() ([]*RaftNode, []StateMachine) {
 		nodes := make([]*RaftNode, n)
-		engines := make([]*storage.MemEngine, n)
-		applyChs := make([]chan ApplyMsg, n)
+		stateMachines := make([]StateMachine, n)
 
 		for i := 0; i < n; i++ {
-			engines[i] = storage.NewMemEngine()
-			applyChs[i] = make(chan ApplyMsg, 100)
+			stateMachines[i] = NewTestStateMachine(storage.NewMemEngine())
 
-			node, err := NewPersistentRaftNode(
+			node, err := NewRaftNode(
 				i,
 				n,
-				applyChs[i],
-				engines[i],
-				statePaths[i],
+				make(chan ApplyMsg, 100),
+				persisters[i],
+				stateMachines[i],
 			)
 			if err != nil {
-				t.Fatalf("create persistent node %d: %v", i, err)
+				// Clean up nodes that were already created.
+				for j := 0; j < i; j++ {
+					nodes[j].Stop()
+				}
+				t.Fatalf("create node %d: %v", i, err)
 			}
 
 			nodes[i] = node
@@ -3231,10 +3289,11 @@ func TestThreeNodeClusterRecoversCommittedValueAfterRestart(t *testing.T) {
 		}
 
 		for _, node := range nodes {
+			go node.applyLoop()
 			node.StartBackground()
 		}
 
-		return nodes, engines, applyChs
+		return nodes, stateMachines
 	}
 
 	stopCluster := func(nodes []*RaftNode) {
@@ -3265,52 +3324,50 @@ func TestThreeNodeClusterRecoversCommittedValueAfterRestart(t *testing.T) {
 				return leader
 			}
 
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(25 * time.Millisecond)
 		}
 
 		return -1
 	}
 
 	// Start the original cluster.
-	nodes, _, _ := startCluster()
-
+	nodes, _ := startCluster()
 	leader := waitForLeader(nodes)
+
 	if leader == -1 {
 		stopCluster(nodes)
 		t.Fatal("cluster failed to elect a leader")
 	}
 
-	// Commit a value before restarting.
+	// Commit a value before reconstruction.
 	ok, err := nodes[leader].Put(1, 1, "language", "Go")
 	if err != nil || !ok {
 		stopCluster(nodes)
-		t.Fatalf("failed to write value before restart: ok=%v, err=%v", ok, err)
+		t.Fatalf("write before reconstruction failed: ok=%v, err=%v", ok, err)
 	}
 
+	// Shut down the original nodes.
 	stopCluster(nodes)
 	time.Sleep(100 * time.Millisecond)
 
-	// Reconstruct every node from its original persistent state file.
-	nodes, _, _ = startCluster()
-
-	t.Cleanup(func() { //tells Go to execute a function when the test finishes, whether it passes or fails.
+	// Reconstruct nodes with the same persisters but fresh state machines.
+	nodes, _ = startCluster()
+	t.Cleanup(func() {
 		stopCluster(nodes)
 	})
 
 	leader = waitForLeader(nodes)
 	if leader == -1 {
-		t.Fatal("cluster failed to elect a leader after restart")
+		t.Fatal("cluster failed to elect a leader after reconstruction")
 	}
 
-	// Submit a new write so the new leader can commit its current-term
-	// entry and advance commitment over the previous log entries.
+	// A current-term entry allows Raft to commit prior entries in the log.
 	ok, err = nodes[leader].Put(1, 2, "restart-check", "ok")
 	if err != nil || !ok {
-		stopCluster(nodes)
-		t.Fatalf("failed to write value before restart: ok=%v, err=%v", ok, err)
+		t.Fatalf("write after reconstruction failed: ok=%v, err=%v", ok, err)
 	}
 
-	// Check that the value committed before the restart is recovered.
+	// Verify that the previously committed value is present again.
 	deadline := time.Now().Add(3 * time.Second)
 
 	for time.Now().Before(deadline) {
@@ -3322,14 +3379,21 @@ func TestThreeNodeClusterRecoversCommittedValueAfterRestart(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 
-	t.Fatal("previously committed value was not recovered after restart")
+	t.Fatal("previously committed value was not recovered after reconstruction")
 }
 
 func TestStartDeduplicatesRepeatedRequest(t *testing.T) {
 	applyCh := make(chan ApplyMsg, 10)
-	engine := storage.NewMemEngine()
+	sm := NewTestStateMachine(storage.NewMemEngine())
 
-	node := NewRaftNode(0, 1, applyCh, engine)
+	node, err := NewRaftNode(
+		0, 1, applyCh,
+		NewMemPersister(), sm,
+	)
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	defer node.Stop()
 
 	node.mu.Lock()
 	node.role = Leader
@@ -3348,45 +3412,47 @@ func TestStartDeduplicatesRepeatedRequest(t *testing.T) {
 
 	// First request.
 	index1, term1, err := node.Start(command)
-	if err!=nil {
-		t.Fatal("First request was rejected by the leader")
+	if err != nil {
+		t.Fatalf("first request was rejected: %v", err)
 	}
 
-	// Wait until the request has been applied.
+	// Wait for application using the StateMachine interface.
 	deadline := time.Now().Add(2 * time.Second)
-	for {
-		node.mu.Lock()
-		applied := node.lastApplied >= index1
-		node.mu.Unlock()
-
-		if applied {
+	for time.Now().Before(deadline) {
+		lastApplied, err := sm.LastApplied()
+		if err != nil {
+			t.Fatalf("read last applied: %v", err)
+		}
+		if lastApplied >= index1 {
 			break
 		}
-
-		if time.Now().After(deadline) {
-			t.Fatalf("Timed out waiting for log index %d to be applied", index1)
-		}
-
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Verify that the first request actually changed the state machine.
-	value, found, err := engine.Get([]byte("framework"))
+	lastApplied, err := sm.LastApplied()
 	if err != nil {
-		t.Fatalf("Failed to read stored value: %v", err)
+		t.Fatalf("read last applied: %v", err)
+	}
+	if lastApplied < index1 {
+		t.Fatalf("timed out waiting for index %d to be applied", index1)
+	}
+
+	value, found, err := sm.Get([]byte("framework"))
+	if err != nil {
+		t.Fatalf("read stored value: %v", err)
 	}
 	if !found || string(value) != "RaftKV" {
-		t.Fatalf("Expected stored value 'RaftKV', got %q", string(value))
+		t.Fatalf("expected value %q, got %q", "RaftKV", string(value))
 	}
 
 	node.mu.Lock()
 	logLenAfterFirst := len(node.log)
 	node.mu.Unlock()
 
-	// Retry the exact same request after it has been applied.
+	// Retry the exact same request.
 	index2, term2, err := node.Start(command)
 	if err != nil {
-		t.Fatal("Duplicate request was rejected by the leader")
+		t.Fatalf("duplicate request was rejected: %v", err)
 	}
 
 	node.mu.Lock()
@@ -3394,42 +3460,41 @@ func TestStartDeduplicatesRepeatedRequest(t *testing.T) {
 	node.mu.Unlock()
 
 	if index1 != index2 {
-		t.Fatalf("Expected the same log index, got %d and %d", index1, index2)
+		t.Fatalf("expected same index, got %d and %d", index1, index2)
 	}
-
 	if term1 != term2 {
-		t.Fatalf("Expected the same term, got %d and %d", term1, term2)
+		t.Fatalf("expected same term, got %d and %d", term1, term2)
 	}
-
 	if logLenAfterFirst != logLenAfterSecond {
 		t.Fatalf(
-			"Duplicate request appended another entry: log length changed from %d to %d",
-			logLenAfterFirst,
-			logLenAfterSecond,
+			"duplicate request appended another entry: log length changed from %d to %d",
+			logLenAfterFirst, logLenAfterSecond,
 		)
 	}
 
 	t.Logf(
-		"Deduplication verified after application: index=%d, log length=%d",
-		index1,
-		logLenAfterSecond,
+		"deduplication verified: index=%d, log length=%d",
+		index1, logLenAfterSecond,
 	)
 }
 
 func TestStartRejectsConflictingDuplicateRequest(t *testing.T) {
 	applyCh := make(chan ApplyMsg, 10)
-	engine := storage.NewMemEngine()
+	stateMachine := NewTestStateMachine(storage.NewMemEngine())
 
-	node := NewRaftNode(0, 1, applyCh, engine)
+	node, err := NewRaftNode(
+		0, 1, applyCh, NewMemPersister(), stateMachine,
+	)
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
 	defer node.Stop()
 
-	// Make this node the leader for a deterministic unit test.
 	node.mu.Lock()
 	node.role = Leader
 	node.currentTerm = 1
 	node.mu.Unlock()
 
-	// First request.
 	command1 := Command{
 		ClientID:  3,
 		SeqNumber: 1,
@@ -3440,197 +3505,113 @@ func TestStartRejectsConflictingDuplicateRequest(t *testing.T) {
 
 	index1, _, err := node.Start(command1)
 	if err != nil {
-		t.Fatal("First request was rejected")
+		t.Fatalf("first request failed: %v", err)
 	}
 
 	node.mu.Lock()
 	logLenBefore := len(node.log)
 	node.mu.Unlock()
 
-	// Same request ID, but a different value.
-	command2 := Command{
+	command2 := command1
+	command2.Value = "DifferentValue"
+
+	index2, _, err := node.Start(command2)
+
+	if !errors.Is(err, ErrRequestIDConflict) {
+		t.Fatalf("expected ErrRequestIDConflict, got %v", err)
+	}
+
+	if index2 != -1 {
+		t.Fatalf("expected index -1, got %d", index2)
+	}
+
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	if len(node.log) != logLenBefore {
+		t.Fatalf(
+			"conflicting request changed log length: before=%d, after=%d",
+			logLenBefore, len(node.log),
+		)
+	}
+
+	if node.log[index1].Command != command1 {
+		t.Fatalf("original command was changed: got %+v", node.log[index1].Command)
+	}
+}
+
+func TestStartDeduplicatesRequestAfterRestart(t *testing.T) {
+	persister := NewMemPersister()
+
+	command := Command{
 		ClientID:  3,
 		SeqNumber: 1,
 		Op:        "SET",
 		Key:       "framework",
-		Value:     "DifferentValue",
+		Value:     "RaftKV",
 	}
 
-	index2, _, err := node.Start(command2)
+	createNode := func() *RaftNode {
+		t.Helper()
 
-	if err == nil {
-		t.Fatal("Expected conflicting duplicate request to be rejected")
+		node, err := NewRaftNode(
+			0,
+			1,
+			make(chan ApplyMsg, 10),
+			persister,
+			NewTestStateMachine(storage.NewMemEngine()),
+		)
+		if err != nil {
+			t.Fatalf("create node: %v", err)
+		}
+		return node
 	}
 
-	if index2 != -1 {
-		t.Fatalf("Expected index -1 for conflicting request, got %d", index2)
+	original := createNode()
+
+	original.mu.Lock()
+	original.role = Leader
+	original.currentTerm = 1
+	original.mu.Unlock()
+
+	index1, term1, err := original.Start(command)
+	if err != nil {
+		original.Stop()
+		t.Fatalf("first request failed: %v", err)
 	}
 
-	node.mu.Lock()
-	logLenAfter := len(node.log)
-	node.mu.Unlock()
+	original.Stop()
 
-	if logLenAfter != logLenBefore {
+	restarted := createNode()
+	defer restarted.Stop()
+
+	restarted.mu.Lock()
+	restarted.role = Leader
+	restarted.mu.Unlock()
+
+	index2, term2, err := restarted.Start(command)
+	if err != nil {
+		t.Fatalf("duplicate request after restart failed: %v", err)
+	}
+
+	restarted.mu.Lock()
+	defer restarted.mu.Unlock()
+
+	if index2 != index1 {
+		t.Fatalf("expected original index %d, got %d", index1, index2)
+	}
+
+	if term2 != term1 {
+		t.Fatalf("expected original term %d, got %d", term1, term2)
+	}
+
+	if len(restarted.log) != index1+1 {
 		t.Fatalf(
-			"Conflicting request changed log length: before=%d, after=%d",
-			logLenBefore,
-			logLenAfter,
+			"duplicate appended an entry: log length=%d",
+			len(restarted.log),
 		)
 	}
-
-	// Confirm the original request is still recorded at its original index.
-	node.mu.Lock()
-	existingCommand := node.log[index1].Command
-	node.mu.Unlock()
-
-	if existingCommand != command1 {
-		t.Fatalf("Original command was changed: got %+v", existingCommand)
-	}
-
-	t.Log("Conflicting duplicate request correctly rejected")
 }
-
-func TestStartDeduplicatesRequestAfterRestart(t *testing.T) {
-    applyCh := make(chan ApplyMsg, 10)
-    persister := NewMemPersister()
-
-    command := Command{
-        ClientID:  3,
-        SeqNumber: 1,
-        Op:        "SET",
-        Key:       "framework",
-        Value:     "RaftKV",
-    }
-
-    // Create the original node.
-    node, err := NewRaftNodeWithPersister(
-        0, 1, applyCh, storage.NewMemEngine(), persister,
-    )
-    if err != nil {
-        t.Fatalf("create original node: %v", err)
-    }
-
-    node.mu.Lock()
-    node.role = Leader
-    node.currentTerm = 1
-    node.mu.Unlock()
-
-    // Persist the first request.
-    index1, term1, err := node.Start(command)
-    if err != nil {
-        t.Fatalf("first request failed: %v", err)
-    }
-
-    node.Stop()
-
-    // Simulate a restart using the same persister.
-    restarted, err := NewRaftNodeWithPersister(
-        0, 1, make(chan ApplyMsg, 10),
-        storage.NewMemEngine(), persister,
-    )
-    if err != nil {
-        t.Fatalf("restart node: %v", err)
-    }
-    defer restarted.Stop()
-
-    // Start() accepts writes only from a leader.
-    restarted.mu.Lock()
-    restarted.role = Leader
-    restarted.mu.Unlock()
-
-    // Retry the exact same request.
-    index2, term2, err := restarted.Start(command)
-    if err != nil {
-        t.Fatalf("duplicate request after restart failed: %v", err)
-    }
-
-    restarted.mu.Lock()
-    logLen := len(restarted.log)
-    restarted.mu.Unlock()
-
-    if index2 != index1 {
-        t.Fatalf("expected original index %d, got %d", index1, index2)
-    }
-
-    if term2 != term1 {
-        t.Fatalf("expected original term %d, got %d", term1, term2)
-    }
-
-    if logLen != index1+1 {
-        t.Fatalf("duplicate appended an entry: log length=%d", logLen)
-    }
-}
-
-func TestStartRejectsConflictingRequestAfterRestart(t *testing.T) {
-    applyCh := make(chan ApplyMsg, 10)
-    persister := NewMemPersister()
-
-    original, err := NewRaftNodeWithPersister(
-        0, 1, applyCh, storage.NewMemEngine(), persister,
-    )
-    if err != nil {
-        t.Fatalf("create original node: %v", err)
-    }
-
-    original.mu.Lock()
-    original.role = Leader
-    original.currentTerm = 1
-    original.mu.Unlock()
-
-    command1 := Command{
-        ClientID:  3,
-        SeqNumber: 1,
-        Op:        "SET",
-        Key:       "framework",
-        Value:     "RaftKV",
-    }
-
-    index1, _, err := original.Start(command1)
-    if err != nil {
-        t.Fatalf("first request failed: %v", err)
-    }
-
-    original.Stop()
-
-    restarted, err := NewRaftNodeWithPersister(
-        0, 1, make(chan ApplyMsg, 10),
-        storage.NewMemEngine(), persister,
-    )
-    if err != nil {
-        t.Fatalf("restart node: %v", err)
-    }
-    defer restarted.Stop()
-
-    restarted.mu.Lock()
-    restarted.role = Leader
-    restarted.mu.Unlock()
-
-    command2 := command1
-    command2.Value = "DifferentValue"
-
-    index2, _, err := restarted.Start(command2)
-
-    if !errors.Is(err, ErrRequestIDConflict) {
-        t.Fatalf("expected ErrRequestIDConflict, got %v", err)
-    }
-
-    if index2 != -1 {
-        t.Fatalf("expected index -1, got %d", index2)
-    }
-
-    restarted.mu.Lock()
-    defer restarted.mu.Unlock()
-
-    if len(restarted.log) != index1+1 {
-        t.Fatalf("log changed after conflicting request: length=%d",
-            len(restarted.log))
-    }
-
-    if restarted.log[index1].Command != command1 {
-        t.Fatal("original command was changed")
-    }
-}
-
 
 func waitForLeader(t *testing.T, nodes []*RaftNode, timeout time.Duration) *RaftNode {
 	t.Helper()
@@ -3663,30 +3644,34 @@ func waitForLeader(t *testing.T, nodes []*RaftNode, timeout time.Duration) *Raft
 	return nil
 }
 
-
 func TestStartDeduplicatesRequestAfterLeadershipChange(t *testing.T) {
 	nodes := make([]*RaftNode, 3)
 
 	for i := range nodes {
-		nodes[i] = NewRaftNode(
+		node, err := NewRaftNode(
 			i,
 			3,
 			make(chan ApplyMsg, 100),
-			storage.NewMemEngine(),
+			NewMemPersister(),
+			NewTestStateMachine(storage.NewMemEngine()),
 		)
-		defer nodes[i].Stop()
+		if err != nil {
+			t.Fatalf("failed to create node %d: %v", i, err)
+		}
+		nodes[i] = node
 	}
 
-	for i := range nodes {
-		nodes[i].SetPeers(nodes)
+	defer func() {
+		for _, node := range nodes {
+			node.Stop()
+		}
+	}()
+
+	for _, node := range nodes {
+		node.SetPeers(nodes)
+		node.StartBackground()
 	}
 
-	// Start the real Raft background loops.
-	for i := range nodes {
-		nodes[i].StartBackground()
-	}
-
-	// Wait for the initial leader.
 	oldLeader := waitForLeader(t, nodes, 3*time.Second)
 
 	command := Command{
@@ -3702,7 +3687,7 @@ func TestStartDeduplicatesRequestAfterLeadershipChange(t *testing.T) {
 		t.Fatalf("failed to submit original request: %v", err)
 	}
 
-	// Wait until at least one follower has the request in its log.
+	// Wait until a follower contains the request.
 	var survivingFollower *RaftNode
 	deadline := time.Now().Add(3 * time.Second)
 
@@ -3735,10 +3720,8 @@ func TestStartDeduplicatesRequestAfterLeadershipChange(t *testing.T) {
 		t.Fatal("request was not replicated to any follower")
 	}
 
-	// Stop the old leader so it cannot send heartbeats.
 	oldLeader.Stop()
 
-	// The remaining nodes should elect a new leader.
 	remainingNodes := make([]*RaftNode, 0, 2)
 	for _, node := range nodes {
 		if node != oldLeader {
@@ -3748,7 +3731,6 @@ func TestStartDeduplicatesRequestAfterLeadershipChange(t *testing.T) {
 
 	newLeader := waitForLeader(t, remainingNodes, 5*time.Second)
 
-	// Retry the same request on the new leader.
 	index, term, err := newLeader.Start(command)
 	if err != nil {
 		t.Fatalf("new leader rejected identical retry: %v", err)
@@ -3763,15 +3745,19 @@ func TestStartDeduplicatesRequestAfterLeadershipChange(t *testing.T) {
 	}
 
 	newLeader.mu.Lock()
-	defer newLeader.mu.Unlock()
-
 	requestID := RequestID{
 		ClientID:  command.ClientID,
 		SeqNumber: command.SeqNumber,
 	}
+	gotIndex, exists := newLeader.requestIndex[requestID]
+	newLeader.mu.Unlock()
 
-	if got := newLeader.requestIndex[requestID]; got != originalIndex {
-		t.Fatalf("requestIndex = %d, want %d", got, originalIndex)
+	if !exists {
+		t.Fatal("request ID missing from requestIndex")
+	}
+
+	if gotIndex != originalIndex {
+		t.Fatalf("requestIndex = %d, want %d", gotIndex, originalIndex)
 	}
 }
 
@@ -3779,25 +3765,30 @@ func TestStartRejectsConflictingRequestAfterLeadershipChange(t *testing.T) {
 	nodes := make([]*RaftNode, 3)
 
 	for i := range nodes {
-		nodes[i] = NewRaftNode(
+		node, err := NewRaftNode(
 			i,
 			3,
 			make(chan ApplyMsg, 100),
-			storage.NewMemEngine(),
+			NewMemPersister(),
+			NewTestStateMachine(storage.NewMemEngine()),
 		)
-		defer nodes[i].Stop()
+		if err != nil {
+			t.Fatalf("failed to create node %d: %v", i, err)
+		}
+		nodes[i] = node
 	}
 
-	for i := range nodes {
-		nodes[i].SetPeers(nodes)
+	defer func() {
+		for _, node := range nodes {
+			node.Stop()
+		}
+	}()
+
+	for _, node := range nodes {
+		node.SetPeers(nodes)
+		node.StartBackground()
 	}
 
-	// Start the real Raft background loops.
-	for i := range nodes {
-		nodes[i].StartBackground()
-	}
-
-	// Wait for the initial leader.
 	oldLeader := waitForLeader(t, nodes, 3*time.Second)
 
 	command := Command{
@@ -3813,7 +3804,7 @@ func TestStartRejectsConflictingRequestAfterLeadershipChange(t *testing.T) {
 		t.Fatalf("failed to submit original request: %v", err)
 	}
 
-	// Wait until at least one follower has the request in its log.
+	// Wait until a follower contains the request.
 	var survivingFollower *RaftNode
 	deadline := time.Now().Add(3 * time.Second)
 
@@ -3846,12 +3837,9 @@ func TestStartRejectsConflictingRequestAfterLeadershipChange(t *testing.T) {
 		t.Fatal("request was not replicated to any follower")
 	}
 
-	// Stop the old leader so it cannot send heartbeats.
 	oldLeader.Stop()
 
-	// Wait for a new leader among the remaining nodes.
 	remainingNodes := make([]*RaftNode, 0, 2)
-
 	for _, node := range nodes {
 		if node != oldLeader {
 			remainingNodes = append(remainingNodes, node)
@@ -3860,7 +3848,6 @@ func TestStartRejectsConflictingRequestAfterLeadershipChange(t *testing.T) {
 
 	newLeader := waitForLeader(t, remainingNodes, 5*time.Second)
 
-	// Reuse the same request ID with a different command value.
 	conflictingCommand := command
 	conflictingCommand.Value = "DifferentValue"
 
@@ -3871,13 +3858,9 @@ func TestStartRejectsConflictingRequestAfterLeadershipChange(t *testing.T) {
 	_, _, err = newLeader.Start(conflictingCommand)
 
 	if !errors.Is(err, ErrRequestIDConflict) {
-		t.Fatalf(
-			"expected ErrRequestIDConflict, got %v",
-			err,
-		)
+		t.Fatalf("expected ErrRequestIDConflict, got %v", err)
 	}
 
-	// A conflicting retry must not append another log entry.
 	newLeader.mu.Lock()
 	logLenAfter := len(newLeader.log)
 
@@ -3885,34 +3868,39 @@ func TestStartRejectsConflictingRequestAfterLeadershipChange(t *testing.T) {
 		ClientID:  command.ClientID,
 		SeqNumber: command.SeqNumber,
 	}
-	requestIndex := newLeader.requestIndex[requestID]
+	requestIndex, exists := newLeader.requestIndex[requestID]
 	newLeader.mu.Unlock()
 
 	if logLenAfter != logLenBefore {
 		t.Fatalf(
 			"conflicting retry changed log length: before=%d, after=%d",
-			logLenBefore,
-			logLenAfter,
+			logLenBefore, logLenAfter,
 		)
+	}
+
+	if !exists {
+		t.Fatal("original request ID missing from requestIndex")
 	}
 
 	if requestIndex != originalIndex {
 		t.Fatalf(
 			"request index changed: got %d, want %d",
-			requestIndex,
-			originalIndex,
+			requestIndex, originalIndex,
 		)
 	}
 }
 
-
 func TestConcurrentDuplicateRequestsAppendOnlyOneEntry(t *testing.T) {
-	node := NewRaftNode(
+	node, err := NewRaftNode(
 		0,
 		1,
 		make(chan ApplyMsg, 100),
-		storage.NewMemEngine(),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create Raft node: %v", err)
+	}
 	defer node.Stop()
 
 	node.mu.Lock()
@@ -3944,12 +3932,13 @@ func TestConcurrentDuplicateRequestsAppendOnlyOneEntry(t *testing.T) {
 	node.mu.Unlock()
 
 	var wg sync.WaitGroup
-	for i := 0; i < requests; i++ {
-		wg.Add(1) //increases the counter by 1
 
-		go func() { //Starts a goroutine. Each goroutine runs independently and can execute concurrently with the others.
-			defer wg.Done() //decreases the counter by 1
-			<-start //Each goroutine waits to receive a value from start. Because the channel has not been closed yet and no value has been sent, the goroutines block here.
+	for i := 0; i < requests; i++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+			<-start
 
 			index, term, err := node.Start(command)
 			results <- result{
@@ -3960,39 +3949,36 @@ func TestConcurrentDuplicateRequestsAppendOnlyOneEntry(t *testing.T) {
 		}()
 	}
 
-	close(start) //Closing the channel releases all goroutines blocked on <-start. They can now proceed without waiting for one another.
-	wg.Wait() 
-	//When each goroutine exits, defer wg.Done() decreases the counter by one. The goroutine running wg.Wait() resumes only when the counter reaches zero.
+	close(start)
+	wg.Wait()
 	close(results)
 
 	var expectedIndex, expectedTerm int
 	first := true
 
-	for result := range results {
-		if result.err != nil {
-			t.Fatalf("concurrent duplicate request failed: %v", result.err)
+	for res := range results {
+		if res.err != nil {
+			t.Fatalf("concurrent duplicate request failed: %v", res.err)
 		}
 
 		if first {
-			expectedIndex = result.index
-			expectedTerm = result.term
+			expectedIndex = res.index
+			expectedTerm = res.term
 			first = false
 			continue
 		}
 
-		if result.index != expectedIndex {
+		if res.index != expectedIndex {
 			t.Fatalf(
 				"concurrent requests returned different indices: %d and %d",
-				expectedIndex,
-				result.index,
+				expectedIndex, res.index,
 			)
 		}
 
-		if result.term != expectedTerm {
+		if res.term != expectedTerm {
 			t.Fatalf(
 				"concurrent requests returned different terms: %d and %d",
-				expectedTerm,
-				result.term,
+				expectedTerm, res.term,
 			)
 		}
 	}
@@ -4004,20 +3990,22 @@ func TestConcurrentDuplicateRequestsAppendOnlyOneEntry(t *testing.T) {
 	if finalLogLen != initialLogLen+1 {
 		t.Fatalf(
 			"expected exactly one appended entry: before=%d, after=%d",
-			initialLogLen,
-			finalLogLen,
+			initialLogLen, finalLogLen,
 		)
 	}
 }
 
-
 func TestConcurrentDistinctRequestsAppendAllEntries(t *testing.T) {
-	node := NewRaftNode(
+	node, err := NewRaftNode(
 		0,
 		1,
 		make(chan ApplyMsg, 100),
-		storage.NewMemEngine(),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create Raft node: %v", err)
+	}
 	defer node.Stop()
 
 	node.mu.Lock()
@@ -4075,11 +4063,7 @@ func TestConcurrentDistinctRequestsAppendAllEntries(t *testing.T) {
 
 	for res := range results {
 		if res.err != nil {
-			t.Fatalf(
-				"request %d failed: %v",
-				res.seqNumber,
-				res.err,
-			)
+			t.Fatalf("request %d failed: %v", res.seqNumber, res.err)
 		}
 
 		if seenIndices[res.index] {
@@ -4094,7 +4078,13 @@ func TestConcurrentDistinctRequestsAppendAllEntries(t *testing.T) {
 	}
 
 	if len(seenIndices) != requests {
-		t.Fatalf("expected %d unique indices, got %d", requests, len(seenIndices))
+		t.Fatalf("expected %d unique indices, got %d",
+			requests, len(seenIndices))
+	}
+
+	if len(seenSequences) != requests {
+		t.Fatalf("expected %d unique sequences, got %d",
+			requests, len(seenSequences))
 	}
 
 	node.mu.Lock()
@@ -4103,8 +4093,7 @@ func TestConcurrentDistinctRequestsAppendAllEntries(t *testing.T) {
 	if len(node.log) != initialLogLen+requests {
 		t.Fatalf(
 			"expected %d new log entries, got %d",
-			requests,
-			len(node.log)-initialLogLen,
+			requests, len(node.log)-initialLogLen,
 		)
 	}
 
@@ -4119,25 +4108,32 @@ func TestConcurrentDistinctRequestsAppendAllEntries(t *testing.T) {
 			t.Fatalf("request index missing for sequence number %d", seq)
 		}
 
-		if node.log[index].Command.SeqNumber != int64(seq) {
+		if index <= 0 || index >= len(node.log) {
+			t.Fatalf("invalid log index %d for request %d", index, seq)
+		}
+
+		entry := node.log[index]
+		if entry.Command.ClientID != 42 ||
+			entry.Command.SeqNumber != int64(seq) {
 			t.Fatalf(
 				"request %d maps to incorrect log entry at index %d",
-				seq,
-				index,
+				seq, index,
 			)
 		}
 	}
 }
 
-
-
 func TestConcurrentRequestsDuringLeadershipStepDown(t *testing.T) {
-	node := NewRaftNode(
+	node, err := NewRaftNode(
 		0,
 		1,
 		make(chan ApplyMsg, 100),
-		storage.NewMemEngine(),
+		NewMemPersister(),
+		NewTestStateMachine(storage.NewMemEngine()),
 	)
+	if err != nil {
+		t.Fatalf("failed to create Raft node: %v", err)
+	}
 	defer node.Stop()
 
 	node.mu.Lock()
@@ -4158,7 +4154,6 @@ func TestConcurrentRequestsDuringLeadershipStepDown(t *testing.T) {
 
 	results := make(chan result, requests)
 
-	// Launch requests that wait until the test releases them.
 	for i := int64(1); i <= requests; i++ {
 		wg.Add(1)
 
@@ -4179,10 +4174,7 @@ func TestConcurrentRequestsDuringLeadershipStepDown(t *testing.T) {
 		}(i)
 	}
 
-	// Phase 1: requests while the node is leader must succeed.
 	close(start)
-
-	// Wait for all concurrent requests to finish before stepping down.
 	wg.Wait()
 	close(results)
 
@@ -4190,20 +4182,23 @@ func TestConcurrentRequestsDuringLeadershipStepDown(t *testing.T) {
 
 	for res := range results {
 		if res.err != nil {
-			t.Fatalf("request %d should succeed before step-down: %v", res.seq, res.err)
+			t.Fatalf("request %d should succeed before step-down: %v",
+				res.seq, res.err)
 		}
 		accepted[res.seq] = res.index
 	}
 
 	if len(accepted) != requests {
-		t.Fatalf("expected %d accepted requests, got %d", requests, len(accepted))
+		t.Fatalf("expected %d accepted requests, got %d",
+			requests, len(accepted))
 	}
 
-	// Phase 2: after step-down, new writes must be rejected.
+	// Step down to follower.
 	node.mu.Lock()
 	node.role = Follower
 	node.mu.Unlock()
 
+	// New writes must be rejected.
 	for i := int64(requests + 1); i <= requests+10; i++ {
 		command := Command{
 			ClientID:  42,
@@ -4224,13 +4219,13 @@ func TestConcurrentRequestsDuringLeadershipStepDown(t *testing.T) {
 		}
 	}
 
-	// Confirm the rejected requests did not append entries.
 	node.mu.Lock()
 	defer node.mu.Unlock()
 
-	expectedLogLen := 1 + requests // Include dummy entry at index 0.
+	expectedLogLen := 1 + requests
 	if len(node.log) != expectedLogLen {
-		t.Fatalf("expected log length %d, got %d", expectedLogLen, len(node.log))
+		t.Fatalf("expected log length %d, got %d",
+			expectedLogLen, len(node.log))
 	}
 
 	for seq, index := range accepted {
@@ -4244,32 +4239,40 @@ func TestConcurrentRequestsDuringLeadershipStepDown(t *testing.T) {
 	}
 }
 
-
 func TestConcurrentWritesDuringRealElection(t *testing.T) {
 	nodes := make([]*RaftNode, 3)
 
 	for i := range nodes {
-		nodes[i] = NewRaftNode(
+		node, err := NewRaftNode(
 			i,
 			3,
 			make(chan ApplyMsg, 100),
-			storage.NewMemEngine(),
+			NewMemPersister(),
+			NewTestStateMachine(storage.NewMemEngine()),
 		)
-		defer nodes[i].Stop()
+		if err != nil {
+			t.Fatalf("failed to create node %d: %v", i, err)
+		}
+		nodes[i] = node
 	}
 
-	for i := range nodes {
-		nodes[i].SetPeers(nodes)
-		nodes[i].StartBackground()
+	// Register cleanup before starting background goroutines.
+	defer func() {
+		for _, node := range nodes {
+			node.Stop()
+		}
+	}()
+
+	for _, node := range nodes {
+		node.SetPeers(nodes)
+		node.StartBackground()
 	}
 
-	// Wait for the initial leader.
 	oldLeader := waitForLeader(t, nodes, 3*time.Second)
 
-	// Ensure the cluster has settled before triggering the election.
+	// Allow the cluster to settle.
 	time.Sleep(100 * time.Millisecond)
 
-	// Stop the old leader so the remaining nodes must elect a new one.
 	oldLeader.Stop()
 
 	remainingNodes := make([]*RaftNode, 0, 2)
@@ -4279,7 +4282,6 @@ func TestConcurrentWritesDuringRealElection(t *testing.T) {
 		}
 	}
 
-	// Start requests while the remaining nodes are running elections.
 	const requests = 20
 	start := make(chan struct{})
 
@@ -4299,7 +4301,6 @@ func TestConcurrentWritesDuringRealElection(t *testing.T) {
 			defer wg.Done()
 			<-start
 
-			// Send each request to one of the surviving nodes.
 			node := remainingNodes[int(seq%int64(len(remainingNodes)))]
 
 			command := Command{
@@ -4319,33 +4320,37 @@ func TestConcurrentWritesDuringRealElection(t *testing.T) {
 	wg.Wait()
 	close(results)
 
-	// Requests can succeed on the elected leader or be rejected on a follower.
 	accepted := make(map[int64]int)
+
 	for res := range results {
 		if res.err == nil {
 			accepted[res.seq] = res.index
 		} else if !errors.Is(res.err, ErrWrongLeader) {
-			t.Fatalf("request %d returned unexpected error: %v", res.seq, res.err)
+			t.Fatalf("request %d returned unexpected error: %v",
+				res.seq, res.err)
 		}
 	}
 
-	// Wait for the cluster to elect a new leader.
 	newLeader := waitForLeader(t, remainingNodes, 5*time.Second)
 	if newLeader == oldLeader {
 		t.Fatal("stopped node unexpectedly became leader")
 	}
 
-	// Confirm every accepted request exists in the node that accepted it.
+	// Verify each accepted request exists in a surviving node's log.
 	for seq, index := range accepted {
 		found := false
 
 		for _, node := range remainingNodes {
 			node.mu.Lock()
-			if index > 0 && index < len(node.log) &&
-				node.log[index].Command.ClientID == 77 &&
-				node.log[index].Command.SeqNumber == seq {
-				found = true
+
+			if index > 0 && index < len(node.log) {
+				entry := node.log[index]
+				if entry.Command.ClientID == 77 &&
+					entry.Command.SeqNumber == seq {
+					found = true
+				}
 			}
+
 			node.mu.Unlock()
 
 			if found {
@@ -4354,7 +4359,10 @@ func TestConcurrentWritesDuringRealElection(t *testing.T) {
 		}
 
 		if !found {
-			t.Fatalf("accepted request %d was not found in the surviving logs", seq)
+			t.Fatalf(
+				"accepted request %d at index %d was not found in surviving logs",
+				seq, index,
+			)
 		}
 	}
 }

@@ -44,11 +44,11 @@ type ApplyMsg struct {
 	Command      Command
 	CommandIndex int
 	CommandTerm  int
+}
 
-	SnapshotValid bool
-	Snapshot      []byte
-	SnapshotTerm  int
-	SnapshotIndex int
+type ApplyResult struct {
+	Done chan struct{}
+	Err  error
 }
 
 type RequestID struct {
@@ -57,37 +57,10 @@ type RequestID struct {
 }
 
 type StateMachine interface {
-	Apply(msg ApplyMsg) ( err error)
-	Get(key []byte) (value string,found bool, err error)
-	Snapshot() ([]byte, error)
-	Restore(snapshot []byte) error
+	Apply(msg ApplyMsg) (err error)
+	Get(key []byte) (value []byte, found bool, err error)
+	LastApplied() (int, error)
+	IsClosed() bool
+	IsFailed() bool
+	Open() error
 }
-
-//              CLIENT
-//                 │
-//                 │ SET A=10
-//                 ▼
-//              Command
-//                 │
-//                 ▼
-//            LogEntry
-//       ┌─────────┼─────────┐
-//       │         │         │
-//    Index      Term     Command
-//                           │
-//                           ▼
-//                    Raft replication
-//                           │
-//                      majority ACK
-//                           │
-//                           ▼
-//                        COMMIT
-//                           │
-//                           ▼
-//                       ApplyMsg
-//                           │
-//                           ▼
-//                    StateMachine
-//                           │
-//                           ▼
-//                      KV State Machine
