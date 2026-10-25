@@ -175,13 +175,14 @@ func (rn *RaftNode) resetElectionTimeout() {
 // Start is called by the client to submit a new command.
 func (rn *RaftNode) Start(command Command) (int, int, error) {
 	rn.mu.Lock()
-	defer rn.mu.Unlock()
 
 	if rn.stopped {
+		rn.mu.Unlock()
 		return -1, -1, ErrNodeStopped
 	}
 
 	if rn.role != Leader {
+		rn.mu.Unlock()
 		return -1, -1, ErrWrongLeader
 	}
 
@@ -198,9 +199,10 @@ func (rn *RaftNode) Start(command Command) (int, int, error) {
 
 				if existingCommand != command {
 					// The same request ID cannot represent two different commands.
+					rn.mu.Unlock()
 					return -1, -1, ErrRequestIDConflict
 				}
-
+				rn.mu.Unlock()
 				return existingIndex, rn.log[existingIndex].Term, nil
 			}
 
@@ -232,6 +234,7 @@ func (rn *RaftNode) Start(command Command) (int, int, error) {
 		rn.votedFor,
 		newLog,
 	); err != nil {
+		rn.mu.Unlock()
 		return -1, -1, err
 	}
 
@@ -250,10 +253,14 @@ func (rn *RaftNode) Start(command Command) (int, int, error) {
 	rn.matchIndex[rn.me] = index
 	rn.nextIndex[rn.me] = index + 1
 
-	// In a single-node cluster, the leader itself is a majority.
+	var applyMsgs []ApplyMsg
 	if rn.peersCount == 1 {
-		applyMsgs := rn.collectCommittedEntries()
-		go func() {
+		applyMsgs = rn.collectCommittedEntries()
+	}
+	rn.mu.Unlock()
+	// In a single-node cluster, the leader itself is a majority.
+	if len(applyMsgs) > 0 {
+		rn.spawn(func() {
 			//The purpose is to send the application messages without making Start() wait synchronously for the receiver of applyCh. Without the go keyword, a send to an unbuffered channel—or a full buffered channel—could block Start() until a receiver became available.
 			for _, msg := range applyMsgs {
 				select {
@@ -262,7 +269,7 @@ func (rn *RaftNode) Start(command Command) (int, int, error) {
 					return
 				}
 			}
-		}()
+		})
 	}
 
 	return index, term, nil
@@ -340,9 +347,11 @@ func (rn *RaftNode) Get(clientID, seqNumber int64, key string) (string, bool, er
 		}
 
 		recoveryResult := make(chan error, 1)
-		go func() {
+		if !rn.spawn(func() {
 			recoveryResult <- rn.openFailedEngine()
-		}()
+		}) {
+			return "", false, ErrNodeStopped
+		}
 
 		select {
 		case recoveryErr := <-recoveryResult:
@@ -409,9 +418,11 @@ func (rn *RaftNode) waitForApply(index int) error {
 			if errors.Is(err, apperrors.ErrEngineFailed) {
 				recoveryDone := make(chan error, 1)
 
-				go func() {
+				if !rn.spawn(func() {
 					recoveryDone <- rn.openFailedEngine()
-				}()
+				}) {
+					return ErrNodeStopped
+				}
 
 				select {
 				case recoveryErr := <-recoveryDone:
@@ -567,8 +578,8 @@ func (rn *RaftNode) readIndex() (int, error) {
 		if i == me {
 			continue
 		}
-
-		go func(peerID int) {
+		peerID := i
+		rn.spawn(func() {
 			args := ReadProbeArgs{
 				Term:     term,
 				LeaderID: me,
@@ -580,7 +591,7 @@ func (rn *RaftNode) readIndex() (int, error) {
 			results <- probeResult{
 				term: reply.Term,
 			}
-		}(i)
+		})
 	}
 
 	// Count valid acknowledgements.
@@ -777,7 +788,7 @@ func (rn *RaftNode) recoverSingleNodeState() error {
 	}
 
 	applyMsgs := rn.collectCommittedEntries()
-	go func() {
+	rn.spawn(func() {
 		//The purpose is to send the application messages without making Start() wait synchronously for the receiver of applyCh. Without the go keyword, a send to an unbuffered channel—or a full buffered channel—could block Start() until a receiver became available.
 		for _, msg := range applyMsgs {
 			select {
@@ -786,7 +797,7 @@ func (rn *RaftNode) recoverSingleNodeState() error {
 				return
 			}
 		}
-	}()
+	})
 	// In this single-node configuration, the recovered durable log represents the committed state reconstructed above.
 
 	return nil

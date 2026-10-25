@@ -173,16 +173,17 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 	rn.mu.Unlock()
 
 	// 7. Deliver committed entries to the state machine.
-	for _, msg := range msgs {
-		if rn.applyCh == nil {
-			continue
-		}
-
-		select {
-		case rn.applyCh <- msg:
-		case <-rn.stopCh:
-			return
-		}
+	// 7. Deliver committed entries without blocking the RPC handler.
+	if len(msgs) > 0 {
+		rn.spawn(func() {
+			for _, msg := range msgs {
+				select {
+				case rn.applyCh <- msg:
+				case <-rn.stopCh:
+					return
+				}
+			}
+		})
 	}
 }
 

@@ -83,6 +83,7 @@ func (rn *RaftNode) runLoop() {
 
 func (rn *RaftNode) startElection() {
 	rn.mu.Lock()
+
 	if rn.role == Leader ||
 		time.Since(rn.lastResetTime) < rn.electionTimeout {
 		rn.mu.Unlock()
@@ -91,11 +92,8 @@ func (rn *RaftNode) startElection() {
 
 	newTerm := rn.currentTerm + 1
 	newVotedFor := rn.me
-	if err := rn.persistState(
-		newTerm,
-		newVotedFor,
-		rn.log,
-	); err != nil {
+
+	if err := rn.persistState(newTerm, newVotedFor, rn.log); err != nil {
 		rn.mu.Unlock()
 		return
 	}
@@ -114,6 +112,7 @@ func (rn *RaftNode) startElection() {
 	rn.mu.Unlock()
 
 	println("Node", me, "started election for term", term)
+
 	var votesMu sync.Mutex
 	votesReceived := 1 // Vote for self
 
@@ -122,9 +121,8 @@ func (rn *RaftNode) startElection() {
 		rn.mu.Lock()
 
 		if rn.role == Candidate && rn.currentTerm == term {
-			println("Node", me, "BECAME LEADER for term", term)
-
 			index := len(rn.log)
+
 			noop := LogEntry{
 				Index: index,
 				Term:  term,
@@ -145,6 +143,7 @@ func (rn *RaftNode) startElection() {
 				rn.mu.Unlock()
 				return
 			}
+
 			rn.role = Leader
 			rn.log = newLog
 			rn.rebuildRequestIndex()
@@ -156,18 +155,25 @@ func (rn *RaftNode) startElection() {
 
 			rn.mu.Unlock()
 
-			for _, msg := range msgs {
-				if rn.applyCh == nil {
-					continue
-				}
+			println("Node", me, "BECAME LEADER for term", term)
 
-				select {
-				case rn.applyCh <- msg:
-				case <-rn.stopCh:
-					return
-				}
+			if len(msgs)>0 {
+				rn.spawn(func() {
+					for _, msg := range msgs {
+						if rn.applyCh == nil {
+							continue
+						}
+
+						select {
+						case rn.applyCh <- msg:
+						case <-rn.stopCh:
+							return
+						}
+					}
+				})
 			}
-			go rn.broadcastAppendEntries()
+
+			rn.spawn(rn.broadcastAppendEntries)
 		} else {
 			rn.mu.Unlock()
 		}
@@ -180,90 +186,112 @@ func (rn *RaftNode) startElection() {
 			continue
 		}
 
-		go func(peerID int) {
+		peerID := i
+
+		rn.spawn(func() {
 			args := RequestVoteArgs{
 				Term:         term,
 				CandidateID:  me,
 				LastLogIndex: lastLogIndex,
 				LastLogTerm:  lastLogTerm,
 			}
-			var reply RequestVoteReply
 
+			var reply RequestVoteReply
 			peers[peerID].RequestVote(&args, &reply)
 
-			rn.mu.Lock()
-			defer rn.mu.Unlock()
+			// Process the reply while holding the mutex.
+			// Return true if this reply makes us leader.
+			shouldBroadcast := func() bool {
+				rn.mu.Lock()
+				defer rn.mu.Unlock()
 
-			if reply.Term > rn.currentTerm {
-				if err := rn.persistState(
-					reply.Term,
-					-1,
-					rn.log,
-				); err != nil {
-					// Do not publish the higher term if persistence fails.
-					return
+				if reply.Term > rn.currentTerm {
+					if err := rn.persistState(
+						reply.Term,
+						-1,
+						rn.log,
+					); err != nil {
+						return false
+					}
+
+					rn.currentTerm = reply.Term
+					rn.role = Follower
+					rn.votedFor = -1
+					rn.resetElectionTimeout()
+					return false
 				}
 
-				rn.currentTerm = reply.Term
-				rn.role = Follower
-				rn.votedFor = -1
-				rn.resetElectionTimeout()
-				return
-			}
+				// Ignore replies from an outdated election.
+				if rn.role != Candidate || rn.currentTerm != term {
+					return false
+				}
 
-			// Ignore stale replies from an election we no longer belong to.
-			if rn.role != Candidate || rn.currentTerm != term {
-				return
-			}
+				if !reply.VoteGranted {
+					return false
+				}
 
-			if reply.VoteGranted {
-				println("Node", me, "received vote from", peerID, "for term", term)
+				println(
+					"Node", me,
+					"received vote from", peerID,
+					"for term", term,
+				)
+
 				votesMu.Lock()
 				votesReceived++
 				hasQuorum := votesReceived > len(peers)/2
 				votesMu.Unlock()
 
-				if hasQuorum && rn.role == Candidate {
-					println("Node", me, "BECAME LEADER for term", term)
-
-					index := len(rn.log)
-					noop := LogEntry{
-						Index: index,
-						Term:  term,
-						Command: Command{
-							Op: "NOOP",
-						},
-					}
-
-					newLog := make([]LogEntry, len(rn.log)+1)
-					copy(newLog, rn.log)
-					newLog[index] = noop
-
-					if err := rn.persistState(
-						rn.currentTerm,
-						rn.votedFor,
-						newLog,
-					); err != nil {
-						return
-					}
-					rn.role = Leader
-					rn.log = newLog
-					rn.rebuildRequestIndex()
-					rn.matchIndex[rn.me] = index
-					rn.nextIndex[rn.me] = index + 1
-
-					for j := range rn.peers {
-						if j != rn.me {
-							rn.nextIndex[j] = index
-							rn.matchIndex[j] = 0
-						}
-					}
-
-					go rn.broadcastAppendEntries()
-					return
+				if !hasQuorum || rn.role != Candidate {
+					return false
 				}
+
+				index := len(rn.log)
+
+				noop := LogEntry{
+					Index: index,
+					Term:  term,
+					Command: Command{
+						Op: "NOOP",
+					},
+				}
+
+				newLog := make([]LogEntry, len(rn.log)+1)
+				copy(newLog, rn.log)
+				newLog[index] = noop
+
+				if err := rn.persistState(
+					rn.currentTerm,
+					rn.votedFor,
+					newLog,
+				); err != nil {
+					return false
+				}
+
+				rn.role = Leader
+				rn.log = newLog
+				rn.rebuildRequestIndex()
+				rn.matchIndex[rn.me] = index
+				rn.nextIndex[rn.me] = index + 1
+
+				for j := range rn.peers {
+					if j != rn.me {
+						rn.nextIndex[j] = index
+						rn.matchIndex[j] = 0
+					}
+				}
+
+				println(
+					"Node", me,
+					"BECAME LEADER for term", term,
+				)
+
+				return true
+			}()
+
+			if shouldBroadcast {
+				rn.spawn(rn.broadcastAppendEntries)
 			}
-		}(i)
+		})
 	}
 }
 
@@ -283,8 +311,8 @@ func (rn *RaftNode) broadcastAppendEntries() {
 		if i == me {
 			continue
 		}
-
-		go func(peerID int) {
+		peerID := i
+		rn.spawn(func() {
 			rn.mu.Lock()
 			sentNextIndex := rn.nextIndex[peerID]
 			if rn.role != Leader || rn.currentTerm != term {
@@ -377,17 +405,46 @@ func (rn *RaftNode) broadcastAppendEntries() {
 				}
 			}
 			rn.mu.Unlock()
-			for _, msg := range msgs {
-				if rn.applyCh == nil {
-					continue
-				}
 
-				select {
-				case rn.applyCh <- msg:
-				case <-rn.stopCh:
-					return
-				}
+			// 7. Deliver committed entries without blocking the RPC handler.
+			if len(msgs) > 0 {
+				rn.spawn(func() {
+					for _, msg := range msgs {
+						select {
+						case rn.applyCh <- msg:
+						case <-rn.stopCh:
+							return
+						}
+					}
+				})
 			}
-		}(i)
+		})
 	}
+}
+
+// spawn starts a tracked goroutine unless the node is stopping.
+// The shutdown check and WaitGroup registration are synchronized
+// with Stop() using rn.mu.
+func (rn *RaftNode) spawn(fn func()) bool {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	if rn.stopped {
+		return false
+	}
+
+	select {
+	case <-rn.stopCh:
+		return false
+	default:
+	}
+
+	rn.wg.Add(1)
+
+	go func() {
+		defer rn.wg.Done()
+		fn()
+	}()
+
+	return true
 }
