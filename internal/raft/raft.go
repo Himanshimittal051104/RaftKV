@@ -50,7 +50,9 @@ type RaftNode struct {
 	lastResetTime   time.Time     //Records when the election timer was last reset.
 	electionTimeout time.Duration //How long this node waits before starting an election.
 
-	applyWaiters map[int]*ApplyResult //A map from a log index (int) to a Go channel that carries an error.
+	applyWaiters map[RequestID]*ApplyResult //A map from a request_id to a Go channel that carries an error.
+	appliedRequests map[RequestID]*ApplyResult
+	indexWaiters map[int]*ApplyResult
 
 	applyCh chan ApplyMsg //This is a Go channel. It's used to send committed Raft commands toward the application/state-machine layer.
 	stopCh  chan struct{} //This is typically used to tell background goroutines to stop running. The struct{} type is an empty struct, which takes up no memory. It's often used as a signal in channels(no data, only signals).
@@ -109,7 +111,9 @@ func NewRaftNode(me int, peersCount int, applyCh chan ApplyMsg, persister Persis
 		commitIndex:  0,
 		nextIndex:    make([]int, peersCount),
 		matchIndex:   make([]int, peersCount),
-		applyWaiters: make(map[int]*ApplyResult),
+		applyWaiters: make(map[RequestID]*ApplyResult),
+		appliedRequests: make(map[RequestID]*ApplyResult),
+		indexWaiters: make(map[int]*ApplyResult),
 		applyCh:      applyCh,
 		stopCh:       make(chan struct{}),
 		persister:    persister,
@@ -285,13 +289,17 @@ func (rn *RaftNode) Put(clientID, seqNumber int64, key, value string) (bool, err
 		Value:     value,
 	}
 
+	requestID := RequestID{
+		ClientID:  cmd.ClientID,
+		SeqNumber: cmd.SeqNumber,
+	}
 	index, _, err := rn.Start(cmd)
 
 	if err != nil {
 		return false, err
 	}
 
-	if err := rn.waitForApply(index); err != nil {
+	if err := rn.waitForApply(requestID, index); err != nil {
 		return false, err
 	}
 
@@ -301,6 +309,10 @@ func (rn *RaftNode) Put(clientID, seqNumber int64, key, value string) (bool, err
 // Get reads directly from the engine if the node is a verified leader.
 func (rn *RaftNode) Get(clientID, seqNumber int64, key string) (string, bool, error) {
 	rn.mu.Lock()
+	if rn.stopped {
+		rn.mu.Unlock()
+		return "", false, ErrNodeStopped
+	}
 	if rn.role != Leader {
 		rn.mu.Unlock()
 		return "", false, ErrWrongLeader
@@ -315,8 +327,8 @@ func (rn *RaftNode) Get(clientID, seqNumber int64, key string) (string, bool, er
 	}
 
 	// wait until the state machine has applied everything through readIndex.
-
-	if err := rn.waitForApply(readIndex); err != nil {
+	
+	if err := rn.waitForApply(RequestID{}, readIndex); err != nil {
 		return "", false, err
 	}
 
@@ -365,7 +377,20 @@ func (rn *RaftNode) Get(clientID, seqNumber int64, key string) (string, bool, er
 			return "", false, ErrTimeout
 		}
 
+		// Recovery may take time, during which leadership can change.
+		rn.mu.Lock()
+		if rn.stopped {
+			rn.mu.Unlock()
+			return "", false, ErrNodeStopped
+		}
+		if rn.role != Leader || rn.currentTerm != term {
+			rn.mu.Unlock()
+			return "", false, ErrWrongLeader
+		}
+		rn.mu.Unlock()
+
 		// Recovery succeeded; retry Get().
+		
 	}
 }
 
@@ -377,26 +402,29 @@ func (rn *RaftNode) Delete(clientID, seqNumber int64, key string) (bool, error) 
 		Op:        "DELETE",
 		Key:       key,
 	}
-
+	requestID := RequestID{
+		ClientID:  cmd.ClientID,
+		SeqNumber: cmd.SeqNumber,
+	}
 	index, _, err := rn.Start(cmd)
 	if err != nil {
 		return false, err
 	}
 
-	if err := rn.waitForApply(index); err != nil {
+	if err := rn.waitForApply(requestID, index); err != nil {
 		return false, err
 	}
 
 	return true, nil
 }
 
-func (rn *RaftNode) waitForApply(index int) error {
-	if index < 0 {
-		return fmt.Errorf("raft: invalid apply index %d", index)
-	}
+func (rn *RaftNode) waitForApply(requestId RequestID, index int) error {
 
 	timer := time.NewTimer(2 * time.Second)
 	defer timer.Stop()
+
+	isReadWait := requestId == (RequestID{})
+
 
 	for {
 		rn.mu.Lock()
@@ -411,24 +439,35 @@ func (rn *RaftNode) waitForApply(index int) error {
 			return apperrors.ErrEngineClosed
 		}
 
+		if !isReadWait {
+			if _, applied := rn.appliedRequests[requestId]; applied {
+				rn.mu.Unlock()
+				return nil
+			}
+		}
+
 		lastApplied, err := rn.stateMachine.LastApplied()
+
 		if err != nil {
 			rn.mu.Unlock()
 
 			if errors.Is(err, apperrors.ErrEngineFailed) {
-				recoveryDone := make(chan error, 1)
+				// Recover the failed engine without blocking this goroutine
+				// indefinitely beyond the request timeout.
+				recoveryResult := make(chan error, 1)
 
 				if !rn.spawn(func() {
-					recoveryDone <- rn.openFailedEngine()
+					recoveryResult <- rn.openFailedEngine()
 				}) {
 					return ErrNodeStopped
 				}
 
 				select {
-				case recoveryErr := <-recoveryDone:
+				case recoveryErr := <-recoveryResult:
 					if recoveryErr != nil {
 						return recoveryErr
 					}
+					// Engine reopened. Recheck application progress.
 					continue
 
 				case <-rn.stopCh:
@@ -438,7 +477,6 @@ func (rn *RaftNode) waitForApply(index int) error {
 					return ErrTimeout
 				}
 			}
-
 			return err
 		}
 
@@ -447,14 +485,27 @@ func (rn *RaftNode) waitForApply(index int) error {
 			return nil
 		}
 
-		result, exists := rn.applyWaiters[index]
-		if !exists {
-			result = &ApplyResult{
-				Done: make(chan struct{}),
-			}
-			rn.applyWaiters[index] = result
-		}
+		var result *ApplyResult
 
+		if isReadWait {
+			// Reuse the existing waiter for this index.
+			result= rn.indexWaiters[index]
+			if result == nil {
+				result = &ApplyResult{
+					Done: make(chan struct{}),
+				}
+				rn.indexWaiters[index] = result
+			}
+		} else {
+			// Reuse the existing waiter for this write request.
+			result = rn.applyWaiters[requestId]
+			if result == nil {
+				result = &ApplyResult{
+					Done: make(chan struct{}),
+				}
+				rn.applyWaiters[requestId] = result
+			}
+		}
 		rn.mu.Unlock()
 
 		select {
@@ -470,31 +521,55 @@ func (rn *RaftNode) waitForApply(index int) error {
 	}
 }
 
-func (rn *RaftNode) notifyApplied(index int, err error) {
-	rn.mu.Lock()
-	defer rn.mu.Unlock()
 
-	result, exists := rn.applyWaiters[index]
-	if !exists {
-		return
-	}
+func (rn *RaftNode) notifyApplied(requestID RequestID,index int,err error,) {
+    rn.mu.Lock()
+    defer rn.mu.Unlock()
 
-	select {
-	case <-result.Done:
-		return
-	default:
-	}
+    // Notify the write request waiter.
+    if requestID != (RequestID{}) {
+        if err == nil {
+            rn.appliedRequests[requestID] = &ApplyResult{
+                Err: nil,
+            }
+        }
 
-	result.Err = err
-	close(result.Done) //closing a channel wakes up every goroutine waiting to receive from it—not just one.
-	delete(rn.applyWaiters, index)
+        if result, exists := rn.applyWaiters[requestID]; exists {
+            select {
+            case <-result.Done:
+                // Already notified.
+            default:
+                result.Err = err
+                close(result.Done)
+            }
+
+            delete(rn.applyWaiters, requestID)
+        }
+    }
+
+    // Notify readers waiting for this index or an earlier index.
+    for targetIndex, result := range rn.indexWaiters {
+        if targetIndex > index {
+            continue
+        }
+
+        select {
+        case <-result.Done:
+            // Already notified.
+        default:
+            result.Err = err
+            close(result.Done)
+        }
+
+        delete(rn.indexWaiters, targetIndex)
+    }
 }
 
 func (rn *RaftNode) failApplyWaiters(err error) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
-	for index, result := range rn.applyWaiters {
+	for requestId, result := range rn.applyWaiters {
 		select {
 		case <-result.Done:
 			// Already notified.
@@ -502,7 +577,20 @@ func (rn *RaftNode) failApplyWaiters(err error) {
 			result.Err = err
 			close(result.Done)
 		}
-		delete(rn.applyWaiters, index)
+		delete(rn.applyWaiters, requestId)
+	}
+
+	// Notify pending reads waiting for specific indexes.
+	for index, result := range rn.indexWaiters {
+		select {
+		case <-result.Done:
+			// Already notified.
+		default:
+			result.Err = err
+			close(result.Done)
+		}
+
+		delete(rn.indexWaiters, index)
 	}
 }
 
@@ -710,6 +798,10 @@ func (rn *RaftNode) applyLoop() {
 							rn.failApplyWaiters(err)
 							return
 						}
+						if !errors.Is(err, apperrors.ErrEngineFailed) {
+							rn.failApplyWaiters(err)
+							return
+						}
 						// Retry the same entry, unless shutting down.
 						err = rn.openFailedEngine() // this can throw node stopped or engine closed err
 						if err != nil {
@@ -746,7 +838,15 @@ func (rn *RaftNode) applyLoop() {
 					}
 				}
 
-				rn.notifyApplied(current.CommandIndex, nil)
+				requestID := RequestID{}
+				if current.Command.Op != "NOOP" && current.Command.ClientID!=0 && current.Command.SeqNumber!=0 {
+					requestID = RequestID{
+						ClientID:  current.Command.ClientID,
+						SeqNumber: current.Command.SeqNumber,
+					}
+				}
+				rn.notifyApplied(requestID,current.CommandIndex, nil)
+
 				delete(pending, current.CommandIndex)
 
 				nextExpected := current.CommandIndex + 1

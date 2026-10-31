@@ -128,6 +128,7 @@ func (rn *RaftNode) startElection() {
 				Term:  term,
 				Command: Command{
 					Op: "NOOP",
+					SeqNumber: int64(rn.currentTerm),
 				},
 			}
 
@@ -252,6 +253,7 @@ func (rn *RaftNode) startElection() {
 					Term:  term,
 					Command: Command{
 						Op: "NOOP",
+						SeqNumber: int64(rn.currentTerm),
 					},
 				}
 

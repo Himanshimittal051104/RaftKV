@@ -1345,7 +1345,11 @@ func (e *retryableRecoveryEngine) Put(index int, key, value []byte) error {
 
 	e.putCount++
 	if e.failAtPut > 0 && e.putCount == e.failAtPut {
-		return fmt.Errorf("simulated temporary Put failure")
+		e.failed = true
+		return fmt.Errorf(
+			"simulated temporary Put failure: %w",
+			apperrors.ErrEngineFailed,
+		)
 	}
 
 	e.data[string(key)] = string(value)
@@ -1434,6 +1438,7 @@ func (e *retryableRecoveryEngine) IsFailed() bool {
 	return e.failed
 }
 
+
 func TestRecoveryRetryAfterPartialFailure(t *testing.T) {
 	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
 
@@ -1443,21 +1448,27 @@ func TestRecoveryRetryAfterPartialFailure(t *testing.T) {
 			Index: 1,
 			Term:  1,
 			Command: Command{
-				Op: "SET", Key: "language", Value: "Go",
+				Op:    "SET",
+				Key:   "language",
+				Value: "Go",
 			},
 		},
 		{
 			Index: 2,
 			Term:  1,
 			Command: Command{
-				Op: "SET", Key: "city", Value: "Delhi",
+				Op:    "SET",
+				Key:   "city",
+				Value: "Delhi",
 			},
 		},
 		{
 			Index: 3,
 			Term:  1,
 			Command: Command{
-				Op: "SET", Key: "database", Value: "RaftKV",
+				Op:    "SET",
+				Key:   "database",
+				Value: "RaftKV",
 			},
 		},
 	}
@@ -1471,11 +1482,13 @@ func TestRecoveryRetryAfterPartialFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create persister: %v", err)
 	}
+
 	if err := persister.SaveRaftState(state); err != nil {
 		t.Fatalf("save state: %v", err)
 	}
 
-	// The second Put fails once; applyLoop should retry it.
+	// The second Put fails once. Recovery should retry and eventually
+	// apply all entries without losing previously applied data.
 	engine := newRetryableRecoveryEngine(2)
 	stateMachine := NewTestStateMachine(engine)
 
@@ -1497,19 +1510,20 @@ func TestRecoveryRetryAfterPartialFailure(t *testing.T) {
 
 	// Wait for all recovered entries to be applied.
 	deadline := time.Now().Add(3 * time.Second)
+
 	for {
 		lastApplied, err := stateMachine.LastApplied()
 		if err != nil {
-			t.Fatalf("get lastApplied: %v", err)
+			t.Fatalf("get LastApplied: %v", err)
 		}
 
-		if lastApplied == 3 {
+		if lastApplied >= 3 {
 			break
 		}
 
 		if time.Now().After(deadline) {
 			t.Fatalf(
-				"timed out waiting for recovery: lastApplied = %d, want 3",
+				"timed out waiting for recovery: LastApplied = %d, want 3",
 				lastApplied,
 			)
 		}
@@ -1523,9 +1537,13 @@ func TestRecoveryRetryAfterPartialFailure(t *testing.T) {
 	engine.mu.Unlock()
 
 	if putCount < 4 {
-		t.Fatalf("putCount = %d, want at least 4 after retry", putCount)
+		t.Fatalf(
+			"putCount = %d, want at least 4 after retry",
+			putCount,
+		)
 	}
 
+	// Verify that every recovered entry is present and correct.
 	expected := map[string]string{
 		"language": "Go",
 		"city":     "Delhi",
@@ -1535,17 +1553,21 @@ func TestRecoveryRetryAfterPartialFailure(t *testing.T) {
 	for key, want := range expected {
 		got, found, err := stateMachine.Get([]byte(key))
 		if err != nil {
-			t.Fatalf("Get(%q): %v", key, err)
+			t.Errorf("Get(%q): %v", key, err)
+			continue
 		}
+
 		if !found {
 			t.Errorf("key %q not found", key)
 			continue
 		}
+
 		if string(got) != want {
 			t.Errorf("%s = %q, want %q", key, got, want)
 		}
 	}
 }
+
 
 func TestMultiNodeFollowerReplaysCommittedEntriesAfterRestart(t *testing.T) {
 	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")

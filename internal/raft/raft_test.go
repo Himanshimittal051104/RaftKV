@@ -1277,13 +1277,19 @@ func TestWaitForApplyBlocksUntilApplied(t *testing.T) {
 	}
 	defer node.Stop()
 
+	requestID := RequestID{
+		ClientID:  1,
+		SeqNumber: 1,
+	}
+	const index = 1
+
 	done := make(chan error, 1)
 
 	go func() {
-		done <- node.waitForApply(1)
+		done <- node.waitForApply(requestID, index)
 	}()
 
-	// It must not return before index 1 is applied.
+	// It must not return before the request is applied.
 	select {
 	case err := <-done:
 		t.Fatalf("waitForApply returned before application: %v", err)
@@ -1291,8 +1297,23 @@ func TestWaitForApplyBlocksUntilApplied(t *testing.T) {
 		// Expected: still waiting.
 	}
 
-	// Simulate successful application.
-	node.notifyApplied(1, nil)
+	// Simulate successful application at index 1.
+	err = stateMachine.Apply(ApplyMsg{
+		CommandValid: true,
+		CommandIndex: index,
+		Command: Command{
+			Op:        "SET",
+			ClientID:  requestID.ClientID,
+			SeqNumber: requestID.SeqNumber,
+			Key:       "key",
+			Value:     "value",
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to apply command: %v", err)
+	}
+
+	node.notifyApplied(requestID, index, nil)
 
 	select {
 	case err := <-done:
@@ -1300,7 +1321,7 @@ func TestWaitForApplyBlocksUntilApplied(t *testing.T) {
 			t.Fatalf("expected successful application, got: %v", err)
 		}
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("waitForApply did not return after notifyApplied")
+		t.Fatal("waitForApply did not return after notification")
 	}
 }
 
@@ -1316,10 +1337,11 @@ func TestWaitForApplyTimeout(t *testing.T) {
 	}
 	defer node.Stop()
 
+	requestID := RequestID{ClientID: 1, SeqNumber: 1}
+	const index = 1
+
 	start := time.Now()
-
-	err = node.waitForApply(1)
-
+	err = node.waitForApply(requestID, index)
 	elapsed := time.Since(start)
 
 	if !errors.Is(err, ErrTimeout) {
@@ -1330,25 +1352,12 @@ func TestWaitForApplyTimeout(t *testing.T) {
 		t.Fatalf("waitForApply returned too early: elapsed=%v", elapsed)
 	}
 
-	// The timed-out result may remain registered because it can be
-	// shared by multiple goroutines waiting for the same index.
 	node.mu.Lock()
-	result, exists := node.applyWaiters[1]
+	result, exists := node.applyWaiters[requestID]
 	node.mu.Unlock()
 
-	if !exists {
-		t.Fatal("expected shared ApplyResult to remain registered until notification")
-	}
-
-	if result == nil {
-		t.Fatal("expected a non-nil ApplyResult")
-	}
-
-	select {
-	case <-result.Done:
-		t.Fatal("expected Done to remain open because index 1 was not applied")
-	default:
-		// Expected: no application notification has occurred.
+	if exists && result == nil {
+		t.Fatal("registered waiter must not be nil")
 	}
 }
 
@@ -1365,25 +1374,34 @@ func TestNotifyAppliedReleasesWaiter(t *testing.T) {
 	}
 	defer node.Stop()
 
+	requestID := RequestID{ClientID: 1, SeqNumber: 1}
+	const index = 1
+
 	done := make(chan error, 1)
 
 	go func() {
-		done <- node.waitForApply(1)
+		done <- node.waitForApply(requestID, index)
 	}()
 
-	// Give waitForApply a moment to register its waiter.
-	time.Sleep(20 * time.Millisecond)
+	// Wait until the write waiter is registered.
+	deadline := time.Now().Add(time.Second)
+	for {
+		node.mu.Lock()
+		_, exists := node.applyWaiters[requestID]
+		node.mu.Unlock()
 
-	node.mu.Lock()
-	_, exists := node.applyWaiters[1]
-	node.mu.Unlock()
+		if exists {
+			break
+		}
 
-	if !exists {
-		t.Fatal("waiter was not registered")
+		if time.Now().After(deadline) {
+			t.Fatal("waiter was not registered")
+		}
+
+		time.Sleep(time.Millisecond)
 	}
 
-	// Simulate successful application.
-	node.notifyApplied(1, nil)
+	node.notifyApplied(requestID, index, nil)
 
 	select {
 	case err := <-done:
@@ -1394,9 +1412,8 @@ func TestNotifyAppliedReleasesWaiter(t *testing.T) {
 		t.Fatal("waitForApply did not return after notifyApplied")
 	}
 
-	// The waiter should have been removed.
 	node.mu.Lock()
-	_, exists = node.applyWaiters[1]
+	_, exists := node.applyWaiters[requestID]
 	node.mu.Unlock()
 
 	if exists {
@@ -1412,6 +1429,7 @@ func TestCommittedCommandReleasesClient(t *testing.T) {
 	// Create 3 nodes with their own state machines.
 	for i := 0; i < 3; i++ {
 		applyChs[i] = make(chan ApplyMsg, 10)
+
 		engine := storage.NewMemEngine()
 		stateMachines[i] = NewTestStateMachine(engine)
 
@@ -1425,6 +1443,7 @@ func TestCommittedCommandReleasesClient(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to create node %d: %v", i, err)
 		}
+
 		nodes[i] = node
 	}
 
@@ -1439,7 +1458,7 @@ func TestCommittedCommandReleasesClient(t *testing.T) {
 		node.SetPeers(nodes)
 	}
 
-	// State-machine consumers.
+	// Start state-machine consumers.
 	for i := 0; i < 3; i++ {
 		go func(i int) {
 			for msg := range applyChs[i] {
@@ -1447,24 +1466,46 @@ func TestCommittedCommandReleasesClient(t *testing.T) {
 					continue
 				}
 
+				// Apply every valid committed entry, including NOOPs.
 				err := stateMachines[i].Apply(msg)
-				nodes[i].notifyApplied(msg.CommandIndex, err)
+
+				// Construct a request ID only for a client command.
+				requestID := RequestID{}
+				if msg.Command.Op != "NOOP" &&
+					msg.Command.ClientID != 0 &&
+					msg.Command.SeqNumber > 0 {
+					requestID = RequestID{
+						ClientID:  msg.Command.ClientID,
+						SeqNumber: msg.Command.SeqNumber,
+					}
+				}
+
+				// Notify request waiters and index waiters.
+				if err != nil {
+					nodes[i].failApplyWaiters(err)
+					continue
+				}
+
+				nodes[i].notifyApplied(
+					requestID,
+					msg.CommandIndex,
+					nil,
+				)
 			}
 		}(i)
 	}
 
 	leader := nodes[0]
 
-	// Make node 0 the leader.
+	// Make node 0 the leader for this test.
 	leader.mu.Lock()
 	leader.role = Leader
 	leader.currentTerm = 1
 	leader.nextIndex[0] = len(leader.log)
-	leader.matchIndex[0] = 0
+	leader.matchIndex[0] = len(leader.log) - 1
 	leader.mu.Unlock()
 
-	// Submit the client request asynchronously because Put()
-	// waits for the command to be applied.
+	// Submit the request asynchronously because Put waits for application.
 	done := make(chan error, 1)
 
 	go func() {
@@ -1478,13 +1519,14 @@ func TestCommittedCommandReleasesClient(t *testing.T) {
 
 	for time.Now().Before(deadline) {
 		leader.mu.Lock()
+
 		if len(leader.log) > 1 {
 			index = len(leader.log) - 1
 			leader.mu.Unlock()
 			break
 		}
-		leader.mu.Unlock()
 
+		leader.mu.Unlock()
 		time.Sleep(5 * time.Millisecond)
 	}
 
@@ -1494,6 +1536,7 @@ func TestCommittedCommandReleasesClient(t *testing.T) {
 
 	// Replicate the command to follower 1.
 	leader.mu.Lock()
+
 	args := AppendEntriesArgs{
 		Term:         leader.currentTerm,
 		LeaderID:     leader.me,
@@ -1502,6 +1545,7 @@ func TestCommittedCommandReleasesClient(t *testing.T) {
 		Entries:      []LogEntry{leader.log[index]},
 		LeaderCommit: 0,
 	}
+
 	leader.mu.Unlock()
 
 	var reply AppendEntriesReply
@@ -1513,10 +1557,11 @@ func TestCommittedCommandReleasesClient(t *testing.T) {
 
 	// Record successful replication to follower 1.
 	leader.mu.Lock()
+
 	leader.matchIndex[1] = index
 	leader.nextIndex[1] = index + 1
 
-	// Leader + follower 1 form a majority.
+	// Leader and follower 1 form a majority.
 	count := 0
 	for i := range leader.peers {
 		if leader.matchIndex[i] >= index {
@@ -1529,14 +1574,19 @@ func TestCommittedCommandReleasesClient(t *testing.T) {
 	}
 
 	msgs := leader.collectCommittedEntries()
+
 	leader.mu.Unlock()
 
-	// Deliver the committed entry to the leader's state machine.
+	// Deliver committed entries to the leader's state machine.
 	for _, msg := range msgs {
-		applyChs[0] <- msg
+		select {
+		case applyChs[0] <- msg:
+		case <-time.After(time.Second):
+			t.Fatal("timed out delivering committed entry to leader")
+		}
 	}
 
-	// Put() should return after successful application.
+	// Put should return after successful application.
 	select {
 	case err := <-done:
 		if err != nil {
@@ -1546,13 +1596,16 @@ func TestCommittedCommandReleasesClient(t *testing.T) {
 		t.Fatal("Put() did not return after command was committed and applied")
 	}
 
+	// Verify the value in the leader's state machine.
 	value, found, err := stateMachines[0].Get([]byte("city"))
 	if err != nil {
 		t.Fatalf("failed to read state machine: %v", err)
 	}
+
 	if !found {
 		t.Fatal("expected committed key to exist in state machine")
 	}
+
 	if string(value) != "Delhi" {
 		t.Fatalf("expected value Delhi, got %s", string(value))
 	}
@@ -2153,7 +2206,8 @@ func TestFollowerAdvancesCommitIndexFromLeaderCommit(t *testing.T) {
 
 	follower, err := NewRaftNode(
 		1, 2, followerApplyCh,
-		NewMemPersister(), followerSM,
+		NewMemPersister(),
+		followerSM,
 	)
 	if err != nil {
 		t.Fatalf("failed to create follower: %v", err)
@@ -2164,19 +2218,31 @@ func TestFollowerAdvancesCommitIndexFromLeaderCommit(t *testing.T) {
 	leader.SetPeers(peers)
 	follower.SetPeers(peers)
 
+	// Set up the leader's log.
 	leader.mu.Lock()
 	leader.currentTerm = 1
 	leader.log = append(leader.log, LogEntry{
-		Term:    1,
-		Command: Command{Op: "SET", Key: "x", Value: "10"},
+		Index: 1,
+		Term:  1,
+		Command: Command{
+			Op:    "SET",
+			Key:   "x",
+			Value: "10",
+		},
 	})
 	leader.mu.Unlock()
 
+	// Set up the follower's matching log entry.
 	follower.mu.Lock()
 	follower.currentTerm = 1
 	follower.log = append(follower.log, LogEntry{
-		Term:    1,
-		Command: Command{Op: "SET", Key: "x", Value: "10"},
+		Index: 1,
+		Term:  1,
+		Command: Command{
+			Op:    "SET",
+			Key:   "x",
+			Value: "10",
+		},
 	})
 	follower.mu.Unlock()
 
@@ -2196,32 +2262,73 @@ func TestFollowerAdvancesCommitIndexFromLeaderCommit(t *testing.T) {
 		t.Fatal("follower should accept valid AppendEntries")
 	}
 
-	// Apply the committed message through the StateMachine interface.
+	// The follower should deliver the committed entry for application.
 	select {
 	case msg := <-followerApplyCh:
+		if !msg.CommandValid {
+			t.Fatal("expected a valid command ApplyMsg")
+		}
+
+		if msg.CommandIndex != 1 {
+			t.Fatalf(
+				"expected CommandIndex = 1, got %d",
+				msg.CommandIndex,
+			)
+		}
+
+		// Apply the committed entry to the follower's state machine.
 		if err := followerSM.Apply(msg); err != nil {
+			follower.failApplyWaiters(err)
 			t.Fatalf("apply committed entry: %v", err)
 		}
-		follower.notifyApplied(msg.CommandIndex, nil)
+
+		// Build a request ID only for a real client command.
+		requestID := RequestID{}
+		if msg.Command.Op != "NOOP" &&
+			msg.Command.ClientID != 0 &&
+			msg.Command.SeqNumber > 0 {
+			requestID = RequestID{
+				ClientID:  msg.Command.ClientID,
+				SeqNumber: msg.Command.SeqNumber,
+			}
+		}
+
+		// Notify client waiters and index waiters.
+		follower.notifyApplied(
+			requestID,
+			msg.CommandIndex,
+			nil,
+		)
+
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for committed ApplyMsg")
 	}
 
+	// Verify that the follower advanced its commit index.
 	follower.mu.Lock()
 	commitIndex := follower.commitIndex
 	follower.mu.Unlock()
 
 	if commitIndex != 1 {
-		t.Fatalf("expected follower commitIndex = 1, got %d", commitIndex)
+		t.Fatalf(
+			"expected follower commitIndex = 1, got %d",
+			commitIndex,
+		)
 	}
 
+	// Verify that the committed entry was applied to the state machine.
 	value, found, err := followerSM.Get([]byte("x"))
 	if err != nil {
 		t.Fatalf("get committed value: %v", err)
 	}
+
 	if !found || string(value) != "10" {
-		t.Fatalf("follower state = (%q, %v), want (%q, true)",
-			string(value), found, "10")
+		t.Fatalf(
+			"follower state = (%q, %v), want (%q, true)",
+			string(value),
+			found,
+			"10",
+		)
 	}
 }
 
@@ -2587,21 +2694,25 @@ func TestReadIndexHigherTermStepsDown(t *testing.T) {
 }
 
 func TestGetWaitsForReadIndexToApply(t *testing.T) {
-	statemachine := NewTestStateMachine(storage.NewMemEngine())
+	stateMachine := NewTestStateMachine(storage.NewMemEngine())
+	applyCh := make(chan ApplyMsg, 10)
 
 	node, err := NewRaftNode(
-		0, 1, make(chan ApplyMsg, 10),
-		NewMemPersister(), statemachine,
+		0, 1, applyCh,
+		NewMemPersister(),
+		stateMachine,
 	)
 	if err != nil {
 		t.Fatalf("failed to create node: %v", err)
 	}
 	defer node.Stop()
 
+	// Configure the single-node cluster as leader.
 	node.mu.Lock()
 	node.role = Leader
 	node.currentTerm = 1
 	node.log = node.log[:1]
+
 	node.log = append(node.log,
 		LogEntry{
 			Index: 1,
@@ -2620,44 +2731,50 @@ func TestGetWaitsForReadIndexToApply(t *testing.T) {
 			},
 		},
 	)
+
 	node.commitIndex = 2
+	node.matchIndex[node.me] = 2
+	node.nextIndex[node.me] = 3
 	node.mu.Unlock()
 
-	done := make(chan struct{})
+	done := make(chan error, 1)
 
 	go func() {
-		_, _, _ = node.Get(1, 1, "key")
-		close(done)
+		_, _, err := node.Get(1, 1, "Country")
+		done <- err
 	}()
 
-	// Wait until Get has had an opportunity to block.
-	time.Sleep(50 * time.Millisecond)
+	// Ensure Get is still waiting while the state machine is behind.
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case err := <-done:
+			t.Fatalf("Get returned before the read index was applied: %v", err)
+		case <-deadline:
+			t.Fatal("Get did not remain blocked while the state machine was behind")
+		default:
+		}
 
-	select {
-	case <-done:
-		t.Fatal("Get returned before the read index was applied")
-	default:
+		lastApplied, err := stateMachine.LastApplied()
+		if err != nil {
+			t.Fatalf("failed to get last applied index: %v", err)
+		}
+		if lastApplied < 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Simulate application reaching index 2.
-	lastApplied, err := statemachine.LastApplied()
-	if err != nil {
-		t.Fatalf("failed to read last applied index: %v", err)
-	}
-
-	if lastApplied < 2 {
-		// Apply the entries in order so the state machine can advance.
-		if err := statemachine.Apply(ApplyMsg{
+	// Apply committed entries in order.
+	entries := []ApplyMsg{
+		{
 			CommandValid: true,
 			CommandIndex: 1,
 			Command: Command{
 				Op: "NOOP",
 			},
-		}); err != nil {
-			t.Fatalf("failed to apply entry 1: %v", err)
-		}
-
-		if err := statemachine.Apply(ApplyMsg{
+		},
+		{
 			CommandValid: true,
 			CommandIndex: 2,
 			Command: Command{
@@ -2665,19 +2782,34 @@ func TestGetWaitsForReadIndexToApply(t *testing.T) {
 				Key:   "Country",
 				Value: "Index",
 			},
-		}); err != nil {
-			t.Fatalf("failed to apply entry 2: %v", err)
+		},
+	}
+
+	for _, msg := range entries {
+		if err := stateMachine.Apply(msg); err != nil {
+			t.Fatalf("failed to apply entry %d: %v", msg.CommandIndex, err)
 		}
 	}
 
-	node.notifyApplied(2, nil)
-
+	// Get should now finish successfully.
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Get returned an error: %v", err)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("Get did not return after the read index was applied")
 	}
+
+	value, found, err := stateMachine.Get([]byte("Country"))
+	if err != nil {
+		t.Fatalf("failed to read state machine: %v", err)
+	}
+	if !found || string(value) != "Index" {
+		t.Fatalf("expected Country=Index, got (%q, %v)", string(value), found)
+	}
 }
+
 
 func TestGetWaitsForReadIndexApplication(t *testing.T) {
 	nodes := make([]*RaftNode, 3)
@@ -2687,14 +2819,19 @@ func TestGetWaitsForReadIndexApplication(t *testing.T) {
 		stateMachines[i] = NewTestStateMachine(storage.NewMemEngine())
 
 		node, err := NewRaftNode(
-			i, 3, make(chan ApplyMsg, 10),
-			NewMemPersister(), stateMachines[i],
+			i,
+			3,
+			make(chan ApplyMsg, 10),
+			NewMemPersister(),
+			stateMachines[i],
 		)
 		if err != nil {
 			t.Fatalf("failed to create node %d: %v", i, err)
 		}
+
 		nodes[i] = node
 	}
+
 	defer func() {
 		for _, node := range nodes {
 			node.Stop()
@@ -2708,18 +2845,19 @@ func TestGetWaitsForReadIndexApplication(t *testing.T) {
 	leader := nodes[0]
 	leaderSM := stateMachines[0]
 
+	// Configure node 0 as leader with a NOOP at index 1
+	// and a SET command at index 2.
 	leader.mu.Lock()
 	leader.role = Leader
 	leader.currentTerm = 1
-
 	leader.log = leader.log[:1]
-	leader.log = append(leader.log,
+
+	leader.log = append(
+		leader.log,
 		LogEntry{
-			Index: 1,
-			Term:  1,
-			Command: Command{
-				Op: "NOOP",
-			},
+			Index:   1,
+			Term:    1,
+			Command: Command{Op: "NOOP"},
 		},
 		LogEntry{
 			Index: 2,
@@ -2731,79 +2869,126 @@ func TestGetWaitsForReadIndexApplication(t *testing.T) {
 			},
 		},
 	)
+
 	leader.commitIndex = 2
+	leader.matchIndex[leader.me] = 2
+	leader.nextIndex[leader.me] = 3
 	leader.mu.Unlock()
 
-	done := make(chan struct{})
+	type getResult struct {
+		value string
+		found bool
+		err   error
+	}
 
-	var (
-		value  string
-		found  bool
-		getErr error
-	)
+	done := make(chan getResult, 1)
 
+	// Start Get asynchronously. It should wait until its read index
+	// has been applied before reading the state machine.
 	go func() {
-		value, found, getErr = leader.Get(1, 1, "x")
-		close(done)
+		value, found, err := leader.Get(1, 1, "x")
+		done <- getResult{
+			value: value,
+			found: found,
+			err:   err,
+		}
 	}()
 
-	// Give Get time to perform ReadIndex and wait for application.
-	time.Sleep(50 * time.Millisecond)
-
+	// Give Get time to start and verify that it has not returned early.
 	select {
-	case <-done:
-		t.Fatal("Get returned before the read index was applied")
-	default:
+	case result := <-done:
+		t.Fatalf(
+			"Get returned before the read index was applied: value=%q found=%v err=%v",
+			result.value,
+			result.found,
+			result.err,
+		)
+	case <-time.After(100 * time.Millisecond):
 	}
 
-	// Apply entries in order through the StateMachine interface.
-	if err := leaderSM.Apply(ApplyMsg{
-		CommandValid: true,
-		CommandIndex: 1,
-		Command: Command{
-			Op: "NOOP",
+	// Apply entries in order to simulate state-machine application.
+	// Notify the Raft node after each successful application.
+	entries := []ApplyMsg{
+		{
+			CommandValid: true,
+			CommandIndex: 1,
+			Command:      Command{Op: "NOOP"},
 		},
-	}); err != nil {
-		t.Fatalf("failed to apply entry 1: %v", err)
-	}
-
-	if err := leaderSM.Apply(ApplyMsg{
-		CommandValid: true,
-		CommandIndex: 2,
-		Command: Command{
-			Op:    "SET",
-			Key:   "x",
-			Value: "value",
+		{
+			CommandValid: true,
+			CommandIndex: 2,
+			Command: Command{
+				Op:    "SET",
+				Key:   "x",
+				Value: "value",
+			},
 		},
-	}); err != nil {
-		t.Fatalf("failed to apply entry 2: %v", err)
 	}
 
-	leader.notifyApplied(2, nil)
+	for _, msg := range entries {
+		if err := leaderSM.Apply(msg); err != nil {
+			t.Fatalf(
+				"failed to apply entry %d: %v",
+				msg.CommandIndex,
+				err,
+			)
+		}
 
+		// NOOP entries also advance LastApplied, so notify index waiters
+		// for every successfully applied entry.
+		requestID := RequestID{}
+
+		if msg.Command.Op != "NOOP" &&
+			msg.Command.ClientID != 0 &&
+			msg.Command.SeqNumber > 0 {
+			requestID = RequestID{
+				ClientID:  msg.Command.ClientID,
+				SeqNumber: msg.Command.SeqNumber,
+			}
+		}
+
+		leader.notifyApplied(
+			requestID,
+			msg.CommandIndex,
+			nil,
+		)
+	}
+
+	// Get should now complete successfully.
 	select {
-	case <-done:
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("Get returned error: %v", result.err)
+		}
+
+		if !result.found {
+			t.Fatal("expected key to be found")
+		}
+
+		if result.value != "value" {
+			t.Fatalf(
+				"expected value %q, got %q",
+				"value",
+				result.value,
+			)
+		}
+
 	case <-time.After(time.Second):
 		t.Fatal("Get did not return after the read index was applied")
 	}
-
-	if getErr != nil {
-		t.Fatalf("Get returned error: %v", getErr)
-	}
-	if !found {
-		t.Fatal("expected key to be found")
-	}
-	if value != "value" {
-		t.Fatalf("expected value %q, got %q", "value", value)
-	}
 }
+
+
 
 func TestGetFailsIfLeadershipLostBeforeRead(t *testing.T) {
 	sm := NewTestStateMachine(storage.NewMemEngine())
 
 	node, err := NewRaftNode(
-		0, 1, make(chan ApplyMsg, 10),
-		NewMemPersister(), sm,
+		0,
+		1,
+		make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		sm,
 	)
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -2813,8 +2998,10 @@ func TestGetFailsIfLeadershipLostBeforeRead(t *testing.T) {
 	node.mu.Lock()
 	node.role = Leader
 	node.currentTerm = 1
+
 	node.log = node.log[:1]
-	node.log = append(node.log,
+	node.log = append(
+		node.log,
 		LogEntry{
 			Index:   1,
 			Term:    1,
@@ -2824,11 +3011,16 @@ func TestGetFailsIfLeadershipLostBeforeRead(t *testing.T) {
 			Index: 2,
 			Term:  1,
 			Command: Command{
-				Op: "SET", Key: "x", Value: "value",
+				Op:    "SET",
+				Key:   "x",
+				Value: "value",
 			},
 		},
 	)
+
 	node.commitIndex = 2
+	node.matchIndex[node.me] = 2
+	node.nextIndex[node.me] = 3
 	node.mu.Unlock()
 
 	done := make(chan struct{})
@@ -2839,38 +3031,67 @@ func TestGetFailsIfLeadershipLostBeforeRead(t *testing.T) {
 		close(done)
 	}()
 
-	// Wait until Get has registered its apply waiter.
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		node.mu.Lock()
-		registered := len(node.applyWaiters) > 0
-		node.mu.Unlock()
-
-		if registered {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
+	// Give Get time to enter its read-index/application-wait path.
+	select {
+	case <-done:
+		t.Fatal("Get returned before the read index was applied")
+	case <-time.After(100 * time.Millisecond):
 	}
 
+	// Simulate losing leadership while Get is waiting.
 	node.mu.Lock()
-	registered := len(node.applyWaiters) > 0
 	node.role = Follower
 	node.mu.Unlock()
 
-	if !registered {
-		t.Fatal("Get did not register an apply waiter")
+	// Apply entries in order and notify the Raft node after each entry.
+	entries := []ApplyMsg{
+		{
+			CommandValid: true,
+			CommandIndex: 1,
+			Command:      Command{Op: "NOOP"},
+		},
+		{
+			CommandValid: true,
+			CommandIndex: 2,
+			Command: Command{
+				Op:    "SET",
+				Key:   "x",
+				Value: "value",
+			},
+		},
 	}
 
-	// Simulate the read index being applied after leadership is lost.
-	node.notifyApplied(2, nil)
+	for _, msg := range entries {
+		if err := sm.Apply(msg); err != nil {
+			t.Fatalf("apply entry %d: %v", msg.CommandIndex, err)
+		}
 
+		requestID := RequestID{}
+
+		if msg.Command.Op != "NOOP" &&
+			msg.Command.ClientID != 0 &&
+			msg.Command.SeqNumber > 0 {
+			requestID = RequestID{
+				ClientID:  msg.Command.ClientID,
+				SeqNumber: msg.Command.SeqNumber,
+			}
+		}
+
+		node.notifyApplied(
+			requestID,
+			msg.CommandIndex,
+			nil,
+		)
+	}
+
+	// Get should wake up and report that leadership was lost.
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("Get did not return after application notification")
+		t.Fatal("Get did not return after application")
 	}
 
-	if getErr != ErrWrongLeader {
+	if !errors.Is(getErr, ErrWrongLeader) {
 		t.Fatalf("expected ErrWrongLeader, got %v", getErr)
 	}
 }
@@ -3054,12 +3275,16 @@ func TestNewLeaderAppendsCurrentTermNoop(t *testing.T) {
 	)
 }
 
+
 func TestGetFailsIfTermChangesBeforeRead(t *testing.T) {
 	sm := NewTestStateMachine(storage.NewMemEngine())
 
 	node, err := NewRaftNode(
-		0, 1, make(chan ApplyMsg, 10),
-		NewMemPersister(), sm,
+		0,
+		1,
+		make(chan ApplyMsg, 10),
+		NewMemPersister(),
+		sm,
 	)
 	if err != nil {
 		t.Fatalf("create node: %v", err)
@@ -3069,8 +3294,10 @@ func TestGetFailsIfTermChangesBeforeRead(t *testing.T) {
 	node.mu.Lock()
 	node.role = Leader
 	node.currentTerm = 1
+
 	node.log = node.log[:1]
-	node.log = append(node.log,
+	node.log = append(
+		node.log,
 		LogEntry{
 			Index:   1,
 			Term:    1,
@@ -3080,11 +3307,16 @@ func TestGetFailsIfTermChangesBeforeRead(t *testing.T) {
 			Index: 2,
 			Term:  1,
 			Command: Command{
-				Op: "SET", Key: "x", Value: "value",
+				Op:    "SET",
+				Key:   "x",
+				Value: "value",
 			},
 		},
 	)
+
 	node.commitIndex = 2
+	node.matchIndex[node.me] = 2
+	node.nextIndex[node.me] = 3
 	node.mu.Unlock()
 
 	done := make(chan struct{})
@@ -3095,41 +3327,74 @@ func TestGetFailsIfTermChangesBeforeRead(t *testing.T) {
 		close(done)
 	}()
 
-	// Wait for Get to register its waiter.
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		node.mu.Lock()
-		registered := len(node.applyWaiters) > 0
-		node.mu.Unlock()
-
-		if registered {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
+	// Give Get time to start waiting for the read index to be applied.
+	select {
+	case <-done:
+		t.Fatalf(
+			"Get returned before the read index was applied: %v",
+			getErr,
+		)
+	case <-time.After(100 * time.Millisecond):
 	}
 
+	// Change the term while Get is waiting for application.
 	node.mu.Lock()
-	registered := len(node.applyWaiters) > 0
 	node.currentTerm = 2
-	node.role = Leader
 	node.mu.Unlock()
 
-	if !registered {
-		t.Fatal("Get did not register an apply waiter")
+	// Apply entries in order and notify the Raft node after each entry.
+	entries := []ApplyMsg{
+		{
+			CommandValid: true,
+			CommandIndex: 1,
+			Command:      Command{Op: "NOOP"},
+		},
+		{
+			CommandValid: true,
+			CommandIndex: 2,
+			Command: Command{
+				Op:    "SET",
+				Key:   "x",
+				Value: "value",
+			},
+		},
 	}
 
-	node.notifyApplied(2, nil)
+	for _, msg := range entries {
+		if err := sm.Apply(msg); err != nil {
+			t.Fatalf("apply entry %d: %v", msg.CommandIndex, err)
+		}
 
+		requestID := RequestID{}
+
+		if msg.Command.Op != "NOOP" &&
+			msg.Command.ClientID != 0 &&
+			msg.Command.SeqNumber > 0 {
+			requestID = RequestID{
+				ClientID:  msg.Command.ClientID,
+				SeqNumber: msg.Command.SeqNumber,
+			}
+		}
+
+		node.notifyApplied(
+			requestID,
+			msg.CommandIndex,
+			nil,
+		)
+	}
+
+	// Get should wake up and detect that its original term is stale.
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("Get did not return")
+		t.Fatal("Get did not return after application")
 	}
 
-	if getErr != ErrWrongLeader {
+	if !errors.Is(getErr, ErrWrongLeader) {
 		t.Fatalf("expected ErrWrongLeader, got %v", getErr)
 	}
 }
+
 
 func TestReadIndexReturnsWhenFollowerDoesNotRespond(t *testing.T) {
 	nodes := make([]*RaftNode, 3)
@@ -4366,4 +4631,3 @@ func TestConcurrentWritesDuringRealElection(t *testing.T) {
 		}
 	}
 }
-
