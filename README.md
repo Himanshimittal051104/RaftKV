@@ -6,7 +6,7 @@ RaftKV is a learning-oriented distributed key-value store designed to explore di
 
 The project implements Raft-based leader election, heartbeats, log replication, conflict resolution, majority-based commitment, ReadIndex-based linearizable reads, request deduplication, an HTTP API, file-based Raft state persistence, and a WAL-backed file storage engine with recovery support.
 
-**Development status** : Core Raft consensus, ReadIndex-based linearizable reads, request deduplication, file-based Raft state persistence, and a WAL-backed key-value storage engine are implemented. The existing Raft, server, and storage test suites have been reported as passing. Safe shutdown, snapshots, log compaction, and broader fault testing remain on the roadmap.
+**Development status** : Core Raft consensus, ReadIndex-based linearizable reads, request deduplication, file-based Raft state persistence, and a WAL-backed key-value storage engine are implemented. The full test suite and Go race detector have passed for the current changes. Coordinated Raft-node shutdown and tracked goroutine lifecycle management are implemented; snapshots, log compaction, and broader fault testing remain on the roadmap.
 
 ---
 
@@ -81,7 +81,20 @@ Storage Engine
 Response
 ```
 
-A dedicated `ReadProbe` RPC is used instead of AppendEntries so that read confirmation does not perform unnecessary log-prefix matching or log repair.
+A dedicated `ReadProbe` RPC is used instead of AppendEntries so that read confirmation does not perform unnecessary log-prefix matching or log repair.The read path uses waitForApply to wait until the local state machine's LastApplied index reaches the returned readIndex. Index-based waiters are notified after each successfully applied entry, including NOOP entries, so a read can wake when the state machine advances. GET also checks that the node is still the leader in the term captured before the read operation before returning a result.
+
+### Safe Shutdown and Goroutine Lifecycle
+
+Raft nodes support coordinated shutdown through `Stop()`. The implementation uses a stop channel, a `sync.Once`, a mutex, and a `sync.WaitGroup` to coordinate the node lifecycle.
+
+- `Stop()` marks the node as stopped, closes `stopCh` only once, and waits for tracked goroutines to finish.
+- `StartBackground()` prevents duplicate starts and rejects startup when the node is already stopped or its peers are invalid.
+- The election/heartbeat loop observes `stopCh` and stops its ticker when it exits.
+- The `spawn()` helper synchronizes lifecycle checks and `WaitGroup` registration with `Stop()` using the node mutex, preventing tracked goroutines from being added after shutdown begins.
+- Committed-entry delivery uses stop-aware channel sends so a sender can exit when shutdown begins instead of waiting indefinitely for an apply-channel receiver.
+
+
+Shutdown is cooperative: `Stop()` waits for tracked work to return. A synchronous peer RPC that blocks indefinitely can delay shutdown, so bounded RPC behavior and shutdown-under-failure scenarios remain important validation areas. This describes Raft-node lifecycle handling; it does not imply that every HTTP server or storage resource is automatically closed unless its own shutdown path calls the relevant cleanup methods.
 
 ### Key-Value Store
 
@@ -571,9 +584,13 @@ RaftKV/
 - [x] HTTP error handling for wrong-leader and conflicting-request responses
 - [x] WAL-backed file storage engine (FileEngine)
 - [x] WAL replay and incomplete-final-record recovery handling
+- [x] Coordinated Raft-node shutdown using `stopCh`, `sync.Once`, and `sync.WaitGroup`
+- [x] Synchronized goroutine registration through `spawn()`
+- [x] Stop-aware committed-entry delivery
 
 ### In Progress
-- [ ] Safe goroutine lifecycle management and graceful shutdown
+- [ ] Verify shutdown behavior when peer RPCs block or fail
+- [ ] Verify complete HTTP server and storage-resource cleanup during process shutdown
 - [ ] Broader multi-node crash-recovery validation
 - [ ] Additional failure-injection testing around persistence and restart boundaries
 - [ ] End-to-end validation of recovery and durability across failure scenarios
@@ -749,11 +766,13 @@ The current implementation includes:
 - File-based Raft state persistence with startup validation.
 - A WAL-backed `FileEngine` that persists key-value operations and replays its WAL during recovery.
 - Ordered state-machine application, application waiters, and recovery handling for storage failures.
+- Coordinated Raft-node shutdown with stop signaling, tracked goroutines, and synchronized goroutine registration.
 - Automated tests covering consensus, replication, linearizable reads, request deduplication, persistence, recovery, and concurrency.
 
 The existing Raft, server, and storage test suites have been reported as passing.
 
-**Next priorities** are safe goroutine lifecycle management and graceful shutdown, followed by snapshots and Raft log compaction. Broader multi-node fault testing, observability, benchmarking, and performance optimization remain future work.
+**Next priorities** are validating shutdown behavior under blocked RPCs and confirming HTTP-server/storage cleanup integration, followed by snapshots and Raft log compaction. Broader multi-node fault testing, observability, benchmarking, and performance optimization remain future work.
+
 
 RaftKV is intended as a learning-oriented distributed-systems project, with an emphasis on consensus, storage durability, recovery, and correctness under failure.
 
