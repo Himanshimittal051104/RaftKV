@@ -521,7 +521,6 @@ func (rn *RaftNode) waitForApply(requestId RequestID, index int) error {
 	}
 }
 
-
 func (rn *RaftNode) notifyApplied(requestID RequestID,index int,err error,) {
     rn.mu.Lock()
     defer rn.mu.Unlock()

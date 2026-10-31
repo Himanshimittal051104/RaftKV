@@ -2978,8 +2978,6 @@ func TestGetWaitsForReadIndexApplication(t *testing.T) {
 	}
 }
 
-
-
 func TestGetFailsIfLeadershipLostBeforeRead(t *testing.T) {
 	sm := NewTestStateMachine(storage.NewMemEngine())
 
