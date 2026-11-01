@@ -25,17 +25,26 @@ func (sm *KVStateMachine) Apply(msg raft.ApplyMsg) error {
 
 	switch cmd.Op {
 	case "NOOP":
-		return sm.Engine.Noop(msg.CommandIndex)
+		if err := sm.Engine.Noop(msg.CommandIndex); err != nil {
+			return err
+		}
 
 	case "SET":
-		return sm.Engine.Put(msg.CommandIndex, []byte(cmd.Key), []byte(cmd.Value))
+		if err := sm.Engine.Put(msg.CommandIndex, []byte(cmd.Key), []byte(cmd.Value)); err != nil {
+			return err
+		}
 
 	case "DELETE":
-		return sm.Engine.Delete(msg.CommandIndex, []byte(cmd.Key))
+		if err := sm.Engine.Delete(msg.CommandIndex, []byte(cmd.Key)); err != nil {
+			return err
+		}
 
 	default:
 		return fmt.Errorf("unsupported operation %q", msg.Command.Op)
 	}
+
+	sm.Engine.MaybeSaveSnapshot()
+	return nil
 }
 
 func (sm *KVStateMachine) Get(key []byte) ([]byte, bool, error) {

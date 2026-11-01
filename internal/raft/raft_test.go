@@ -2810,7 +2810,6 @@ func TestGetWaitsForReadIndexToApply(t *testing.T) {
 	}
 }
 
-
 func TestGetWaitsForReadIndexApplication(t *testing.T) {
 	nodes := make([]*RaftNode, 3)
 	stateMachines := make([]StateMachine, 3)
@@ -3273,7 +3272,6 @@ func TestNewLeaderAppendsCurrentTermNoop(t *testing.T) {
 	)
 }
 
-
 func TestGetFailsIfTermChangesBeforeRead(t *testing.T) {
 	sm := NewTestStateMachine(storage.NewMemEngine())
 
@@ -3392,7 +3390,6 @@ func TestGetFailsIfTermChangesBeforeRead(t *testing.T) {
 		t.Fatalf("expected ErrWrongLeader, got %v", getErr)
 	}
 }
-
 
 func TestReadIndexReturnsWhenFollowerDoesNotRespond(t *testing.T) {
 	nodes := make([]*RaftNode, 3)
@@ -4628,4 +4625,150 @@ func TestConcurrentWritesDuringRealElection(t *testing.T) {
 			)
 		}
 	}
+}
+
+func TestRestartedFollowerRepairsUncommittedConflict(t *testing.T) {
+	persister := NewMemPersister()
+
+	// Simulate persisted Raft state containing an uncommitted entry:
+	// [dummy, SET x = "old" (term 1)].
+	oldLog := []LogEntry{
+		{Index: 0, Term: 0},
+		{
+			Index: 1,
+			Term:  1,
+			Command: Command{
+				Op:    "SET",
+				Key:   "x",
+				Value: "old",
+			},
+		},
+	}
+
+	state, err := encodeRaftState(1, -1, oldLog)
+	if err != nil {
+		t.Fatalf("encode persisted state: %v", err)
+	}
+	if err := persister.SaveRaftState(state); err != nil {
+		t.Fatalf("save persisted state: %v", err)
+	}
+
+	// Reconstruct the follower with the same persister and a fresh
+	// state machine, simulating a restart.
+	applyCh := make(chan ApplyMsg, 10)
+	sm := NewTestStateMachine(storage.NewMemEngine())
+
+	follower, err := NewRaftNode(1, 3, applyCh, persister, sm)
+	if err != nil {
+		t.Fatalf("reconstruct follower: %v", err)
+	}
+	defer follower.Stop()
+
+	go follower.applyLoop()
+
+	// The recovered entry is present in the log but must not be applied
+	// because the restarted follower's commit index is zero.
+	follower.mu.Lock()
+	if follower.commitIndex != 0 {
+		got := follower.commitIndex
+		follower.mu.Unlock()
+		t.Fatalf("commitIndex = %d, want 0", got)
+	}
+	if len(follower.log) != 2 {
+		got := len(follower.log)
+		follower.mu.Unlock()
+		t.Fatalf("recovered log length = %d, want 2", got)
+	}
+	follower.mu.Unlock()
+
+	if _, found, err := sm.Get([]byte("x")); err != nil {
+		t.Fatalf("get x before commitment: %v", err)
+	} else if found {
+		t.Fatal("uncommitted value was applied after restart")
+	}
+
+	// A valid higher-term leader sends a conflicting entry at index 1.
+	newEntry := LogEntry{
+		Index: 1,
+		Term:  2,
+		Command: Command{
+			Op:    "SET",
+			Key:   "x",
+			Value: "new",
+		},
+	}
+
+	repairArgs := AppendEntriesArgs{
+		Term:         2,
+		LeaderID:     0,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		Entries:      []LogEntry{newEntry},
+		LeaderCommit: 0,
+	}
+
+	var repairReply AppendEntriesReply
+	follower.AppendEntries(&repairArgs, &repairReply)
+
+	if !repairReply.Success {
+		t.Fatal("follower rejected valid conflict-repair AppendEntries")
+	}
+
+	// Verify that the old entry was replaced, but the replacement
+	// has not yet been applied because it is still uncommitted.
+	follower.mu.Lock()
+	if len(follower.log) != 2 {
+		got := len(follower.log)
+		follower.mu.Unlock()
+		t.Fatalf("log length after repair = %d, want 2", got)
+	}
+	repaired := follower.log[1]
+	follower.mu.Unlock()
+
+	if repaired.Term != 2 ||
+		repaired.Command.Op != "SET" ||
+		repaired.Command.Key != "x" ||
+		repaired.Command.Value != "new" {
+		t.Fatalf("conflicting entry was not replaced correctly: %+v", repaired)
+	}
+
+	if _, found, err := sm.Get([]byte("x")); err != nil {
+		t.Fatalf("get x before new entry is committed: %v", err)
+	} else if found {
+		t.Fatal("replacement entry was applied before commitment")
+	}
+
+	// The leader now informs the follower that index 1 is committed.
+	commitArgs := AppendEntriesArgs{
+		Term:         2,
+		LeaderID:     0,
+		PrevLogIndex: 1,
+		PrevLogTerm:  2,
+		LeaderCommit: 1,
+	}
+
+	var commitReply AppendEntriesReply
+	follower.AppendEntries(&commitArgs, &commitReply)
+
+	if !commitReply.Success {
+		t.Fatal("follower rejected AppendEntries advancing commit index")
+	}
+
+	// Wait for the apply loop to apply the committed replacement.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		value, found, err := sm.Get([]byte("x"))
+		if err != nil {
+			t.Fatalf("get x after commitment: %v", err)
+		}
+		if found {
+			if string(value) != "new" {
+				t.Fatalf("x = %q, want %q", value, "new")
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatal("timed out waiting for the replacement entry to be applied")
 }

@@ -1,9 +1,8 @@
 package storage
 
 import (
-	"sync"
-
 	"RaftKV/internal/apperrors"
+	"sync"
 )
 
 // MemEngine is a thread-safe, in-memory storage engine.
@@ -144,4 +143,8 @@ func (m *MemEngine) Open() error {
 
 func (m *MemEngine) IsFailed() bool {
 	return false
+}
+
+func (m *MemEngine) MaybeSaveSnapshot() {
+	// No snapshot required for the in-memory engine.
 }

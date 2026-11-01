@@ -1,6 +1,9 @@
 package storage
 
-//Any storage implementation used by RaftKV must provide these four operations.
+type EngineSnapshot struct {
+	LastApplied int               `json:"lastApplied"`
+	Data        map[string][]byte `json:"data"`
+}
 
 type Engine interface {
 	Put(index int, key, value []byte) error
@@ -8,6 +11,9 @@ type Engine interface {
 	Delete(index int, key []byte) error
 	Noop(index int) error
 	LastApplied() (int, error)
+
+	MaybeSaveSnapshot()
+
 	Open() error
 	Close() error
 	IsClosed() bool

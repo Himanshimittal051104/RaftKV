@@ -1157,7 +1157,9 @@ func (e *failingRecoveryEngine) IsClosed() bool {
 func (e *failingRecoveryEngine) IsFailed() bool {
 	return false
 }
-
+func (e *failingRecoveryEngine) MaybeSaveSnapshot() {
+	// No snapshot required for the in-memory engine.
+}
 func TestRecoveryPutFailureDoesNotAdvanceLastApplied(t *testing.T) {
 	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
 
@@ -1256,6 +1258,10 @@ func (e *failingRecoveryDeleteEngine) IsClosed() bool {
 
 func (e *failingRecoveryDeleteEngine) IsFailed() bool {
 	return false
+}
+
+func (e *failingRecoveryDeleteEngine) MaybeSaveSnapshot() {
+	// No snapshot required for the in-memory engine.
 }
 
 func TestRecoveryDeleteFailureDoesNotAdvanceLastApplied(t *testing.T) {
@@ -1437,8 +1443,9 @@ func (e *retryableRecoveryEngine) IsFailed() bool {
 
 	return e.failed
 }
-
-
+func (e *retryableRecoveryEngine) MaybeSaveSnapshot() {
+	// No snapshot required for the in-memory engine.
+}
 func TestRecoveryRetryAfterPartialFailure(t *testing.T) {
 	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
 
@@ -1567,7 +1574,6 @@ func TestRecoveryRetryAfterPartialFailure(t *testing.T) {
 		}
 	}
 }
-
 
 func TestMultiNodeFollowerReplaysCommittedEntriesAfterRestart(t *testing.T) {
 	stateFile := filepath.Join(t.TempDir(), "raft-state.bin")
