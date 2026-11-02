@@ -6,7 +6,7 @@ RaftKV is a learning-oriented distributed key-value store designed to explore di
 
 The project implements Raft-based leader election, heartbeats, log replication, conflict resolution, majority-based commitment, ReadIndex-based linearizable reads, request deduplication, an HTTP API, file-based Raft state persistence, and a WAL-backed file storage engine with recovery support.
 
-**Development status** : Core Raft consensus, ReadIndex-based linearizable reads, request deduplication, file-based Raft state persistence, and a WAL-backed key-value storage engine are implemented. The full test suite and Go race detector have passed for the current changes. Coordinated Raft-node shutdown and tracked goroutine lifecycle management are implemented; snapshots, log compaction, and broader fault testing remain on the roadmap.
+**Development status**: Core Raft consensus, ReadIndex-based linearizable reads, request deduplication, file-based Raft state persistence, and a WAL-backed key-value storage engine are implemented. Storage-level snapshots and WAL compaction are also implemented. Raft-level snapshots, Raft log compaction, snapshot transfer and installation, and broader fault testing remain on the roadmap.
 
 ---
 
@@ -135,6 +135,9 @@ RaftKV implements two separate persistence mechanisms:
 - Flushes and synchronizes WAL writes to disk.
 - Replays WAL records during startup to reconstruct key-value state.
 - Detects and truncates an incomplete final WAL record during recovery.
+-   Saves and restores storage-level snapshots of key-value state.
+- Compacts the storage WAL by removing records already represented by a snapshot.
+- Supports WAL backup recovery and handles relevant recovery and compaction failure scenarios.
 
 **Recovery and Testing**
 
@@ -143,6 +146,8 @@ The Raft recovery path restores persisted consensus state and replays committed 
 Tests cover persisted-state validation, restart recovery, WAL recovery, persistence failures, and relevant Raft safety properties. Broader multi-node crash-recovery and fault-injection testing remain useful areas for further validation.
 
 **Important distinction:** Raft state persistence and WAL-backed key-value persistence are implemented separately. Their end-to-end recovery behavior must remain consistent across crashes and restarts.
+
+**Snapshot scope:** Storage-level snapshots and WAL compaction operate on the key-value storage engine. They do not compact the persisted Raft log. Raft-level snapshot creation, Raft log compaction, and snapshot installation on lagging followers have not yet been implemented.
 
 
 ### HTTP API
@@ -527,6 +532,9 @@ RaftKV/
 │   └── invariants.md
 │
 ├── internal/
+│   ├── apperrors/
+│   │   └── apperrors.go
+│   │
 │   ├── raft/
 │   │   ├── handlers.go
 │   │   ├── persister.go
@@ -537,6 +545,8 @@ RaftKV/
 │   │   ├── state.go
 │   │   ├── state_test.go
 │   │   ├── ticker.go
+│   │   ├── ticker_test.go
+│   │   ├── test_state_machine_test.go
 │   │   └── types.go
 │   │
 │   ├── server/
@@ -548,7 +558,8 @@ RaftKV/
 │       ├── engine.go
 │       ├── mem_engine.go
 |       ├── file_engine.go
-│       └── file_engine_test.go
+|       ├── file_engine.go
+│       └── snapshot_test.go
 │
 ├── proto/
 ├── go.mod
@@ -587,6 +598,9 @@ RaftKV/
 - [x] Coordinated Raft-node shutdown using `stopCh`, `sync.Once`, and `sync.WaitGroup`
 - [x] Synchronized goroutine registration through `spawn()`
 - [x] Stop-aware committed-entry delivery
+- [x] Storage-level snapshot creation and restoration
+- [x] Storage-level WAL compaction
+- [x] WAL backup recovery and compaction failure handling
 
 ### In Progress
 - [ ] Verify shutdown behavior when peer RPCs block or fail
@@ -595,9 +609,11 @@ RaftKV/
 - [ ] Additional failure-injection testing around persistence and restart boundaries
 - [ ] End-to-end validation of recovery and durability across failure scenarios
 
-
 ### Planned
-- [ ] Snapshots and log compaction
+- [ ] Implement Raft-level snapshot creation and persistence
+- [ ] Implement Raft log compaction
+- [ ] Implement snapshot transfer and installation for lagging followers
+- [ ] Resume log replication after snapshot installation
 - [ ] Fault injection and chaos testing
 - [ ] Broader linearizability and correctness testing
 - [ ] Observability and metrics
@@ -710,9 +726,15 @@ A passing test suite provides evidence for the scenarios tested; it does not by 
 - Further validation of end-to-end durability across crashes and restarts
 
 ### 4. Scalability and Compaction
-- Snapshot creation and restoration
+**Completed**
+- Storage-level snapshot creation and restoration
+- Storage WAL compaction
+
+**Remaining work:**
+- Raft-level snapshot creation and persistence
 - Raft log compaction
-- Snapshot installation and synchronization with lagging followers
+- Snapshot transfer and installation for lagging followers
+- Log replication resumption after snapshot installation
 
 ### 5. Correctness and Reliability
 - Fault injection and chaos testing
@@ -771,7 +793,7 @@ The current implementation includes:
 
 The existing Raft, server, and storage test suites have been reported as passing.
 
-**Next priorities** are validating shutdown behavior under blocked RPCs and confirming HTTP-server/storage cleanup integration, followed by snapshots and Raft log compaction. Broader multi-node fault testing, observability, benchmarking, and performance optimization remain future work.
+**Next priorities** are validating shutdown behavior under blocked RPCs and confirming HTTP-server and storage-resource cleanup integration, followed by implementing Raft-level snapshot creation and Raft log compaction. Snapshot transfer and installation for lagging followers, broader multi-node fault testing, observability, benchmarking, and performance optimization remain future work.
 
 
 RaftKV is intended as a learning-oriented distributed-systems project, with an emphasis on consensus, storage durability, recovery, and correctness under failure.
