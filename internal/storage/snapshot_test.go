@@ -462,3 +462,228 @@ func TestCompactWALPreservesDataAfterRestart(t *testing.T) {
 		}
 	}
 }
+
+func TestReplaceWALFailsWhenBackupCannotBeRemoved(t *testing.T) {
+	dir := t.TempDir()
+	walPath := filepath.Join(dir, "wal.log")
+	backupPath := walPath + ".bak"
+
+	engine, err := NewFileEngine(walPath)
+	if err != nil {
+		t.Fatalf("NewFileEngine: %v", err)
+	}
+	defer engine.Close()
+
+	if err := engine.Put(1, []byte("key"), []byte("value")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// Create a non-empty directory at the backup path.
+	if err := os.Mkdir(backupPath, 0700); err != nil {
+		t.Fatalf("create backup directory: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(backupPath, "keep.txt"),
+		[]byte("keep"),
+		0600,
+	); err != nil {
+		t.Fatalf("create file in backup directory: %v", err)
+	}
+
+	tmpPath := filepath.Join(dir, "compacted.tmp")
+	if err := os.WriteFile(tmpPath, []byte("compacted"), 0600); err != nil {
+		t.Fatalf("create temporary WAL: %v", err)
+	}
+
+	err = engine.replaceWALAtomically(tmpPath)
+	if err == nil {
+		t.Fatal("expected replacement to fail when backup cannot be removed")
+	}
+
+	// The active WAL should remain on disk.
+	if _, statErr := os.Stat(walPath); statErr != nil {
+		t.Fatalf("original WAL should remain on disk: %v", statErr)
+	}
+
+	// The original data should still be readable from the in-memory state.
+	got, found, getErr := engine.Get([]byte("key"))
+	if getErr != nil || !found || string(got) != "value" {
+		t.Fatalf("Get(key) = %q, found=%v, err=%v",
+			got, found, getErr)
+	}
+}
+
+func TestShouldSnapshotThreshold(t *testing.T) {
+	walPath := filepath.Join(t.TempDir(), "wal.log")
+
+	engine, err := NewFileEngine(walPath)
+	if err != nil {
+		t.Fatalf("NewFileEngine: %v", err)
+	}
+	defer engine.Close()
+
+	// Fewer than 100 entries should not trigger a snapshot.
+	for i := 1; i <= 99; i++ {
+		if err := engine.Put(i, []byte("key"), []byte("value")); err != nil {
+			t.Fatalf("Put at index %d: %v", i, err)
+		}
+	}
+
+	if engine.ShouldSnapshot() {
+		t.Fatal("ShouldSnapshot() = true after 99 entries; want false")
+	}
+
+	// The 100th entry should trigger a snapshot.
+	if err := engine.Put(100, []byte("key"), []byte("value")); err != nil {
+		t.Fatalf("Put at index 100: %v", err)
+	}
+
+	if !engine.ShouldSnapshot() {
+		t.Fatal("ShouldSnapshot() = false after 100 entries; want true")
+	}
+}
+
+func TestMaybeSaveSnapshotSkipsBelowThreshold(t *testing.T) {
+	walPath := filepath.Join(t.TempDir(), "wal.log")
+
+	engine, err := NewFileEngine(walPath)
+	if err != nil {
+		t.Fatalf("NewFileEngine: %v", err)
+	}
+	defer engine.Close()
+
+	for i := 1; i <= 99; i++ {
+		if err := engine.Put(i, []byte("key"), []byte("value")); err != nil {
+			t.Fatalf("Put at index %d: %v", i, err)
+		}
+	}
+
+	engine.MaybeSaveSnapshot()
+
+	if _, err := os.Stat(engine.snapshotPath()); !os.IsNotExist(err) {
+		t.Fatalf("snapshot should not exist below threshold; stat error = %v", err)
+	}
+}
+
+func TestMaybeSaveSnapshotAtThreshold(t *testing.T) {
+	walPath := filepath.Join(t.TempDir(), "wal.log")
+
+	engine, err := NewFileEngine(walPath)
+	if err != nil {
+		t.Fatalf("NewFileEngine: %v", err)
+	}
+
+	for i := 1; i <= 100; i++ {
+		if err := engine.Put(i, []byte("key"), []byte("value")); err != nil {
+			t.Fatalf("Put at index %d: %v", i, err)
+		}
+	}
+
+	engine.MaybeSaveSnapshot()
+
+	snapshot, err := engine.ReadSnapshot()
+	if err != nil {
+		_ = engine.Close()
+		t.Fatalf("ReadSnapshot: %v", err)
+	}
+	if snapshot == nil {
+		_ = engine.Close()
+		t.Fatal("expected snapshot at threshold")
+	}
+	if snapshot.LastApplied != 100 {
+		_ = engine.Close()
+		t.Fatalf("snapshot LastApplied = %d, want 100", snapshot.LastApplied)
+	}
+
+	if err := engine.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestMaybeSaveSnapshotHandlesSaveFailure(t *testing.T) {
+	dir := t.TempDir()
+	walPath := filepath.Join(dir, "wal.log")
+
+	engine, err := NewFileEngine(walPath)
+	if err != nil {
+		t.Fatalf("NewFileEngine: %v", err)
+	}
+	defer engine.Close()
+
+	// Make the snapshot destination a directory so replacing it
+	// with the snapshot file should fail.
+	snapshotPath := engine.snapshotPath()
+	if err := os.Mkdir(snapshotPath, 0700); err != nil {
+		t.Fatalf("create snapshot directory: %v", err)
+	}
+
+	for i := 1; i <= 100; i++ {
+		if err := engine.Put(i, []byte("key"), []byte("value")); err != nil {
+			t.Fatalf("Put at index %d: %v", i, err)
+		}
+	}
+
+	// Snapshot creation should fail gracefully rather than panic.
+	engine.MaybeSaveSnapshot()
+
+	// The already-applied data should remain available.
+	got, found, err := engine.Get([]byte("key"))
+	if err != nil {
+		t.Fatalf("Get after snapshot failure: %v", err)
+	}
+	if !found || string(got) != "value" {
+		t.Fatalf("Get = %q, found=%v; want value", got, found)
+	}
+
+	// The snapshot destination should still be a directory,
+	// confirming that a snapshot file was not installed.
+	info, err := os.Stat(snapshotPath)
+	if err != nil {
+		t.Fatalf("stat snapshot destination: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatal("expected snapshot destination to remain a directory")
+	}
+}
+
+func TestCompactWALFailsOnIncompleteRecord(t *testing.T) {
+	dir := t.TempDir()
+	walPath := filepath.Join(dir, "wal.log")
+
+	engine, err := NewFileEngine(walPath)
+	if err != nil {
+		t.Fatalf("NewFileEngine: %v", err)
+	}
+	defer engine.Close()
+
+	for i := 1; i <= 100; i++ {
+		if err := engine.Put(i, []byte("key"), []byte("value")); err != nil {
+			t.Fatalf("Put at index %d: %v", i, err)
+		}
+	}
+
+	// Save a snapshot so compaction has records to remove.
+	if err := engine.SaveSnapshot(); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+
+	// Append an incomplete WAL record.
+	wal, err := os.OpenFile(walPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatalf("open WAL: %v", err)
+	}
+
+	if _, err := wal.Write([]byte(`{"index":101,"op":"SET"`)); err != nil {
+		_ = wal.Close()
+		t.Fatalf("write incomplete record: %v", err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatalf("close WAL: %v", err)
+	}
+
+	// Explicitly verify that compaction fails.
+	err = engine.CompactWAL()
+	if err == nil {
+		t.Fatal("CompactWAL() error = nil; want error for incomplete WAL record")
+	}
+}
